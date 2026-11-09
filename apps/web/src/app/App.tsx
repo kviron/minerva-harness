@@ -7,6 +7,7 @@ import { models } from './models';
 import '../style.css';
 
 export function App() {
+  const [view,setView]=useState<'chat'|'plugins'|'client'>(new URLSearchParams(location.search).has('fme-embed')?'client':'chat');
   const sessions=React.useSyncExternalStore(models.sessions.subscribe,models.sessions.getSnapshot);
   const setSessions=(next:SessionInfo[]|((current:SessionInfo[])=>SessionInfo[]))=>models.sessions.set(typeof next==='function'?next(models.sessions.getSnapshot()):next);
   const [session,setSession]=useState<SessionInfo|null>(null);
@@ -92,5 +93,5 @@ export function App() {
   },[session?.id,model,availablePluginModels]);
 
   if(!session)return <div className="oe-studio session-startup" role="status">{sessionLoading?'Загружаем историю…':sessionError||'Нет доступных диалогов'}{!sessionLoading&&<Button variant="outline" onClick={()=>void createSession()}>Повторить</Button>}</div>;
-  return <>{sessionError&&<div className="session-error" role="alert">{sessionError}<button aria-label="Закрыть уведомление" onClick={()=>setSessionError('')}>×</button></div>}<Chat key={session.id} session={session} sessions={sessions} onSession={selectSession} onSaved={()=>void refreshSessions()} onError={setSessionError} model={model} configured={configured} providers={providers} pluginModels={availablePluginModels} onSelect={selectModel} onProviders={setProviders} activePlugins={activePlugins} onNew={workspaceId=>void createSession(workspaceId)}/></>;
+  return <>{sessionError&&<div className="session-error" role="alert">{sessionError}<button aria-label="Закрыть уведомление" onClick={()=>setSessionError('')}>×</button></div>}<Chat view={view} setView={setView} key={session.id} session={session} sessions={sessions} onSession={selectSession} onSaved={()=>void refreshSessions()} onError={setSessionError} model={model} configured={configured} providers={providers} pluginModels={availablePluginModels} onSelect={selectModel} onProviders={setProviders} activePlugins={activePlugins} onNew={workspaceId=>void createSession(workspaceId)}/></>;
 }

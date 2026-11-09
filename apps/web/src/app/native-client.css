@@ -1,0 +1,17 @@
+.fme-experiment{position:relative;flex:1;min-height:0;display:flex;flex-direction:column;background:#19191d;color:#e9e9ed}
+.fme-controls{position:absolute;z-index:2;top:0;right:6px;display:flex;align-items:center;gap:2px;height:36px;padding:1px 3px 1px 9px;border:1px solid #ffffff24;border-radius:10px;background:#2b2b30b8;backdrop-filter:blur(18px) saturate(125%);-webkit-backdrop-filter:blur(18px) saturate(125%);box-shadow:0 3px 12px #0003,inset 0 1px #ffffff0a}
+.fme-controls select{width:104px;height:32px;padding:0 4px;border:0;outline-offset:0;border-radius:6px;background:transparent;color:inherit;font-size:11px;cursor:pointer}
+.fme-controls select:disabled{opacity:1;cursor:default;color:#d6d5dc}
+.fme-controls select:focus-visible{outline:2px solid var(--ring);outline-offset:-2px}
+.fme-controls option{background:#28282d;color:#e9e9ed}
+.fme-connection-dot{width:5px;height:5px;flex:none;border-radius:50%;background:#8a8993}
+.fme-connection-dot[data-connected=true]{background:#96c7a6}
+.fme-control-button{width:32px!important;height:32px!important;flex:none}
+.fme-control-button svg{width:14px!important;height:14px!important}
+.fme-control-button:hover{background:#ffffff14}
+.fme-menubar{display:flex;flex-wrap:wrap;flex:none;gap:4px;min-height:36px;padding:3px 170px 4px 12px;border-bottom:1px solid var(--border)}
+.fme-error{display:flex;flex:none;align-items:center;gap:12px;padding:8px 246px 8px 12px;color:#f08d8d;background:#352627;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+.fme-menubar~.fme-error{padding-right:12px}
+.fme-error>span{flex:1;min-width:0}
+.fme-surface{flex:1;min-height:0;position:relative}
+.fme-empty{position:absolute;inset:0;display:grid;place-items:center;padding:48px 20px;color:#aaa9b2;text-align:center;font-size:13px}
