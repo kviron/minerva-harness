@@ -5,8 +5,10 @@ plugin contexts, disposable ownership, and a serialized BrowserPluginHost.
 React rendering is isolated behind the `/renderer` export, with a per-plugin
 error boundary and settings/disable recovery actions supplied by the host.
 
-Only trusted, already-resolved BrowserPlugin objects are accepted. This package
-does not fetch modules, evaluate code, authorize tenants, or assert backend health.
+BrowserPluginHost accepts trusted, already-resolved BrowserPlugin objects.
+The optional ExternalClientModules adapter loads and evaluates verified CommonJS
+factories using host-supplied load/compile callbacks and shared module instances.
+Neither layer authorizes tenants, sandboxes JavaScript, or asserts backend health.
 UI props must contain presentation data and scoped actions; never pass lifecycle
 contexts, transport instances, secrets, or service implementations to components.
 

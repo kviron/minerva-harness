@@ -171,12 +171,18 @@ impl Plugin for ShellPlugin {
     type Config = ();
     type Input = ();
     type PrepareError = Infallible;
-    type ApplyError = cordis::service::ServicePublishError;
+    type ApplyError = std::io::Error;
     fn prepare(&self, (): ()) -> Result<(), Infallible> {
         Ok(())
     }
     async fn apply(&self, ctx: Context, _: &()) -> Result<(), Self::ApplyError> {
-        let _publication = ctx.provide(self.0.clone())?;
+        let owned = self.0.clone();
+        ctx.effect(move || async move {
+            owned.terminals.shutdown();
+            Ok::<_, std::io::Error>(())
+        }).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let _publication = ctx.provide(self.0.clone())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 }
@@ -185,6 +191,22 @@ impl Plugin for ShellPlugin {
 mod tests {
     use super::*;
     use std::fs;
+    #[tokio::test]
+    async fn fiber_disposal_stops_terminals_with_service_arc_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(ShellService::new(dir.path().join("shell.json")).unwrap());
+        let ctx = Context::new();
+        let fiber = ctx.spawn(cordis::PreparedPlugin::from_input(ShellPlugin(service.clone()), ())).await.unwrap();
+        let id = service.terminals.open(dir.path(), 80, 24).unwrap();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), fiber.dispose()).await.unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(ctx.try_service::<ShellService>().is_err());
+        assert!(service.terminals.read(&id, 0).is_err());
+        assert!(service.terminals.write(&id, "echo unwanted\r").is_err());
+        assert!(service.terminals.open(dir.path(), 80, 24).unwrap_err().contains("stopped"));
+        service.terminals.shutdown();
+    }
     #[tokio::test]
     async fn saves_shared_config_without_losing_plugin_selection_or_run_limits() {
         let dir = tempfile::tempdir().unwrap();

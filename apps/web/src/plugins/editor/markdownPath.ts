@@ -6,7 +6,10 @@ export function resolveLink(from: string, href: string): string | null {
   const parts = target.startsWith('/') ? [] : from.split('/').slice(0, -1);
   for (const part of target.split('/')) {
     if (!part || part === '.') continue;
-    if (part === '..') { if (!parts.length) return null; parts.pop(); } else parts.push(part);
+    if (part === '..') {
+      if (!parts.length) return null;
+      parts.pop();
+    } else parts.push(part);
   }
   return parts.join('/') || null;
 }

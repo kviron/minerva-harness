@@ -57,6 +57,32 @@ fn dependencies(id: &str) -> &'static [&'static str] {
         _ => &[],
     }
 }
+fn teardown_order(ids: &mut [String]) {
+    ids.sort_by_key(|id| PLUGINS.iter().position(|(plugin, _, _)| *plugin == id.as_str()).unwrap_or(usize::MAX));
+    ids.reverse();
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+
+    #[test]
+    fn teardown_stops_consumers_before_their_dependencies() {
+        let mut ids = PLUGINS.iter().map(|(id, _, _)| (*id).to_owned()).collect::<Vec<_>>();
+        ids.sort();
+        teardown_order(&mut ids);
+        for (index, id) in ids.iter().enumerate() {
+            for dependency in dependencies(id) {
+                let dependency_index = ids.iter().position(|id| id.as_str() == *dependency).unwrap();
+                assert!(index < dependency_index, "{id} must stop before {dependency}");
+            }
+        }
+        let mut subset = vec!["skills".into(), "experiments".into(), "skill-curation".into()];
+        teardown_order(&mut subset);
+        assert_eq!(subset, ["skill-curation", "experiments", "skills"]);
+    }
+}
+
 fn encode(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|e| e.to_string())
 }
@@ -212,7 +238,10 @@ impl Learning {
             )))?;
         this.context.set_learning_actor(this.actor.clone())?;
         manager.harness.tools.revoke_owner("native.skills");
-        this.sync().await?;
+        if let Err(error) = this.sync().await {
+            let _ = OptionalPlugins::shutdown(this.as_ref()).await;
+            return Err(error);
+        }
         Ok(this)
     }
     pub(crate) fn myself(&self) -> Result<Arc<Self>, String> {
@@ -305,7 +334,7 @@ impl Learning {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        remove.reverse();
+        teardown_order(&mut remove);
         if remove.iter().any(|id| {
             matches!(
                 id.as_str(),

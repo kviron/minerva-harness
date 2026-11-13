@@ -159,8 +159,27 @@ impl Runtime {
                 return Err(error);
             }
         };
-        let learning = learning::Learning::open(&config, &plugins, sessions.clone(), ownership).await.map_err(RuntimeError::Bootstrap)?;
-        plugins.attach_optional(learning.clone()).map_err(RuntimeError::Bootstrap)?;
+        let learning = async {
+            let learning = learning::Learning::open(&config, &plugins, sessions.clone(), ownership)
+                .await
+                .map_err(RuntimeError::Bootstrap)?;
+            if let Err(error) = plugins.attach_optional(learning.clone()) {
+                let _ = mh_plugin_manager::optional::OptionalPlugins::shutdown(learning.as_ref()).await;
+                return Err(RuntimeError::Bootstrap(error));
+            }
+            Ok(learning)
+        }
+        .await;
+        let learning = match learning {
+            Ok(learning) => learning,
+            Err(error) => {
+                for fiber in fibers.iter().rev() {
+                    let _ = fiber.dispose().await;
+                }
+                plugins.shutdown().await;
+                return Err(error);
+            }
+        };
         Ok(Self {
             learning,
             config,
@@ -218,6 +237,29 @@ mod runtime_services_tests {
             matches!(result, Err(RuntimeError::Configuration(ref error)) if error.contains("minerva.conf.json"))
         );
         assert!(!data.exists());
+    }
+    #[tokio::test]
+    async fn late_learning_failure_releases_runtime_storage_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            tenant_id: "test".into(),
+            workspace_id: "test".into(),
+            profile: "local".into(),
+            data_dir: dir.path().join("data"),
+            config_dir: dir.path().join("config"),
+        };
+        let learning = config.data_dir.join("learning");
+        std::fs::create_dir_all(&learning).unwrap();
+        let database = learning.join("experiments.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.pragma_update(None, "user_version", 999).unwrap();
+        drop(connection);
+        assert!(matches!(Runtime::start(config.clone()).await, Err(RuntimeError::Bootstrap(_))));
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
+        drop(connection);
+        let runtime = Runtime::start(config).await.unwrap();
+        runtime.shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn session_and_execution_services_are_system_plugins_with_owned_shutdown() {

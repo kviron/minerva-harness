@@ -1,13 +1,17 @@
 # Minerva application artwork
 
-`minerva-master.png` is the approved full-bleed portrait on a dark brown background.
-`minerva-macos.png` uses a 1024px transparent canvas with an 824px rounded tile so its apparent size matches other Dock icons. The portrait remains bottom-aligned inside the tile.
-
-Regenerate desktop and mobile sizes on macOS:
+`minerva-profile.png` is the current source artwork for application icons. The
+native Windows, macOS, Linux, Android and iOS icons in `src-tauri/icons/` are
+generated with:
 
 ```sh
-swift scripts/prepare-macos-icon.swift assets/minerva-master.png assets/minerva-macos.png
-npx tauri icon assets/minerva-macos.png
+npx tauri icon assets/minerva-profile.png
 ```
 
-The PNGs in `public/` use the full-bleed source for the browser favicon, touch icon, manifest, sidebar and empty-chat illustration. `src-tauri/icons/` contains the rounded native application icons, including ICNS and ICO.
+The PNG files and favicon in `apps/web/public/` are derived from the same source
+for the browser, PWA, sidebar and welcome image. Rebuild the frontend after
+updating them. Native icons are embedded at compile time, so rebuild the Tauri
+application to update the executable, window and tray icons.
+
+`new_icons/`, `minerva-master.png` and `minerva-macos.png` contain earlier artwork
+and exports retained for reference.

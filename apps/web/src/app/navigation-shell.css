@@ -44,7 +44,7 @@ html body {
 .shell-panels [data-panel] {
   min-height: 0;
 }
-.shell-panels [data-slot="resizable-panel"] {
+.shell-panels [data-slot='resizable-panel'] {
   height: 100%;
 }
 
@@ -80,7 +80,7 @@ html body {
   color: var(--foreground);
 }
 .activity-rail .rail-button.selected,
-.activity-rail .rail-button[aria-current="page"] {
+.activity-rail .rail-button[aria-current='page'] {
   background: var(--secondary);
   color: var(--primary);
 }
@@ -113,7 +113,10 @@ html body {
   padding: 0;
 }
 .section-sidebar .brand .brand-name {
-  font: 600 15px/20px Inter, "Segoe UI", sans-serif;
+  font:
+    600 15px/20px Inter,
+    'Segoe UI',
+    sans-serif;
   letter-spacing: normal;
   color: var(--foreground);
 }
@@ -191,7 +194,7 @@ html body {
   touch-action: none;
 }
 .shell-panels .sidebar-resize::after {
-  content: "";
+  content: '';
   position: absolute;
   inset-block: 0;
   left: 50%;
@@ -255,7 +258,7 @@ html body {
 .settings-screen .settings-body > .provider-add {
   margin-top: 20px;
 }
-[data-slot="tooltip-content"] {
+[data-slot='tooltip-content'] {
   background: var(--foreground);
   color: var(--background);
 }
@@ -270,7 +273,7 @@ html body {
   border: 0;
   border-radius: 0;
 }
-.mobile-sidebar-sheet [data-slot="sheet-close"] {
+.mobile-sidebar-sheet [data-slot='sheet-close'] {
   right: 8px;
   top: 8px;
 }
@@ -288,7 +291,7 @@ html body {
     display: none;
   }
   .navigation-shell .thread {
-    --chat-gutter:16px;
+    --chat-gutter: 16px;
   }
   .navigation-shell .harness-session {
     padding-inline: 12px;
@@ -298,17 +301,76 @@ html body {
   }
 }
 
-.shell-panels .main.development-mode { display:grid; grid-template-columns:minmax(0,1fr) 1px min(var(--chat-width,420px), calc(100% - 361px)); grid-template-rows:minmax(0,1fr) auto; }
-.development-mode .chat-view {grid-column:3;grid-row:1 / -1;min-width:0;overflow:hidden;}
-.development-mode .shell-dock {grid-column:1;grid-row:2;min-width:0;}
-.development-mode .chat-resize {grid-column:2;grid-row:1 / -1;position:relative;z-index:20;background:var(--border);cursor:col-resize;touch-action:none;}
-.development-mode .chat-resize::after {content:"";position:absolute;inset-block:0;left:50%;width:12px;transform:translateX(-50%);}
-.development-mode .chat-resize:hover,.development-mode .chat-resize:focus-visible {background:color-mix(in srgb, var(--primary) 45%, transparent);outline:none;}
-.development-mode .editor-workbench {grid-column:1;grid-row:1;min-width:0;min-height:0;display:flex;flex-direction:column;}
-.development-mode .thread {--chat-gutter:18px;}
-.development-mode .viewport {padding-block:18px;}
-@media(max-width:900px){.shell-panels .main.development-mode {grid-template-columns:minmax(0,1fr);} .development-mode .chat-view, .development-mode .chat-resize {display:none;} }
+.shell-panels .main.development-mode {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 1px min(var(--chat-width, 420px), calc(100% - 361px));
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+.development-mode .chat-view {
+  grid-column: 3;
+  grid-row: 1 / -1;
+  min-width: 0;
+  overflow: hidden;
+}
+.development-mode .shell-dock {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+}
+.development-mode .chat-resize {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  position: relative;
+  z-index: 20;
+  background: var(--border);
+  cursor: col-resize;
+  touch-action: none;
+}
+.development-mode .chat-resize::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 50%;
+  width: 12px;
+  transform: translateX(-50%);
+}
+.development-mode .chat-resize:hover,
+.development-mode .chat-resize:focus-visible {
+  background: color-mix(in srgb, var(--primary) 45%, transparent);
+  outline: none;
+}
+.development-mode .editor-workbench {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.development-mode .thread {
+  --chat-gutter: 18px;
+}
+.development-mode .viewport {
+  padding-block: 18px;
+}
+@media (max-width: 900px) {
+  .shell-panels .main.development-mode {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .development-mode .chat-view,
+  .development-mode .chat-resize {
+    display: none;
+  }
+}
 
 /* The chat column and an optional right dock share the chat view. */
-.shell-panels .chat-view { flex-direction:row; }
-.chat-main { flex:1; min-width:0; min-height:0; display:flex; flex-direction:column; }
+.shell-panels .chat-view {
+  flex-direction: row;
+}
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}

@@ -1,10 +1,17 @@
-import {viteWorkerStub} from './vite-worker-stub.mjs';
-import {test,expect} from '@playwright/test';
-import {build} from 'esbuild';
+import { viteWorkerStub } from './vite-worker-stub.mjs';
+import { test, expect } from '@playwright/test';
+import { build } from 'esbuild';
 
-test('polled crash removes external settings and exposes retry and disable actions',async({page})=>{
- const source=`exports.sdkVersion=2;exports.apply=ctx=>{const React=require('react');ctx.effect(()=>{window.disposed=true;});ctx.slots.register('settings.pages',{entryId:'plugin:fixture',component:props=>props.placement==='navigation'?React.createElement('button',{onClick:()=>props.onSelectPage('plugin:fixture')},'Fixture'):React.createElement('p',null,'Fixture body')});};`;
- const result=await build({plugins:[viteWorkerStub],stdin:{resolveDir:process.cwd(),loader:'tsx',contents:`
+test('polled crash removes external settings and exposes retry and disable actions', async ({
+  page,
+}) => {
+  const source = `exports.sdkVersion=2;exports.apply=ctx=>{const React=require('react');ctx.effect(()=>{window.disposed=true;});ctx.slots.register('settings.pages',{entryId:'plugin:fixture',component:props=>props.placement==='navigation'?React.createElement('button',{onClick:()=>props.onSelectPage('plugin:fixture')},'Fixture'):React.createElement('p',null,'Fixture body')});};`;
+  const result = await build({
+    plugins: [viteWorkerStub],
+    stdin: {
+      resolveDir: process.cwd(),
+      loader: 'tsx',
+      contents: `
   import React from 'react';
   import {createRoot} from 'react-dom/client';
   import {Plugins} from './apps/web/src/pages/plugins/Plugins';
@@ -27,24 +34,46 @@ test('polled crash removes external settings and exposes retry and disable actio
    const externalPlugins=startExternalPlugins(host);models.plugins.startPolling();
    createRoot(document.getElementById('root')).render(<PluginRoot host={host} externalPlugins={externalPlugins}><Settings/></PluginRoot>);
   });
- `},bundle:true,format:'esm',write:false,loader:{'.css':'empty'}});
- await page.route('http://roster.test/**',route=>route.fulfill({contentType:route.request().url().endsWith('/app.js')?'text/javascript':'text/html',body:route.request().url().endsWith('/app.js')?result.outputFiles[0].text:'<div id="root"></div><script type="module" src="/app.js"></script>'}));
- await page.goto('http://roster.test/');
- await page.locator('.settings-open').click();
- const dialog=page.locator('.navigation-shell');
- await expect(dialog.getByRole('button',{name:'Fixture',exact:true})).toBeVisible();
- await page.evaluate(()=>window.crash());
- await expect(dialog.getByRole('button',{name:'Fixture',exact:true})).toHaveCount(0);
- expect(await page.evaluate(()=>window.disposed)).toBe(true);
- await page.getByRole('button',{name:'Плагины',exact:true}).click();
- await expect(page.getByRole('alert')).toHaveText('process exited');
- await page.getByRole('button',{name:'Отключить автозапуск'}).click();
- expect(await page.evaluate(()=>window.toggles.at(-1))).toEqual({id:'fixture',enabled:false});
- await expect(page.getByRole('alert')).toHaveText('process exited');
- await page.locator('.plugin-row').filter({has:page.getByRole('alert')}).getByRole('switch').click();
- await expect(page.getByRole('alert')).toHaveCount(0);
- await expect(page.locator('.plugin-status')).toHaveText('Работает');
- await page.evaluate(()=>{window.failTransport=true;});
- await expect(page.getByRole('alert')).toContainText('offline');
- await expect(page.locator('.plugin-status')).toHaveText('Работает');
+ `,
+    },
+    bundle: true,
+    format: 'esm',
+    write: false,
+    loader: { '.css': 'empty' },
+  });
+  await page.route('http://roster.test/**', (route) =>
+    route.fulfill({
+      contentType: route.request().url().endsWith('/app.js') ? 'text/javascript' : 'text/html',
+      body: route.request().url().endsWith('/app.js')
+        ? result.outputFiles[0].text
+        : '<div id="root"></div><script type="module" src="/app.js"></script>',
+    }),
+  );
+  await page.goto('http://roster.test/');
+  await page.locator('.settings-open').click();
+  const dialog = page.locator('.navigation-shell');
+  await expect(dialog.getByRole('button', { name: 'Fixture', exact: true })).toBeVisible();
+  await page.evaluate(() => window.crash());
+  await expect(dialog.getByRole('button', { name: 'Fixture', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => window.disposed)).toBe(true);
+  await page.getByRole('button', { name: 'Плагины', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveText('process exited');
+  await page.getByRole('button', { name: 'Отключить автозапуск' }).click();
+  expect(await page.evaluate(() => window.toggles.at(-1))).toEqual({
+    id: 'fixture',
+    enabled: false,
+  });
+  await expect(page.getByRole('alert')).toHaveText('process exited');
+  await page
+    .locator('.plugin-row')
+    .filter({ has: page.getByRole('alert') })
+    .getByRole('switch')
+    .click();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.locator('.plugin-status')).toHaveText('Работает');
+  await page.evaluate(() => {
+    window.failTransport = true;
+  });
+  await expect(page.getByRole('alert')).toContainText('offline');
+  await expect(page.locator('.plugin-status')).toHaveText('Работает');
 });

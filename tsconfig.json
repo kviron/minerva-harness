@@ -1,11 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
@@ -16,13 +12,8 @@
     "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": [
-        "./apps/web/src/*"
-      ]
+      "@/*": ["./apps/web/src/*"]
     }
   },
-  "include": [
-    "apps/web/src",
-    "packages/client-models/src"
-  ]
+  "include": ["apps/web/src", "packages/client-models/src"]
 }

@@ -40,10 +40,25 @@ export type SlotDeclarations = typeof slotDeclarations;
 export type SlotName = keyof SlotDeclarations;
 // React-free contract; the renderer adapter validates the component boundary.
 export type SlotComponent = (props: any) => any;
-export interface SlotEntry { ownerPluginId: string; entryId: string; component: SlotComponent; order?: number }
+export interface SlotEntry {
+  ownerPluginId: string;
+  entryId: string;
+  component: SlotComponent;
+  order?: number;
+}
 export type SlotSelection = Partial<Record<SlotName, string | Record<string, string>>>;
 
 /** Props supplied by Minerva to workspace-scoped shell contributions. */
-export interface ShellNavigationProps {section:string;onNavigate:(section:string)=>void}
-export interface ShellSectionProps extends ShellNavigationProps {sessionId:string;placement:'rail'|'sidebar'|'body'|'title';selected:boolean}
-export interface EditorTabsSlotProps {sessionId:string;activePath:string|null}
+export interface ShellNavigationProps {
+  section: string;
+  onNavigate: (section: string) => void;
+}
+export interface ShellSectionProps extends ShellNavigationProps {
+  sessionId: string;
+  placement: 'rail' | 'sidebar' | 'body' | 'title';
+  selected: boolean;
+}
+export interface EditorTabsSlotProps {
+  sessionId: string;
+  activePath: string | null;
+}
