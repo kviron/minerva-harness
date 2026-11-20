@@ -4,7 +4,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "OpenIDEA",
+        "title": "Minerva IDE",
         "width": 1440,
         "height": 900,
         "center": true,

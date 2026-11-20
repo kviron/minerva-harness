@@ -1,0 +1,81 @@
+name: Minerva release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: minerva-release-${{ inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    if: github.repository == 'kviron/minerva-harness'
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 11
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: minerva-windows-release
+          cache-on-failure: true
+      - name: Check release configuration
+        shell: pwsh
+        run: |
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($env:TAG -ne "v$($config.version)") { throw "Tag does not match app version" }
+          if ($config.identifier -ne 'ru.minerva.ide') { throw "Unexpected app identity" }
+          if ($config.plugins.updater.endpoints[0] -ne 'https://github.com/kviron/minerva-harness/releases/latest/download/latest.json') { throw "Unexpected update source" }
+      - run: pnpm install --frozen-lockfile
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.TAG }}
+          releaseName: Minerva IDE ${{ env.TAG }}
+          releaseBody: |
+            Minerva IDE on the OpenIDEA foundation: integrated agent conversations, workspace tabs, native development tools and Minerva plugins.
+
+            Windows x64: download the setup.exe installer. Signed automatic updates are delivered from this repository.
+          releaseDraft: true
+          prerelease: false
+          args: --bundles nsis
+          tauriScript: pnpm exec tauri
+      - name: Validate and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $release = gh release view $env:TAG --json assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read draft release" }
+          $installer = @($release.assets | Where-Object name -Like '*_x64-setup.exe')
+          if ($installer.Count -ne 1) { throw "Expected one Windows x64 installer" }
+          if ($release.assets.name -notcontains "$($installer[0].name).sig") { throw "Updater signature missing" }
+          New-Item -ItemType Directory release-check | Out-Null
+          gh release download $env:TAG --pattern latest.json --dir release-check
+          if ($LASTEXITCODE -ne 0) { throw "Update manifest missing" }
+          $manifest = Get-Content release-check/latest.json -Raw | ConvertFrom-Json
+          $platform = $manifest.platforms.'windows-x86_64'
+          if ($manifest.version -ne ($env:TAG -replace '^v', '') -or !$platform.signature -or $platform.url -notlike "https://github.com/kviron/minerva-harness/releases/download/$env:TAG/*") { throw "Invalid update manifest" }
+          gh release edit $env:TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed" }

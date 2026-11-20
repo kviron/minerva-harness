@@ -23,6 +23,7 @@ env:
 jobs:
   # Creates (or reuses) one draft release that every platform build uploads into.
   create-release:
+    if: github.repository == 'l0ng-ai/openidea'
     permissions:
       contents: write
     runs-on: ubuntu-latest

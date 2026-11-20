@@ -556,9 +556,9 @@ fn config_endpoints<R: tauri::Runtime>(app: &AppHandle<R>) -> Vec<String> {
 
 /// The endpoints tried in order: `source` first, the other source when it fails or has
 /// no manifest. Bundles are signed, so either source's manifest and downloads verify.
-/// No official endpoint (a build without updates) means no mirror either.
+/// The upstream mirror is only used with upstream endpoints, never a fork's channel.
 fn source_endpoints(official: Vec<String>, source: UpdateSource) -> Vec<String> {
-    if official.is_empty() {
+    if !official.iter().any(|url| url.starts_with("https://github.com/l0ng-ai/openidea/")) {
         return official;
     }
     let mirror = vec![CNB_ENDPOINT.to_string()];
@@ -905,6 +905,9 @@ mod tests {
         assert_eq!(source_endpoints(vec![github.clone()], UpdateSource::Cnb), [CNB_ENDPOINT.into(), github]);
         // A build without an update endpoint stays without one.
         assert!(source_endpoints(Vec::new(), UpdateSource::Cnb).is_empty());
+        let fork = vec!["https://github.com/kviron/minerva-harness/releases/latest/download/latest.json".to_string()];
+        assert_eq!(source_endpoints(fork.clone(), UpdateSource::Github), fork);
+        assert_eq!(source_endpoints(fork.clone(), UpdateSource::Cnb), fork);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Minerva IDE",
-  "version": "0.1.49",
+  "version": "0.2.0",
   "identifier": "ru.minerva.ide",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -47,8 +47,8 @@
   "mainBinaryName": "openidea",
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFCOUU0MUFFOUY4NzZCNkQKUldSdGE0ZWZya0dlRzNnRFJUR2loUVdNZ1BmamxkNzFoaWNPUTBsRmI0cjhxZFRqQURybkMwakEK",
-      "endpoints": []
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdDMzMwRjc1OTUzNDk0RjkKUldUNWxEU1ZkUTh6ZkllNm52YWFrUzliUkZrUWRYUVhUN093dHQvZHd2Ti81RFRvcjFoWXc4RzkK",
+      "endpoints": ["https://github.com/kviron/minerva-harness/releases/latest/download/latest.json"]
     }
   }
 }

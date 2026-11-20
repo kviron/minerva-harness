@@ -2,6 +2,7 @@
 > inside OpenIDEA. See [architecture, launch and verification](docs/minerva-integration.md).
 > Active development uses `main`; the previous standalone harness is preserved in
 > [`clear-harness`](https://github.com/kviron/minerva-harness/tree/clear-harness).
+> [Minerva releases and automatic updates](docs/minerva-releases.md).
 > Upstream documentation follows below.
 
 <p align="center">
