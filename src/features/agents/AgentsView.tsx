@@ -21,6 +21,7 @@ import {
 } from "@/ui";
 import {
   SESSION_KIND,
+  HOME_KIND,
   TASK_DRAG,
   age,
   branchLabel,
@@ -161,7 +162,7 @@ function TaskStatusIcon({ status }: { status: Status }) {
   }
 }
 
-export function AgentsView() {
+export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?: string }) {
   const project = useProject((s) => s.project);
   const tx = useTx();
   const loaded = useAgents((s) => s.loaded);
@@ -171,7 +172,7 @@ export function AgentsView() {
   const providers = useAgents((s) => s.providers);
   const docked = useAgents((s) => s.docked);
   const homeOpen = useAgents((s) => s.homeOpen);
-  const inline = docked !== null || homeOpen;
+  const inline = !historyOnly && (docked !== null || homeOpen);
   const historyRef = useRef<HTMLButtonElement>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const external = useAgents((s) => s.external);
@@ -189,12 +190,27 @@ export function AgentsView() {
   const organize = useAgents((s) => s.organize);
   const [query, setQuery] = useState("");
   const treeRef = useRef<TreeHandle>(null);
+  useEffect(() => {
+    if (!historyOnly) return;
+    const sync = () => {
+      const state = useAgents.getState();
+      const task = state.homeOpen ? null : state.lastTask;
+      setSelected(new Set(task ? [task] : []));
+    };
+    sync();
+    return useAgents.subscribe((state, previous) => {
+      if (state.lastTask !== previous.lastTask || state.homeOpen !== previous.homeOpen) sync();
+    });
+  }, [historyOnly]);
   // Follow the active session tab.
   useEffect(
     () =>
       maybeEditorService()?.onActiveInputChange?.((input) => {
         const task = sessionTask(input);
-        if (!task) return;
+        if (!task) {
+          if (input?.kind === HOME_KIND) setSelected(new Set());
+          return;
+        }
         setSelected((current) => (current.has(task) ? current : new Set([task])));
         const known = useAgents.getState().tasks.get(task);
         const keys = known ? keysOf(known) : [];
@@ -234,7 +250,7 @@ export function AgentsView() {
   const [tabOver, setTabOver] = useState(false);
   useEffect(() => {
     const el = viewRef.current;
-    if (!el) return;
+    if (!el || historyOnly) return;
     return registerDropTarget(el, {
       accepts: (type) => type === EDITOR_TAB_MIME,
       over: (data) => setTabOver(sessionPayloadTask(data.payload) != null),
@@ -245,7 +261,7 @@ export function AgentsView() {
         if (task) void executeAction("agents.dockTask", task);
       },
     });
-  }, [loaded, error]);
+  }, [loaded, error, historyOnly]);
   if (!loaded)
     return (
       <div className={styles.loading}>
@@ -272,8 +288,8 @@ export function AgentsView() {
           value={query}
           onChange={setQuery}
           clearable
-          placeholder={tx("Search tasks")}
-          aria-label={tx("Search tasks")}
+          placeholder={tx(historyOnly ? "Search chats" : "Search tasks")}
+          aria-label={tx(historyOnly ? "Search chats" : "Search tasks")}
           onKeyDown={(e) => {
             if (e.key === "ArrowDown" || e.key === "ArrowUp") {
               e.preventDefault();
@@ -293,7 +309,7 @@ export function AgentsView() {
         />
       )}
       <Tree<Node>
-        aria-label="Agent tasks"
+        aria-label={historyOnly ? "Chats" : "Agent tasks"}
         handleRef={treeRef}
         roots={roots}
         getKey={nodeKey}
@@ -404,7 +420,7 @@ export function AgentsView() {
             </div>
           ) : (
             <div className={styles.empty}>
-              <T>No agent tasks yet</T>
+              <T>{historyOnly ? "No chats yet" : "No agent tasks yet"}</T>
               <button type="button" className={styles.link} onClick={() => openHome()}>
                 <T>New Task…</T>
               </button>

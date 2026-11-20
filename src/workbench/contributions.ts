@@ -367,6 +367,22 @@ function register<K extends keyof Contributions>(
 }
 
 export const registerWorkbenchBanner = (c: WorkbenchBannerContribution) => register("workbenchBanners", c.id, c);
+
+/** A feature can replace IDE navigation without replacing the editor or its tool-window state. */
+export const useWorkbenchChrome = create<{
+  navigation: ComponentType | null;
+  sidebar: ComponentType | null;
+  primary?: ComponentType | null;
+  workspaceOpen?: boolean;
+  workspaceMaximized?: boolean;
+  headerActions?: ComponentType | null;
+  /** Close Agent-only views through the editor's guarded lifecycle before switching layouts. */
+  closeWorkspace?: () => Promise<boolean>;
+  workspaceCwd?: string | null;
+}>(() => ({
+  navigation: null,
+  sidebar: null,
+}));
 export const registerToolWindow = (c: ToolWindowContribution) => register("toolWindows", c.id, c);
 export const registerStatusItem = (c: StatusItemContribution) => register("statusItems", c.id, c);
 export const registerOverlay = (c: OverlayContribution) => register("overlays", c.id, c);
@@ -397,6 +413,26 @@ export const ToolWindowShownProvider = ToolWindowShown.Provider;
 export const useToolWindowShown = () => useContext(ToolWindowShown);
 
 export const registerEditorKind = (c: EditorKindContribution) => register("editorKinds", c.kind, c);
+
+/** Launcher entries use the same editor inputs and document lifecycle as ordinary tabs. */
+export interface WorkspaceItem {
+  id: string;
+  title: string;
+  icon: string;
+  verbatim?: boolean;
+  input: EditorInput;
+}
+export const useWorkspaceItems = create<{ items: Map<string, WorkspaceItem> }>(() => ({ items: new Map() }));
+export function registerWorkspaceItem(item: WorkspaceItem): () => void {
+  useWorkspaceItems.setState((s) => ({ items: new Map(s.items).set(item.id, item) }));
+  return () =>
+    useWorkspaceItems.setState((s) => {
+      if (s.items.get(item.id) !== item) return s;
+      const items = new Map(s.items);
+      items.delete(item.id);
+      return { items };
+    });
+}
 export const registerTitleItem = (c: TitleItemContribution) => register("titleItems", c.id, c);
 export const registerServiceView = (c: ServiceViewContribution) => register("serviceViews", c.id, c);
 

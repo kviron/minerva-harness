@@ -48,7 +48,9 @@ import { activate as thymeleaf } from "./thymeleaf";
 import { activate as database } from "./database";
 import { activate as graphql } from "./graphql";
 import { activate as deployment } from "./deployment";
+import { activate as workspace } from "./workspace";
 import { activate as agents } from "./agents";
+import { activate as minerva } from "./minerva";
 import { activate as vim } from "./vim";
 import { activate as ssh } from "./ssh";
 import { activate as lspMessages } from "./lsp-messages";
@@ -66,6 +68,7 @@ const features: Array<[string, Activate]> = [
   ["whats-new", whatsNew],
   ["welcome", welcome],
   ["project-tree", projectTree],
+  ["minerva", minerva],
   ["search", search],
   ["code-insight", codeInsight],
   ["dependencies", dependencies],
@@ -104,6 +107,7 @@ const features: Array<[string, Activate]> = [
   ["graphql", graphql],
   ["deployment", deployment],
   ["agents", agents],
+  ["workspace", workspace],
   ["vim", vim],
   ["ssh", ssh],
   ["lsp-messages", lspMessages],

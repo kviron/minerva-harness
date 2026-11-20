@@ -17,8 +17,10 @@ const config: KnipConfig = {
     "smoke/**/*.ts",
   ],
   // Plugins' web pages are projects of their own (own package.json, checked by plugins/build.sh and CI).
-  ignore: ["plugins/**/web-src/**"],
+  ignore: ["plugins/**/web-src/**", "vendor/**"],
   ignoreExportsUsedInFile: true,
+  // Used by the imported Minerva plugin SDK, which is checked separately.
+  ignoreDependencies: ["cordis"],
   // System tools used by formatting and language smoke fixtures.
   ignoreBinaries: ["rustfmt", "composer", "make"],
   compilers: {

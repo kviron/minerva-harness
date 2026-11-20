@@ -6,6 +6,8 @@
   "trailingComma": "all",
   "sortPackageJson": false,
   "ignorePatterns": [
+    "vendor",
+    "test-results",
     "dist",
     "target",
     "src/bindings.ts",

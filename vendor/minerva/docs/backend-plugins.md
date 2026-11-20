@@ -1,0 +1,163 @@
+# Backend-плагины
+
+Необязательные встроенные плагины памяти и улучшения также управляются общим
+roster и переключателем. Их ID зарезервированы, но не являются обязательными
+системными ID. Операции идут через `plugins.call`; данные и выбор сохраняются
+при выключении. [Возможности и ограничения](harness-learning.md).
+
+Встроенными сервисами управляет Cordis. Внешние пакеты исполняются отдельными процессами через `minerva-plugin-host`. Общий roster менеджера показывает фактическое состояние `enabled`, индивидуальный выбор `requestedEnabled`, глобальный режим `optionalEnabled` и диагностическую ошибку `error`.
+
+## Общий переключатель
+
+Переключатель «Несистемные плагины» находится в строке менеджера плагинов. Он приостанавливает внешние плагины и встроенный тестовый плагин, сохраняя индивидуальный выбор. Включение возвращает только выбранные плагины. Выбор можно менять и во время паузы. Режим и выбор сохраняются в `minerva.conf.json` и восстанавливаются после перезапуска. Формат и миграция описаны в [конфигурации](configuration.md).
+
+Системные плагины находятся в отдельных Cargo-пакетах `plugins/mh-*`, входят в бинарник и активируются через Cordis. Все пакеты собираются в одном репозитории и не требуют отдельной установки.
+
+| ID | Сервис |
+| --- | --- |
+| `plugin-manager` | Управление плагинами |
+| `providers` | Провайдеры моделей |
+| `shell` | Настройки и выполнение команд |
+| `tool-runtime` | Реестр инструментов, разрешения, подтверждения и вопросы |
+| `context` | Рабочая папка, инструкции/навыки, резюме и вложения |
+| `workspace-tools` | Встроенные файловые инструменты, shell и загрузка навыков |
+| `mh-editor` | Редактор файлов активного локального workspace |
+| `mh-lsp` / `mh-lsp-rust` | Языковые серверы и конфигурация Rust |
+| `mcp` | Подключения и инструменты MCP-серверов |
+| `sessions` | SQLite истории, событий и восстановление прерванных запусков |
+| `message-queue` | Системный UI-плагин очереди с вложениями (`plugins/mh-message-queue/ui`), runtime assistant-ui открытого чата |
+| `agent-loop` | Admission, активные запуски, отмена и ограниченное ожидание завершения задач |
+| `workspaces` | Рабочие пространства и принадлежность сессий |
+| `mh-lsp` | Языковые серверы рабочих пространств |
+| `mh-lsp-rust` | Конфигурация Rust language server |
+
+Общий переключатель их не останавливает, индивидуальное отключение backend отклоняет. MCP-менеджер и его включённые серверы продолжают работать при паузе несистемных плагинов; конкретный сервер отключается своей настройкой `enabled`. В hosted-профиле локальные инструменты и внешние процессы остаются недоступными.
+
+Список и фактическая доступность берутся из опубликованных сервисов Cordis, а не из отдельного флага «системный». При завершении или неудачной активации fibers освобождаются в обратном порядке. Эффекты плагина отзывают встроенные инструменты и останавливают MCP-соединения. Системные ID зарезервированы в SDK, установленный пакет не может занять их или объявить себя системным.
+
+Композиция — `plugins/mh-plugin-manager/src/plugins/builtin.rs` и `crates/runtime/src/lib.rs`. Имена пакетов используют префикс `mh-`; существующие ID плагинов сохранены. UI рабочих пространств находится рядом с backend в `plugins/mh-workspaces/ui` и собирается веб-приложением. Общие адаптеры учётных данных и сетевой политики находятся в `crates/runtime-support`. `Harness` подготавливает ссылки на ресурсы, а публикацией, запуском и освобождением управляют плагины. Контекстные возможности сгруппированы в один плагин, поскольку используют общее SQLite-хранилище.
+
+HTTP и Tauri предоставляют `set_optional_plugins_enabled({enabled: boolean})`, возвращающий обновлённый roster. В gateway применяется та же политика `ManagePlugins`, что и к индивидуальному переключению.
+
+## Зависимости и сервисы
+
+Провайдер объявляет именованный контракт и его целочисленную версию:
+
+```json
+{"provides": {"example.format": 1}}
+```
+
+Потребитель объявляет требование:
+
+```json
+{"requires": {"example.format": 1}}
+```
+
+Оба пакета должны быть выбраны пользователем. Host проверяет наличие единственного провайдера, точное совпадение версии и отсутствие циклов. Требования относятся к сервисам, не к ID пакетов. Неизвестные встроенные wire-контракты (например, `sessions`) не предоставляются автоматически.
+
+Провайдер запускается до потребителя; остановка идёт в обратном порядке. Отключение или падение провайдера останавливает зависимых потребителей, сохраняя их выбор. Их UI освобождается после обновления roster. Повторное включение провайдера восстанавливает выбранных потребителей; прерванные чаты и инструменты автоматически не повторяются.
+
+Во время обработки запроса Host, включая `initialize`, процесс-потребитель может отправить обратный JSON-RPC запрос:
+
+```json
+{"jsonrpc":"2.0","id":"format-1","method":"services.call","params":{"service":"example.format","version":1,"method":"format","params":{"text":"hello"}}}
+```
+
+Host определяет потребителя по процессу, проверяет его `requires` и отправляет провайдеру `services.invoke` с тем же объектом `params`. Провайдер явно диспетчеризует имя сервиса, версию и метод. Ответ возвращается потребителю с исходным ID. Произвольного доступа к приватным методам провайдера этот маршрут не предоставляет.
+
+Обратные вызовы обрабатываются внутри текущего запроса Host, а не как фоновый поток событий. Сохраняются общий таймаут запроса, ограничение размера фрейма и числа обратных вызовов. Очередь RPC своя у каждого процесса; операции изменения графа сериализуются отдельно. Пакеты остаются доверенным локальным кодом: процессная граница не является sandbox.
+
+## Код
+
+- `crates/plugin-host/src/package.rs` — проверка пакета, digest и установка.
+- `crates/plugin-host/src/storage.rs` — lock-файл и атомарные изменения под writer lock.
+- `crates/plugin-host/src/process.rs` — транспорт, таймауты и завершение дерева процессов.
+- `crates/plugin-host/src/graph.rs` — зависимости и маршрутизация сервисов.
+- `crates/plugin-host/src/lib.rs` — состояние и жизненный цикл Host.
+- `plugins/mh-plugin-manager/src/plugins.rs` — системные сервисы Cordis и общий API менеджера.
+
+
+## Harness tool contract
+
+Генераторы изображений расширяют общий механизм харнеса через capability `image-generation`; контракт, проверка доступности и выбор пользователя описаны в [image-generation.md](image-generation.md).
+
+Installed packages may declare the `tools` capability. `tools.list` returns SDK
+`ToolDefinition[]` (`name`, `description`, `inputSchema`, `outputSchema`,
+`sideEffect`). Raw names use ASCII letters, digits and underscores, at most64
+bytes. The host adds a stable plugin namespace. Catalogues are admitted per
+process generation and revoked on disable, pause, failure or shutdown.
+
+Model calls use short RPCs: `tools.start({runId,callId,name,arguments})`, then
+`tools.poll({runId,callId})`, returning `{status,output?,error?}`. Status is
+`running`, `completed`, `failed` or `cancelled`. Both `tools.cancel` and
+`tools.release` take the same identity and must be idempotent. Long work must
+never block the process RPC reader. The host cancels and releases on error,
+timeout, cancellation or a dropped model future. Browser calls cannot invoke
+these execution methods. Argument/output schemas and approval policy are
+checked by the shared registry before effects execute.
+
+External model engines receive optional `engine.start.context` with
+`systemPrompt`, `cwd`, `permissionPolicy`, and admitted `tools`. Poll snapshots
+may contain `requests: [{id,callId,kind,tool?,arguments?,prompt?,options?}]` while
+running. Kinds are `tool`, `approval` and `question`. The host replies through
+`engine.answer({runId,id,decision,answer,output,isError})`. Repeated requests
+must retain their identity and content. Host tools and answers remain scoped to
+the actual session/run/call. Terminal snapshots never execute new requests.
+
+JSON-RPC incoming responses and ordinary outgoing requests are bounded to1MiB.
+Only outgoing `engine.start` permits32MiB for validated inline image inputs;
+plugins must avoid echoing base64 in poll snapshots. Mutable state belongs in
+`initialize.dataDir`, outside the immutable package digest. Native trusted
+plugins and explicitly approved shell commands are not an OS security sandbox.
+
+
+## Языковые серверы
+
+Включённый локальный backend-плагин может объявить в `plugin.json` серверы:
+
+```json
+{
+  "id": "example.python",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "backend": {"kind": "process", "entry": "plugin.exe"},
+  "languageServers": [{
+    "id": "python",
+    "command": "pyright-langserver",
+    "args": ["--stdio"],
+    "extensions": {".py": "python", ".pyi": "python"}
+  }]
+}
+```
+
+Идентификатор провайдера в Harness — `plugin:example.python/python`. Команда
+запускается без shell в корне выбранного workspace; сервер устанавливается
+отдельно. Плагины являются доверенным локальным кодом. Расширения и ID
+проверяются, пересечения отвергаются. Выключение, пауза и смена поколения
+плагина отзывают регистрацию и останавливают его серверы. В hosted-профиле
+локальные серверы недоступны.
+
+Транспорт `mh-lsp.open`, `mh-lsp.change`, `mh-lsp.close`, `mh-lsp.query` и
+`mh-lsp.diagnostics` использует `sessionId` и относительный `path`. При
+открытии передаются `text` и целочисленная `version`, при изменении — новый
+полный текст и возрастающая версия. Один открытый файл workspace принадлежит
+одной сессии до закрытия; другие сессии не могут изменить его буфер. `query`
+принимает `operation` (`completion`, `hover`, `definition`, `references`) и
+нулевые `line`, `character` в UTF-16, как в LSP. Diagnostics возвращает
+последнюю публикацию только для открытого файла. Путь проверяется относительно
+реального корня проекта, включая символические ссылки. API не сохраняет файл.
+
+Для агента системный `mh-lsp` также регистрирует инструмент `lsp`: hover,
+definition и references. Он использует открытый несохранённый буфер своей
+сессии либо временно открывает файл с диска и закрывает его после запроса.
+Инструмент доступен только локальной сессии с рабочей папкой.
+
+
+`mh-editor` предоставляет локальной сессии операции `list`, `read`, `save`
+относительно корня её workspace. Редактируемые текстовые файлы ограничены 2 МБ и UTF-8;
+символьные ссылки и выход из workspace отклоняются. `read` также возвращает
+поддерживаемые бинарные предпросмотры либо `readOnlyReason` для нередактируемых
+файлов; это не разрешает сохранять бинарный или не-UTF-8 оригинал. `save`
+проверяет SHA-256 предыдущей версии и не перезаписывает уже обнаруженные
+изменения на диске. Встроенный агент и редактор сериализуют свои записи; между
+проверкой версии и заменой остаётся узкая гонка с внешними процессами.

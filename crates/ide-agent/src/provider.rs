@@ -16,6 +16,7 @@ pub(crate) const COPILOT_GITHUB_ACCOUNT_ENV: &str = "OPENIDEA_COPILOT_GITHUB_ACC
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Driver {
+    Minerva,
     #[default]
     Acp,
     /// `codex app-server`.
@@ -42,6 +43,7 @@ pub(crate) struct ProviderSpec {
 /// `(id, name, driver, command line, sign-in hint)`. npm adapters are pinned so a
 /// session's protocol does not change under the user.
 const BUILTIN: &[(&str, &str, Driver, &[&str], &str)] = &[
+    ("minerva", "Minerva", Driver::Minerva, &["builtin:minerva"], "Configure API models in Minerva settings."),
     ("claude", "Claude Code", Driver::Claude, &["claude"], "Run `claude` in a terminal and sign in."),
     ("codex", "Codex", Driver::Codex, &["codex", "app-server"], "Run `codex login` in a terminal."),
     (
@@ -159,7 +161,7 @@ impl ProviderSpec {
     }
 
     fn resolve_for_launch_base(mut self, cwd: &Path, strip_ambient_tokens: bool) -> Self {
-        if self.driver != Driver::Acp {
+        if !matches!(self.driver, Driver::Acp | Driver::Minerva) {
             self.command = crate::native::newest_install(&self.command);
         }
         if is_copilot_provider(&self.id) {
@@ -350,7 +352,9 @@ pub(crate) fn is_unlisted(spec: &ProviderSpec) -> bool {
 /// Public launch metadata, keeping the built-in defaults separate from agent-file overrides.
 pub(crate) fn describe(spec: &ProviderSpec) -> AgentProvider {
     let builtin = builtin_spec(&spec.id);
-    let reason = if matches!(spec.source, AgentSource::Registry { .. }) {
+    let reason = if spec.driver == Driver::Minerva {
+        Some(AgentCommandReadOnlyReason::CustomAgent)
+    } else if matches!(spec.source, AgentSource::Registry { .. }) {
         Some(AgentCommandReadOnlyReason::Registry)
     } else if let Some(default) = &builtin {
         matches!(default.command.as_str(), "npx" | "bunx" | "uvx").then_some(AgentCommandReadOnlyReason::PackageRunner)
@@ -372,7 +376,7 @@ pub(crate) fn describe(spec: &ProviderSpec) -> AgentProvider {
         command_overridden: builtin.as_ref().is_some_and(|b| b.command != spec.command),
         command_editable: reason.is_none(),
         command_read_only_reason: reason,
-        installed: installed(&spec.command),
+        installed: spec.driver == Driver::Minerva || installed(&spec.command),
         env: spec.env.iter().cloned().collect(),
         config: vec![],
         thought_levels: BTreeMap::new(),
@@ -855,7 +859,7 @@ mod tests {
     #[test]
     fn login_hints_cover_all_builtin_commands_and_preserve_separate_login_tools() {
         for spec in builtins() {
-            let separate = matches!(spec.id.as_str(), "claude-acp" | "codex-acp" | "vibe");
+            let separate = matches!(spec.id.as_str(), "minerva" | "claude-acp" | "codex-acp" | "vibe");
             for windows in [false, true] {
                 let program =
                     if windows { Path::new(r"C:\Agent Tools\renamed.cmd") } else { Path::new("/agent tools/renamed") };
@@ -975,10 +979,14 @@ mod tests {
         for p in &defaults {
             assert_eq!(p.source, AgentSource::Builtin);
             assert!(p.default_program.is_some());
-            assert_eq!(p.command_editable, !p.id.ends_with("-acp"));
+            assert_eq!(p.command_editable, p.id != "minerva" && !p.id.ends_with("-acp"));
             assert_eq!(
                 p.command_read_only_reason,
-                p.id.ends_with("-acp").then_some(AgentCommandReadOnlyReason::PackageRunner)
+                if p.id == "minerva" {
+                    Some(AgentCommandReadOnlyReason::CustomAgent)
+                } else {
+                    p.id.ends_with("-acp").then_some(AgentCommandReadOnlyReason::PackageRunner)
+                }
             );
         }
         set_builtin_command(dir.path(), None, "codex", Some("/path with spaces/codex")).unwrap();
@@ -1022,7 +1030,7 @@ mod tests {
         assert!(!specs.iter().any(|s| s.id == "broken"));
         assert_eq!(specs.iter().filter(|s| s.id == "claude").count(), 1);
         assert!(!installed("/definitely/not/here"));
-        assert!(installed("sh"));
+        assert!(installed(if cfg!(windows) { "cmd" } else { "sh" }));
     }
 
     #[test]

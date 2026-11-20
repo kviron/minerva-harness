@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenIDEA",
+  "productName": "Minerva IDE",
   "version": "0.1.49",
-  "identifier": "ai.l0ng.openidea",
+  "identifier": "ru.minerva.ide",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "OpenIDEA",
+        "title": "Minerva IDE",
         "width": 1440,
         "height": 900,
         "minWidth": 400,
@@ -26,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: data: blob: http: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; frame-src http://127.0.0.1:* openidea-plugin: http://openidea-plugin.localhost; frame-ancestors 'none'"
+      "csp": "default-src 'self'; img-src 'self' asset: data: blob: http: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; frame-src https: http: openidea-plugin: http://openidea-plugin.localhost; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -48,7 +48,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFCOUU0MUFFOUY4NzZCNkQKUldSdGE0ZWZya0dlRzNnRFJUR2loUVdNZ1BmamxkNzFoaWNPUTBsRmI0cjhxZFRqQURybkMwakEK",
-      "endpoints": ["https://github.com/l0ng-ai/openidea/releases/latest/download/latest.json"]
+      "endpoints": []
     }
   }
 }

@@ -1,3 +1,4 @@
+import { WorkspaceLayout } from "../WorkspaceLayout";
 import {
   createContext,
   useContext,
@@ -34,6 +35,7 @@ import { TabStripRegistry } from "@/ui/Tabs";
 import {
   ToolWindowShownProvider,
   useContributions,
+  useWorkbenchChrome,
   type ToolWindowAnchor,
   type ToolWindowContribution,
 } from "../contributions";
@@ -621,9 +623,11 @@ function staticHeaderMenu(items: MenuItem[] | undefined): (id: string) => MenuIt
 const noTitleMenu = (): { label: string; items: MenuItem[] } | null => null;
 
 /** The tool window around its content, for `ToolWindowHeader` and `useOwnToolWindowHeader`. */
-const ToolWindowFrame = createContext<{ tw: ToolWindowContribution; setOwnHeader: (own: boolean) => void } | null>(
-  null,
-);
+const ToolWindowFrame = createContext<{
+  tw: ToolWindowContribution;
+  setOwnHeader: (own: boolean) => void;
+  editor?: boolean;
+} | null>(null);
 
 /**
  * Takes the header over from the tool window while `own` is true: its content
@@ -687,6 +691,7 @@ export function ToolWindowCornerActions({ className }: { className?: string }) {
 }
 
 function ToolWindowActionsBar({ tw, className }: { tw: ToolWindowContribution; className?: string }) {
+  const inEditor = useContext(ToolWindowFrame)?.editor;
   const maximized = useToolWindowLayout((s) => s.maximized === tw.anchor);
   const viewMode = useToolWindowLayout((s) => viewModeOf(tw.id, s.viewModes));
   const [moreOpen, setMoreOpen] = useState(false);
@@ -695,42 +700,53 @@ function ToolWindowActionsBar({ tw, className }: { tw: ToolWindowContribution; c
 
   const useHeaderMenu = typeof tw.headerMenu === "function" ? tw.headerMenu : staticHeaderMenu(tw.headerMenu);
   const own = useHeaderMenu(tw.id);
-  const more: MenuItem[] = [
-    ...own,
-    ...(own.length ? [{ kind: "separator" } as MenuItem] : []),
-    viewModeMenu(tw.id, viewMode),
-    moveToMenu(tw),
-    {
-      label: maximized ? "Restore Size" : "Maximize",
-      icon: maximized ? "minimize" : "maximize",
-      run: () => toggleMaximizeToolWindow(tw.id),
-    },
-    { kind: "separator" },
-    { label: "Hide", icon: "hide", shortcut: shortcutLabel("toolwindow.hideActive"), run: () => hideToolWindow(tw.id) },
-  ];
+  const more: MenuItem[] = inEditor
+    ? own
+    : [
+        ...own,
+        ...(own.length ? [{ kind: "separator" } as MenuItem] : []),
+        viewModeMenu(tw.id, viewMode),
+        moveToMenu(tw),
+        {
+          label: maximized ? "Restore Size" : "Maximize",
+          icon: maximized ? "minimize" : "maximize",
+          run: () => toggleMaximizeToolWindow(tw.id),
+        },
+        { kind: "separator" },
+        {
+          label: "Hide",
+          icon: "hide",
+          shortcut: shortcutLabel("toolwindow.hideActive"),
+          run: () => hideToolWindow(tw.id),
+        },
+      ];
 
   return (
     <>
       <div className={clsx(styles.headerActions, className)}>
         {Actions && <Actions id={tw.id} />}
-        <IconButton
-          ref={moreRef}
-          icon="more"
-          title="Options"
-          size="small"
-          iconSize={16}
-          aria-haspopup="menu"
-          aria-expanded={moreOpen}
-          onClick={() => setMoreOpen((v) => !v)}
-        />
-        <IconButton
-          icon="minus"
-          title="Hide"
-          shortcut={shortcutLabel("toolwindow.hideActive")}
-          size="small"
-          iconSize={16}
-          onClick={() => hideToolWindow(tw.id)}
-        />
+        {more.length > 0 && (
+          <IconButton
+            ref={moreRef}
+            icon="more"
+            title="Options"
+            size="small"
+            iconSize={16}
+            aria-haspopup="menu"
+            aria-expanded={moreOpen}
+            onClick={() => setMoreOpen((v) => !v)}
+          />
+        )}
+        {!inEditor && (
+          <IconButton
+            icon="minus"
+            title="Hide"
+            shortcut={shortcutLabel("toolwindow.hideActive")}
+            size="small"
+            iconSize={16}
+            onClick={() => hideToolWindow(tw.id)}
+          />
+        )}
       </div>
       <Menu
         open={moreOpen}
@@ -755,6 +771,7 @@ function HeaderRow({
   actions: boolean;
   children?: ReactNode;
 }) {
+  const inEditor = useContext(ToolWindowFrame)?.editor;
   const [titleOpen, setTitleOpen] = useState(false);
   const titleRef = useRef<HTMLButtonElement>(null);
   const showTitle = title && !(tw.headerContent && tw.tabsReplaceTitle);
@@ -771,10 +788,12 @@ function HeaderRow({
     <header
       className={clsx(styles.header, tw.headerContent && styles.headerTabbed)}
       onDoubleClick={(e) => {
+        if (inEditor) return;
         if (!(e.target as Element).closest('button, a, input, [role="tablist"], [role="separator"]'))
           toggleMaximizeToolWindow(tw.id);
       }}
       onMouseDown={(e) => {
+        if (inEditor) return;
         // A middle click on the header hides the window (like the Hide button).
         // Not a press on the header's tabs or buttons, which close and act
         // themselves: their event would otherwise hide the whole window too.
@@ -817,11 +836,37 @@ function HeaderRow({
 /** How long an activated tool window waits for lazily loaded content to focus. */
 const LATE_FOCUS_MS = 5000;
 
-function ToolWindowView({ tw, hidden }: { tw: ToolWindowContribution; hidden: boolean }) {
+const useEditorToolHosts = create<{ ids: Map<string, number> }>(() => ({ ids: new Map() }));
+
+/** The same contributed content and headers, hosted by an editor tab instead of a dock. */
+export function ToolWindowView({
+  tw,
+  hidden,
+  inEditor = false,
+}: {
+  tw: ToolWindowContribution;
+  hidden: boolean;
+  inEditor?: boolean;
+}) {
   const ref = useRef<HTMLElement>(null);
   const focusRequest = useToolWindowLayout((s) => s.focusRequest);
   const [ownHeader, setOwnHeader] = useState(false);
-  const frame = useMemo(() => ({ tw, setOwnHeader }), [tw]);
+  const frame = useMemo(() => ({ tw, setOwnHeader, editor: inEditor }), [tw, inEditor]);
+  const primary = useWorkbenchChrome((s) => !!s.primary);
+  const hosted = useEditorToolHosts((s) => s.ids.has(tw.id));
+  useLayoutEffect(() => {
+    if (!inEditor) return;
+    const update = (delta: number) =>
+      useEditorToolHosts.setState((s) => {
+        const ids = new Map(s.ids);
+        const count = (ids.get(tw.id) ?? 0) + delta;
+        if (count > 0) ids.set(tw.id, count);
+        else ids.delete(tw.id);
+        return { ids };
+      });
+    update(1);
+    return () => update(-1);
+  }, [inEditor, tw.id]);
   const Content = tw.component;
   const Tabs = tw.headerContent;
 
@@ -870,39 +915,41 @@ function ToolWindowView({ tw, hidden }: { tw: ToolWindowContribution; hidden: bo
     };
   }, [focusRequest, tw.id, hidden]);
 
+  if (!inEditor && primary && hosted) return null;
   return (
-    <section
-      ref={ref}
-      className={styles.window}
-      data-toolwindow={tw.id}
-      data-focus-scope=""
-      aria-label={toolWindowTitle(tw)}
-      hidden={hidden}
-      tabIndex={-1}
-      // WebKit doesn't focus a clicked button. A menu opened from this window would then hand
-      // focus back to the editor on close, hiding an unpinned or undocked window.
-      onClickCapture={(e) => {
-        const button = (e.target as Element).closest<HTMLElement>("button[aria-haspopup]");
-        if (button && e.currentTarget.contains(button)) button.focus({ preventScroll: true });
-      }}
-    >
-      {!ownHeader && (
-        <HeaderRow tw={tw} title actions>
-          {Tabs && (
-            <TabStripRegistry.Provider value={contentTabRegistry(tw.id)}>
-              <Tabs id={tw.id} />
-            </TabStripRegistry.Provider>
-          )}
-        </HeaderRow>
-      )}
-      <div className={styles.body} data-toolwindow-body="">
-        <ToolWindowFrame.Provider value={frame}>
+    <ToolWindowFrame.Provider value={frame}>
+      <section
+        ref={ref}
+        className={styles.window}
+        data-toolwindow={inEditor ? undefined : tw.id}
+        data-workspace-tool={inEditor ? tw.id : undefined}
+        data-focus-scope=""
+        aria-label={toolWindowTitle(tw)}
+        hidden={hidden}
+        tabIndex={-1}
+        // WebKit doesn't focus a clicked button. A menu opened from this window would then hand
+        // focus back to the editor on close, hiding an unpinned or undocked window.
+        onClickCapture={(e) => {
+          const button = (e.target as Element).closest<HTMLElement>("button[aria-haspopup]");
+          if (button && e.currentTarget.contains(button)) button.focus({ preventScroll: true });
+        }}
+      >
+        {!ownHeader && (
+          <HeaderRow tw={tw} title actions>
+            {Tabs && (
+              <TabStripRegistry.Provider value={contentTabRegistry(tw.id)}>
+                <Tabs id={tw.id} />
+              </TabStripRegistry.Provider>
+            )}
+          </HeaderRow>
+        )}
+        <div className={styles.body} data-toolwindow-body="">
           <ToolWindowShownProvider value={!hidden}>
             <Content id={tw.id} />
           </ToolWindowShownProvider>
-        </ToolWindowFrame.Provider>
-      </div>
-    </section>
+        </div>
+      </section>
+    </ToolWindowFrame.Provider>
   );
 }
 
@@ -1270,11 +1317,18 @@ function useToolWindowAppearance() {
  * between islands. A CSS grid does the layout, so a window resize costs no script.
  */
 export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
+  const { navigation: Navigation, sidebar: Sidebar } = useWorkbenchChrome();
   const windows = useToolWindows();
-  const visible = useEffectiveVisible(windows);
-  const maximized = useEffectiveMaximized(windows);
+  const effectiveVisible = useEffectiveVisible(windows);
+  const effectiveMaximized = useEffectiveMaximized(windows);
+  const visible = useMemo(
+    () => (Navigation ? (Object.fromEntries(SLOTS.map((slot) => [slot, null])) as SlotRecord) : effectiveVisible),
+    [Navigation, effectiveVisible],
+  );
+  const maximized = Navigation ? null : effectiveMaximized;
   const appearance = useToolWindowAppearance();
-  const { bars, widescreen } = appearance;
+  const bars = !Navigation && appearance.bars;
+  const { widescreen } = appearance;
   const stripes = useStripes();
   const names = (side: StripeSide) => stripes[side].names ?? appearance.names;
   // A change of the setting (here or in Settings) overrides what stripe drags chose.
@@ -1349,25 +1403,29 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
   return (
     <div
       ref={frameRef}
-      className={clsx(styles.frame, !rightStripe && styles.frameNoRight, !bars && styles.frameNoLeft)}
+      className={clsx(styles.frame, !rightStripe && styles.frameNoRight, !bars && !Navigation && styles.frameNoLeft)}
     >
+      {Navigation && <Navigation />}
+      {Sidebar && <Sidebar />}
       {bars && stripe("left")}
       {bars && stripeHandle("left")}
-      <div
-        ref={gridRef}
-        className={clsx(styles.grid, widescreen && styles.widescreen)}
-        data-maximized={maximized ?? undefined}
-      >
-        <SidePanel anchor="left" windows={windows} visible={visible} />
-        {gap("left")}
-        <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)} hidden={!!maximized}>
-          {editor}
+      <WorkspaceLayout>
+        <div
+          ref={gridRef}
+          className={clsx(styles.grid, widescreen && styles.widescreen)}
+          data-maximized={maximized ?? undefined}
+        >
+          <SidePanel anchor="left" windows={windows} visible={visible} />
+          {gap("left")}
+          <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)} hidden={!!maximized}>
+            {editor}
+          </div>
+          {gap("right")}
+          <SidePanel anchor="right" windows={windows} visible={visible} />
+          {gap("bottom")}
+          <SidePanel anchor="bottom" windows={windows} visible={visible} />
         </div>
-        {gap("right")}
-        <SidePanel anchor="right" windows={windows} visible={visible} />
-        {gap("bottom")}
-        <SidePanel anchor="bottom" windows={windows} visible={visible} />
-      </div>
+      </WorkspaceLayout>
       {rightStripe && stripeHandle("right")}
       {rightStripe && stripe("right")}
     </div>

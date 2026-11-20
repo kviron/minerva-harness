@@ -417,25 +417,21 @@ describe("docking a conversation in the tool window", () => {
     expect(useAgents.getState().docked).toBeNull();
   });
 
-  it("drops a dragged task into the editor: undocking when docked, opening a tab otherwise", () => {
+  it("routes a dragged task to the primary Agent conversation without creating a duplicate editor tab", () => {
     const dispose = activate();
     const execute = vi.spyOn(actions, "executeAction");
     act(() => dropOnEditor({ type: TASK_DRAG, payload: "two" }));
     expect(execute).toHaveBeenCalledWith("agents.openTaskInEditor", "two");
     expect(useAgents.getState().docked).toBeNull();
-    expect(backend.openInput).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "agent-session", key: "agent:two" }),
-      { focus: true },
-    );
+    expect(useAgents.getState()).toMatchObject({ mainAgent: true, lastTask: "two", homeOpen: false });
+    expect(backend.openInput).not.toHaveBeenCalled();
     backend.openInput.mockClear();
     act(() => dockTask("one"));
     act(() => dropOnEditor({ type: TASK_DRAG, payload: "one" }));
     expect(execute).toHaveBeenCalledWith("agents.openTaskInEditor", "one");
     expect(useAgents.getState().docked).toBeNull();
-    expect(backend.openInput).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "agent-session", key: "agent:one" }),
-      { focus: true },
-    );
+    expect(useAgents.getState()).toMatchObject({ mainAgent: true, lastTask: "one", homeOpen: false });
+    expect(backend.openInput).not.toHaveBeenCalled();
     dispose();
   });
 

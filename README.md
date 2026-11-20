@@ -1,3 +1,9 @@
+> **Minerva integration:** this checkout embeds the Minerva agent and plugin host
+> inside OpenIDEA. See [architecture, launch and verification](docs/minerva-integration.md).
+> Active development uses `main`; the previous standalone harness is preserved in
+> [`clear-harness`](https://github.com/kviron/minerva-harness/tree/clear-harness).
+> Upstream documentation follows below.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="src-tauri/icons/source/openidea-wordmark-dark.svg">

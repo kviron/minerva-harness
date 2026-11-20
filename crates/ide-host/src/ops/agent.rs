@@ -26,9 +26,12 @@ pub fn agent_subscribe(host: &Host, window: &str, on_event: Channel<AgentEvent>)
 }
 
 #[command(trust = trusted)]
-pub fn agent_providers(host: &Host, window: &str) -> IdeResult<Vec<AgentProvider>> {
+pub async fn agent_providers(host: &Host, window: &str) -> IdeResult<Vec<AgentProvider>> {
     host.require_trust(window)?;
-    let mut providers = host.project(window)?.agents.providers();
+    let connections = host.minerva.connections().await.map_err(IdeError::invalid)?;
+    let project = host.project(window)?;
+    project.agents.set_minerva_connections(connections);
+    let mut providers = project.agents.providers();
     ide_agent::registry::mark_updates(&registry_paths(host), &mut providers);
     Ok(providers)
 }

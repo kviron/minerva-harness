@@ -1,5 +1,6 @@
 import type { ComponentType } from "react";
 import { activateSettingsPages as agentsPages } from "./features/agents/settingsPages";
+import { activateSettingsPages as minervaPages } from "./features/minerva";
 import { installLocaleSync } from "./features/app/locale";
 import { activateSettingsPages as databasePages } from "./features/database/settingsPages";
 import { activateSettingsPages as githubPages } from "./features/github/settingsPages";
@@ -28,6 +29,7 @@ export function bootSettingsWindow(parent: string): ComponentType {
     ["plugins", pluginsPages],
     ["tools", toolsPages],
     ["agents", agentsPages],
+    ["minerva", minervaPages],
     ["vim", vimPages],
     ["vcs", vcsPages],
     ["github", githubPages],

@@ -116,6 +116,7 @@ impl LaunchContext {
             &mut hash,
             match self.spec.driver {
                 provider::Driver::Acp => b"acp",
+                provider::Driver::Minerva => b"minerva",
                 provider::Driver::Codex => b"codex",
                 provider::Driver::Claude => b"claude",
                 provider::Driver::Copilot => b"copilot",
@@ -466,7 +467,8 @@ impl AgentCatalogs {
         model: Option<String>,
         result: Result<Discovered, String>,
     ) {
-        let current = provider::load(shared.paths.custom_agents_dir.as_deref(), shared.env_secrets())
+        let current = shared
+            .load_specs()
             .into_iter()
             .find(|spec| spec.id == key.2)
             .map(|spec| LaunchContext::new(spec, &shared.paths.project_root));
@@ -620,8 +622,7 @@ impl crate::AgentManager {
     /// Return cached choices immediately and schedule discovery when eligible.
     pub fn refresh_models(&self, provider: &str, force: bool, model: Option<&str>) -> IdeResult<AgentModelCatalog> {
         // Settings and environment secrets can change while this window is open.
-        *self.shared.providers.write() =
-            provider::load(self.shared.paths.custom_agents_dir.as_deref(), self.shared.env_secrets());
+        *self.shared.providers.write() = self.shared.load_specs();
         let spec = self.shared.spec(provider).ok_or_else(|| IdeError::invalid(format!("unknown agent {provider}")))?;
         Ok(self.shared.paths.catalogs.request(&self.shared, spec, force, model).0)
     }
@@ -634,6 +635,7 @@ async fn discover(
 ) -> Result<Discovered, String> {
     match spec.driver {
         provider::Driver::Acp => acp::discover::run(shared, &spec, model).await,
+        provider::Driver::Minerva => native::minerva::discover(shared, &spec, model).await,
         provider::Driver::Codex => native::codex::discover(spec, shared.paths.project_root.clone()).await,
         provider::Driver::Claude => {
             let found = native::claude::discover(spec.clone(), shared.paths.project_root.clone()).await?;

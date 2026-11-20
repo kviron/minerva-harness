@@ -1,0 +1,43 @@
+[package]
+name = "minerva-runtime"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
+mh-session-query = { path = "../../plugins/mh-session-query" }
+mh-skills = { path = "../../plugins/mh-skills" }
+mh-memory = { path = "../../plugins/mh-memory" }
+mh-experience = { path = "../../plugins/mh-experience" }
+mh-experiments = { path = "../../plugins/mh-experiments" }
+mh-improvement = { path = "../../plugins/mh-improvement" }
+mh-skill-curation = { path = "../../plugins/mh-skill-curation" }
+sha2 = "0.10"
+
+mh-editor = { path = "../../plugins/mh-editor" }
+mh-agent-loop = { path = "../../plugins/mh-agent-loop" }
+mh-plugin-manager = { path = "../../plugins/mh-plugin-manager" }
+mh-workspace-tools = { path = "../../plugins/mh-workspace-tools" }
+mh-providers = { path = "../../plugins/mh-providers" }
+mh-workspaces = { path = "../../plugins/mh-workspaces" }
+mh-context = { path = "../../plugins/mh-context" }
+mh-sessions = { path = "../../plugins/mh-sessions" }
+mh-runtime-support = { path = "../runtime-support" }
+mh-mcp = { path = "../../plugins/mh-mcp" }
+mh-tool-runtime = { path = "../../plugins/mh-tool-runtime" }
+mh-shell = { path = "../../plugins/mh-shell" }
+mh-lsp = { path = "../../plugins/mh-lsp" }
+mh-lsp-rust = { path = "../../plugins/mh-lsp-rust" }
+minerva-plugin-sdk = { path = "../plugin-sdk" }
+minerva-plugin-host = { path = "../plugin-host" }
+
+cordis-rs = "=0.11.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+[dependencies.tokio]
+version = "1"
+features = ["sync", "time", "macros", "rt-multi-thread", "process", "io-util"]
+
+[dev-dependencies]
+rig-core = { version = "0.46.0", default-features = false, features = ["reqwest", "rustls"] }
+rig-agent = { version = "0.46.0", default-features = false }
+tempfile = "3"

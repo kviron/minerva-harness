@@ -1,0 +1,49 @@
+.start {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  height: 100%;
+  overflow: auto;
+  padding: var(--space-6);
+}
+.start h2 {
+  color: var(--fg-strong);
+  font-size: calc(var(--fs-ui) + 4px);
+}
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  width: min(100%, 560px);
+  gap: var(--space-3);
+}
+.tiles > button {
+  min-height: 64px;
+  justify-content: flex-start;
+}
+.browser {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.address {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2);
+}
+.address > input {
+  flex: 1;
+  min-width: 0;
+}
+.browser iframe {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: var(--bg-island);
+}
+.note {
+  padding: 0 var(--space-3);
+  color: var(--fg-muted);
+}

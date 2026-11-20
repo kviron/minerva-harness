@@ -21,6 +21,8 @@ impl Handler for ModelPages {
 
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         assert_eq!(method, "model/list", "listing models must never start a thread or turn");
+        assert_eq!(params["limit"], 100);
+        assert_eq!(params["includeHidden"], false);
         self.cursors.lock().push(params["cursor"].clone());
         self.pages.lock().pop_front().expect("another expected page")
     }

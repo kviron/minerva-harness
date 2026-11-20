@@ -30,7 +30,7 @@ agent_mcp_set_enabled                        always             project_host bin
 agent_mcp_test                               trusted            project_host bindings async
 agent_probe                                  trusted            project_host bindings async
 agent_prompt                                 trusted            project_host bindings async
-agent_providers                              trusted            project_host bindings sync
+agent_providers                              trusted            project_host bindings async
 agent_refresh_models                         trusted            project_host bindings sync
 agent_registry_install                       always             project_host bindings async
 agent_registry_list                          always             project_host bindings async
@@ -392,6 +392,8 @@ menu_configure                               always             desktop      bin
 menu_model                                   always             desktop      bindings sync
 menu_refresh                                 always             desktop      bindings sync
 menu_set_disabled                            always             desktop      bindings sync
+minerva_call                                 trusted            project_host bindings async
+minerva_workspace                            trusted            project_host bindings async
 nav_index_definitions                        always             project_host bindings async
 nav_inheritance                              always             project_host bindings async
 nav_resolve_module                           always             project_host bindings async

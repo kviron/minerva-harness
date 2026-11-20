@@ -72,7 +72,7 @@
   max-width: 40%;
 }
 
-/* The agent shows as its icon only. */
+/* Keep the selected connection readable beside its model. */
 .agentPicker {
   display: flex;
   flex: none;

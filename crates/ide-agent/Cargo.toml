@@ -14,6 +14,7 @@ ide-mcp.workspace = true
 ide-jsonrpc.workspace = true
 ide-vcs.workspace = true
 ide-tools = { path = "../ide-tools" }
+ide-minerva.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 specta.workspace = true

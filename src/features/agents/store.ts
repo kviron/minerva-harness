@@ -138,6 +138,7 @@ interface AgentsState {
   /** Task shown inside the Agents tool window instead of an editor tab. */
   docked: string | null;
   sessionLocation: SessionLocation;
+  mainAgent: boolean;
   lastTask: string | null;
   homeOpen: boolean;
   pinnedModels: string[];
@@ -170,7 +171,7 @@ function save(key: string, value: unknown) {
 }
 
 const fallbackDraft: Draft = {
-  provider: "claude",
+  provider: "minerva",
   config: {},
   isolation: "local",
   base: null,
@@ -213,13 +214,33 @@ export const useAgents = create<AgentsState>(() => ({
   importing: new Set(),
   focus: null,
   docked: null,
-  sessionLocation: load<unknown>(SESSION_LOCATION_KEY, null) === "toolWindow" ? "toolWindow" : "editor",
+  sessionLocation: load<unknown>("minerva.workspaceMode.v1", null) === "toolWindow" ? "toolWindow" : "editor",
   lastTask: null,
+  mainAgent: false,
   homeOpen: false,
   pinnedModels: load<string[]>(PINNED_MODELS_KEY, []),
   ideContext: load<boolean>(IDE_CONTEXT_KEY, true),
   scrollPositions: new Map(),
 }));
+
+const projectDrafts = new Map<string, { composer: ComposerDraft; draft: Draft }>();
+let draftRoot: string | null = null;
+
+/** A new-task prompt and its file references belong to the selected project. */
+export function selectDraftProject(root: string | null) {
+  if (root === draftRoot) return;
+  const state = useAgents.getState();
+  if (draftRoot)
+    projectDrafts.set(draftRoot, { composer: state.composers.get(HOME) ?? emptyDraft(), draft: state.draft });
+  draftRoot = root;
+  const saved = root ? projectDrafts.get(root) : undefined;
+  const composers = new Map(state.composers);
+  composers.set(HOME, saved?.composer ?? emptyDraft());
+  useAgents.setState({
+    composers,
+    draft: saved?.draft ?? savedDraft(root ? load<Partial<Draft>>(`${DRAFT_KEY}.${root}`, {}) : {}),
+  });
+}
 
 export function togglePinnedModel(modelValue: string) {
   const current = useAgents.getState().pinnedModels;
@@ -237,7 +258,7 @@ export function updateDraft(patch: Partial<Draft>) {
     ...patch,
   };
   useAgents.setState({ draft });
-  save(DRAFT_KEY, draft);
+  save(draftRoot ? `${DRAFT_KEY}.${draftRoot}` : DRAFT_KEY, draft);
 }
 
 /** What Settings › Agents says new tasks of `provider` start with, by option id. */
@@ -555,6 +576,7 @@ export async function connect(): Promise<void> {
     organizeRoot,
     organize: pruneOrganize(loadOrganize(organizeRoot), tasks),
   });
+  reconcileDraftProvider();
   notifyTabTitlesChanged();
   // Restored tabs of tasks deleted meanwhile close, like editors of deleted files.
   const editors = editorService();
@@ -677,7 +699,8 @@ function dropTaskCache(taskId: string) {
 }
 
 function isTaskOpenInUi(taskId: string): boolean {
-  if (useAgents.getState().docked === taskId) return true;
+  const state = useAgents.getState();
+  if (state.docked === taskId || (state.mainAgent && !state.homeOpen && state.lastTask === taskId)) return true;
   return (editorService().openTabs?.() ?? []).some(
     (t) => t.input.kind === SESSION_KIND && (t.input.data as { task?: string } | undefined)?.task === taskId,
   );
@@ -786,6 +809,7 @@ function onEvent(e: AgentEvent) {
         ...withoutTaskCache(s, e.id),
         organize,
         ...(s.docked === e.id ? { docked: null } : {}),
+        ...(s.mainAgent && s.lastTask === e.id ? { lastTask: null, homeOpen: true } : {}),
       });
       clearAgentTaskFontZoom(sessionKey(e.id));
       clearDismissedAssets(e.id);
@@ -1013,6 +1037,19 @@ export async function refreshProviders() {
     }
     return { providers, modelCatalogs, modelRequestTargets };
   });
+  reconcileDraftProvider();
+}
+
+export function reconcileDraftProvider() {
+  const { providers, draft } = useAgents.getState();
+  if (providers.some((provider) => provider.id === draft.provider)) return;
+  const model = draft.config.model;
+  const matching =
+    draft.provider === "minerva" && model
+      ? providers.find((provider) => provider.id.startsWith("minerva.") && model.startsWith(provider.args[0] ?? "\0"))
+      : undefined;
+  const selected = matching ?? providers.find((provider) => provider.installed);
+  if (selected) updateDraft({ provider: selected.id, ...(matching ? {} : { config: {}, thoughtLevels: {} }) });
 }
 
 export const NO_COMMANDS: readonly AgentCommand[] = [];
@@ -1052,8 +1089,10 @@ export function openTask(task: string) {
     showDockedTask(task);
     return;
   }
+  const previous = useAgents.getState().lastTask;
   useAgents.setState({ lastTask: task, homeOpen: false, lastComposer: task });
-  openTaskInEditor(task);
+  if (previous && previous !== task && useAgents.getState().mainAgent) releaseClosedTaskCache(previous);
+  if (!useAgents.getState().mainAgent) openTaskInEditor(task);
 }
 
 function openTaskInEditor(task: string) {
@@ -1078,6 +1117,7 @@ function showDockedTask(task: string) {
 function saveSessionLocation(location: SessionLocation) {
   useAgents.setState({ sessionLocation: location });
   save(SESSION_LOCATION_KEY, location);
+  save("minerva.workspaceMode.v1", location);
   if (location === "toolWindow") {
     for (const { input } of editorService().openTabs?.() ?? []) {
       if (input.kind === SESSION_KIND || input.kind === HOME_KIND) void editorService().closeInput?.(input.key);
@@ -1137,6 +1177,10 @@ export function openTaskInEditorLocation(task: string) {
  * Agents tool window. `null` when the active tab isn't an agent task, `false` when closing was cancelled.
  */
 export function closeActiveTask(): Promise<boolean> | null {
+  if (useAgents.getState().mainAgent && !useAgents.getState().homeOpen) {
+    openHome();
+    return Promise.resolve(true);
+  }
   const active = editorService().activeInput?.();
   if (active?.kind !== SESSION_KIND) return null;
   return editorService().closeInput?.(active.key) ?? Promise.resolve(false);
@@ -1161,6 +1205,12 @@ export function openHome(prompt?: string) {
     });
   }
   if (prompt !== undefined) updateComposer(HOME, { text: prompt });
+  if (useAgents.getState().mainAgent) {
+    const previous = useAgents.getState().lastTask;
+    useAgents.setState({ homeOpen: true });
+    if (previous) releaseClosedTaskCache(previous);
+    return;
+  }
   if (useAgents.getState().sessionLocation === "toolWindow") {
     const previousDocked = useAgents.getState().docked;
     useAgents.setState({ docked: null, homeOpen: true });
@@ -1557,6 +1607,7 @@ export async function setTaskMcpOverrides(task: string, overrides: Record<string
 /** The composer the user is looking at: the Agents surface on show, else the one typed in last. */
 function activeComposerKey(): string {
   const s = useAgents.getState();
+  if (s.mainAgent) return s.homeOpen ? HOME : (s.lastTask ?? HOME);
   // The tool window shows one conversation at a time; its inline New Task page wins.
   if (s.sessionLocation === "toolWindow") {
     if (s.homeOpen) return HOME;

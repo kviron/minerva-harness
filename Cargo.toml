@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["crates/*", "src-tauri"]
 # Plugins and the guest SDK build for wasm32-wasip2 in their own workspaces.
-exclude = ["sdk", "plugins"]
+exclude = ["sdk", "plugins", "vendor/minerva"]
 
 [workspace.package]
 version = "0.1.49"
@@ -37,6 +37,7 @@ ide-db = { path = "crates/ide-db" }
 ide-web = { path = "crates/ide-web" }
 ide-spell = { path = "crates/ide-spell" }
 ide-agent = { path = "crates/ide-agent" }
+ide-minerva = { path = "crates/ide-minerva" }
 ide-clipboard = { path = "crates/ide-clipboard" }
 ide-fonts = { path = "crates/ide-fonts" }
 ide-ssh = { path = "crates/ide-ssh" }

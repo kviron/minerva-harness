@@ -28,7 +28,7 @@ function AgentRegistryPage(props: ComponentProps<typeof RegistryPage>) {
     </SettingsFormContext.Provider>
   );
 }
-import { ADD_AGENT, providerOptions } from "./providerOptions";
+import { ADD_AGENT, ADD_PROVIDER, providerOptions } from "./providerOptions";
 import {
   afterInstall,
   afterRemove,
@@ -190,6 +190,7 @@ describe("agent picker", () => {
       ["cline", "3.0.74"],
       ["__missing__", undefined],
       ["gemini", "gemini"],
+      [ADD_PROVIDER, undefined],
       [ADD_AGENT, undefined],
     ]);
   });

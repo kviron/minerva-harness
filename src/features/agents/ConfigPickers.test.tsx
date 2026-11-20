@@ -20,6 +20,13 @@ const config = (values: AgentConfigOption["values"], category = "model"): AgentC
 const value = (id: string, name = id, description: string | null = null) => ({ value: id, name, description });
 
 describe("configPickerOptions", () => {
+  it("keeps internal engine namespaces out of the model menu headings", () => {
+    const options = configPickerOptions(
+      config([value("plugin:minerva-home/model", "Home model"), value("api:custom/model", "API model")]),
+    );
+    expect(options.filter((option) => option.section)).toEqual([]);
+    expect(options.map((option) => option.label)).toEqual(["Home model", "API model"]);
+  });
   it("groups nested paths by their first provider and preserves the full value and description", () => {
     expect(configPickerOptions(config([value("9router/cmc/Beam", "Beam display", "Fast")]))).toEqual([
       { value: "9router", label: "9router", section: true },

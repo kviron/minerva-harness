@@ -14,6 +14,7 @@
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod minerva;
 
 use ide_jsonrpc::{Framing, Handler, Peer};
 use std::path::{Path, PathBuf};
@@ -29,7 +30,34 @@ pub(crate) fn newest_install(command: &str) -> String {
         .or_else(|| ide_core::process::shell_env().find(|(k, _)| *k == "PATH").map(|(_, v)| v.to_owned()))
         .unwrap_or_default();
     // Windows: read afresh, so a tool the user installed since the IDE started is found too.
-    newest_install_in(command, &ide_core::process::with_user_path(&path))
+    let path = ide_core::process::with_user_path(&path);
+    #[cfg(windows)]
+    let path = if command.eq_ignore_ascii_case("codex") || command.eq_ignore_ascii_case("codex.exe") {
+        let mut dirs: Vec<_> = std::env::split_paths(&path).collect();
+        if let Some(program_files) = ide_core::process::host_var_os("ProgramFiles") {
+            dirs.extend(packaged_codex_dirs(&PathBuf::from(program_files).join("WindowsApps")));
+        }
+        if let Some(home) = ide_core::process::host_var_os("USERPROFILE") {
+            dirs.push(PathBuf::from(home).join(".codex/packages/standalone/current/bin"));
+        }
+        std::env::join_paths(dirs).unwrap_or(path)
+    } else {
+        path
+    };
+    newest_install_in(command, &path)
+}
+
+#[cfg(any(windows, test))]
+fn packaged_codex_dirs(windows_apps: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(windows_apps)
+        .into_iter()
+        .flatten()
+        .take(4096)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("OpenAI.Codex_"))
+        .map(|entry| entry.path().join("app/resources"))
+        .filter(|path| path.join("codex.exe").is_file())
+        .collect()
 }
 
 fn newest_install_in(command: &str, search: &std::ffi::OsStr) -> String {
@@ -98,6 +126,18 @@ pub(crate) fn serve<S: Shim>(shim: Arc<S>, client: Arc<dyn Handler>) -> Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_codex_is_found_outside_path_without_treating_other_apps_as_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        for app in ["OpenAI.Codex_26.1_x64__test", "OpenAI.CodexPrimaryRuntime_26.1", "OtherApp"] {
+            let resources = dir.path().join(app).join("app/resources");
+            std::fs::create_dir_all(&resources).unwrap();
+            std::fs::write(resources.join("codex.exe"), b"fixture").unwrap();
+        }
+        assert_eq!(packaged_codex_dirs(dir.path()), [dir.path().join("OpenAI.Codex_26.1_x64__test/app/resources")]);
+        assert!(packaged_codex_dirs(&dir.path().join("missing")).is_empty());
+    }
 
     #[test]
     fn versions_are_read_from_either_side_of_the_name() {

@@ -18,7 +18,7 @@ import { McpPicker } from "./McpPicker";
 import { useEffortFocus } from "./effortFocus";
 import { useAgentFontZoomSurface } from "./fontZoom";
 import { HOME_KEY, providerIcon } from "./model";
-import { ADD_AGENT, providerOptions as agentOptions } from "./providerOptions";
+import { ADD_AGENT, ADD_PROVIDER, providerOptions as agentOptions } from "./providerOptions";
 import {
   HOME,
   NO_COMMANDS,
@@ -215,12 +215,16 @@ export function HomeEditor({ docked = false, input }: { docked?: boolean; input?
               <span className={styles.agentPicker} {...tooltipAttrs(agentTitle, undefined, true)}>
                 <Select
                   variant="ghost"
-                  aria-label="Agent"
+                  aria-label="Provider"
                   value={provider?.id ?? null}
                   options={providerOptions}
-                  renderValue={(o) => (o?.icon ? <Icon name={o.icon} size={14} /> : <T>Agent</T>)}
+                  renderValue={() => provider?.name ?? tx("Provider")}
                   onChange={(id) =>
-                    id === ADD_AGENT ? void executeAction("agents.addAgent") : updateDraft({ provider: id, config: {} })
+                    id === ADD_AGENT
+                      ? void executeAction("agents.addAgent")
+                      : id === ADD_PROVIDER
+                        ? void executeAction("file.settings", "agents.minerva")
+                        : updateDraft({ provider: id, config: {} })
                   }
                 />
               </span>

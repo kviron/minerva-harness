@@ -1,0 +1,12 @@
+**/node_modules/**
+**/target/**
+**/dist/**
+**/lib/**
+**/gen/**
+agent-artifacts/**
+output/**
+assets/**
+apps/web/public/**
+src-tauri/icons/**
+packages/client/src/generated.ts
+package-lock.json

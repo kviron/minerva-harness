@@ -146,6 +146,7 @@ struct Shared {
     new_task_approvals: RwLock<Option<NewTaskApprovalsHook>>,
     known: Arc<Mutex<HashMap<String, Known>>>,
     providers: RwLock<Vec<provider::ProviderSpec>>,
+    minerva_providers: RwLock<Vec<provider::ProviderSpec>>,
     /// Last probe of each provider.
     probes: Mutex<HashMap<String, AgentProbe>>,
     /// Copilot CLI installs where `--headless` failed and fell back to `--acp`.
@@ -180,6 +181,12 @@ struct Known {
 }
 
 impl Shared {
+    fn load_specs(&self) -> Vec<provider::ProviderSpec> {
+        let mut specs = self.minerva_providers.read().clone();
+        specs.extend(provider::load(self.paths.custom_agents_dir.as_deref(), self.env_secrets()));
+        specs
+    }
+
     fn spec(&self, id: &str) -> Option<provider::ProviderSpec> {
         self.providers.read().iter().find(|p| p.id == id).cloned()
     }
@@ -536,6 +543,28 @@ struct Task {
 }
 
 impl AgentManager {
+    pub fn minerva_models_changed(&self) {
+        for spec in self.shared.load_specs().iter().filter(|spec| spec.driver == provider::Driver::Minerva) {
+            self.shared.paths.catalogs.evict_if_idle(&self.shared, &spec.id);
+            let _ = self.refresh_models(&spec.id, true, None);
+        }
+        self.shared.emit(AgentEvent::Providers);
+    }
+
+    pub fn set_minerva_connections(&self, connections: Vec<ide_minerva::Connection>) {
+        let template = provider::load(None, None).into_iter().find(|spec| spec.id == "minerva").unwrap();
+        *self.shared.minerva_providers.write() = connections
+            .into_iter()
+            .map(|connection| {
+                let mut spec = template.clone();
+                spec.id = connection.id;
+                spec.name = connection.name;
+                spec.args = vec![connection.model_prefix];
+                spec
+            })
+            .collect();
+    }
+
     #[cfg(test)]
     fn set_idle_release(&self, delay: Duration) {
         self.shared.idle_release_ms.store(delay.as_millis() as u64, Ordering::Relaxed);
@@ -543,7 +572,20 @@ impl AgentManager {
 
     /// Loads the project's saved tasks. Spawned work runs on `runtime`.
     pub fn new(paths: AgentPaths, runtime: tokio::runtime::Handle) -> Self {
-        let connector: Connector = Arc::new(|spec, cwd, client, on_stderr| match spec.driver {
+        let base = paths.models_file.parent().unwrap_or(&paths.store_dir).join("minerva");
+        let minerva = Arc::new(ide_minerva::Service::new(base.join("data"), base.join("config")));
+        Self::with_minerva(paths, runtime, minerva)
+    }
+
+    pub fn with_minerva(
+        paths: AgentPaths,
+        runtime: tokio::runtime::Handle,
+        minerva: Arc<ide_minerva::Service>,
+    ) -> Self {
+        let connector: Connector = Arc::new(move |spec, cwd, client, on_stderr| match spec.driver {
+            provider::Driver::Minerva => {
+                Ok(native::minerva::connect(minerva.clone(), cwd, client, spec.args.first().cloned()))
+            }
             provider::Driver::Acp => {
                 Peer::spawn_framed(&spec.command, &spec.args, cwd, &spec.env, client, on_stderr, Framing::Lines)
             }
@@ -566,6 +608,7 @@ impl AgentManager {
             new_task_approvals: RwLock::new(None),
             known,
             providers,
+            minerva_providers: RwLock::new(Vec::new()),
             probes: Mutex::new(HashMap::new()),
             copilot_acp_fallback: Mutex::new(HashSet::new()),
             idle_release_ms: AtomicU64::new(IDLE_RELEASE.as_millis() as u64),
@@ -622,12 +665,12 @@ impl AgentManager {
 
     /// The agents (custom ones re-read), whether each is installed, and what they offered last time.
     pub fn providers(&self) -> Vec<AgentProvider> {
-        let specs = provider::load(self.shared.paths.custom_agents_dir.as_deref(), self.shared.env_secrets());
+        let specs = self.shared.load_specs();
         let in_use: std::collections::HashSet<String> =
             self.tasks.read().values().map(|t| t.state.lock().task.provider.clone()).collect();
         let list = specs
             .iter()
-            .filter(|p| !provider::is_unlisted(p) || in_use.contains(&p.id))
+            .filter(|p| p.id != "minerva" && (!provider::is_unlisted(p) || in_use.contains(&p.id)))
             .map(|p| {
                 let mut info = provider::describe(p);
                 let catalog = self.shared.paths.catalogs.cached(&self.shared, &p.id);
@@ -693,7 +736,7 @@ impl AgentManager {
 
     /// Re-reads configured/installed agents, drops cached probes, and notifies subscribers.
     pub fn reload_providers(&self) {
-        let specs = provider::load(self.shared.paths.custom_agents_dir.as_deref(), self.shared.env_secrets());
+        let specs = self.shared.load_specs();
         *self.shared.providers.write() = specs;
         self.shared.probes.lock().clear();
         self.shared.copilot_acp_fallback.lock().clear();

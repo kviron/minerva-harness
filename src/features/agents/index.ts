@@ -21,6 +21,7 @@ import {
   registerMenuSlotItem,
   registerOverlay,
   registerStatusItem,
+  registerTitleItem,
   registerToolWindow,
   toolWindowService,
 } from "@/workbench/contributions";
@@ -41,12 +42,15 @@ import {
   refreshModels,
   refreshProviders,
   refreshTaskModels,
+  selectDraftProject,
   releaseClosedTaskCache,
   useAgents,
 } from "./store";
 import { TaskStatusMark } from "./TaskStatusMark";
 import { taskActions, useAgentsHeaderMenu } from "./taskActions";
 import { replyActions } from "./replyActions";
+import { WorkspaceMode, setWorkspaceMode } from "./WorkspaceMode";
+import { activateAgentNavigation } from "./AgentNavigation";
 
 export { activateSettingsPages } from "./settingsPages";
 
@@ -64,11 +68,42 @@ function trackAgentButtonSetting(): () => void {
 
 export function activate(): () => void {
   const sync = (root: string | null | undefined) => {
+    selectDraftProject(root ?? null);
     disconnect();
-    if (root) void connect().catch((e: unknown) => console.warn("agents unavailable", e));
+    if (root)
+      void connect()
+        .then(() => {
+          if (useProject.getState().project?.root === root)
+            return setWorkspaceMode(useAgents.getState().sessionLocation === "toolWindow" ? "development" : "chat");
+        })
+        .catch((e: unknown) => console.warn("agents unavailable", e));
   };
   sync(useProject.getState().project?.root);
   const disposers = [
+    activateAgentNavigation(),
+    registerActions([
+      {
+        id: "minerva.chatMode",
+        title: "Open Agent",
+        category: "Minerva",
+        when: "projectOpen",
+        run: () => setWorkspaceMode("chat"),
+      },
+      {
+        id: "minerva.developmentMode",
+        title: "Development",
+        category: "Minerva",
+        when: "projectOpen",
+        run: () => setWorkspaceMode("development"),
+      },
+    ]),
+    registerTitleItem({
+      id: "minerva.workspaceMode",
+      align: "left",
+      priority: 15,
+      title: "Workspace mode",
+      component: WorkspaceMode,
+    }),
     activateSettingsPages(),
     trackEditorCopies(),
     registerAgentContextSource({

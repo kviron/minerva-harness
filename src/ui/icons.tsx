@@ -372,6 +372,7 @@ const ICONS = {
   "bulb-fix": "codeInsight/quickfixBulb",
   package: "nodes/package",
   plugin: "nodes/plugin",
+  home: "openidea/home",
   "soft-wrap": "general/softWrap",
   history: "general/history",
   clock: "general/history",

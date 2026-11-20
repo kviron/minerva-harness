@@ -59,6 +59,7 @@ pub struct HostConfig {
 }
 
 pub struct Host {
+    pub minerva: Arc<ide_minerva::Service>,
     pub(crate) mcp_executable: Arc<RwLock<Option<PathBuf>>>,
     pub mcp: mcp::McpService,
     plugin_host: RwLock<std::sync::Weak<plugins::PluginHost>>,
@@ -160,6 +161,7 @@ impl Host {
         let ssh = Arc::new(ide_ssh::SshManager::new(data_dir.join("ssh-passwords.json")));
         ssh.set_configs(global_settings.effective().ssh.configs);
         let host = Self {
+            minerva: Arc::new(ide_minerva::Service::new(data_dir.join("minerva"), config_dir.join("minerva"))),
             plugin_host: RwLock::default(),
             mcp_executable: Arc::default(),
             mcp: Default::default(),
@@ -506,6 +508,9 @@ impl Host {
     /// runs and terminals.
     /// For a process that exits without dropping the host (the remote server).
     pub async fn shutdown(&self) {
+        if let Err(error) = self.minerva.shutdown().await {
+            tracing::error!(%error, "Minerva shutdown failed");
+        }
         // A capture's dump may hold secrets from the debuggee's memory: delete it before exiting.
         ops::heap::shutdown(self).await;
         self.environment.shutdown();

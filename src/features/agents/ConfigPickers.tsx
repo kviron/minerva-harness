@@ -23,7 +23,8 @@ export function configPickerOptions(
   const pinnedSet = new Set(pinned);
   const buildItem = (v: AgentConfigOption["values"][number]): { provider: string; opt: SelectOption } => {
     const slash = v.value.indexOf("/");
-    const provider = slash >= 0 ? v.value.slice(0, slash) : "";
+    const namespace = slash >= 0 ? v.value.slice(0, slash) : "";
+    const provider = /^(api|plugin):/.test(namespace) ? "" : namespace;
     const path = slash >= 0 ? v.value.slice(slash + 1) : "";
     // Prefer the agent-reported display name (e.g. "opencode/Beam Free" → "Beam Free"); agents
     // that just echo the id keep the compact id tail. The raw id stays in the detail line.

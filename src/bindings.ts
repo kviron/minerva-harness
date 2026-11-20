@@ -1029,6 +1029,8 @@ export const commands = {
 	 *  disabled in place (no rebuild).
 	 */
 	menuSetDisabled: (ids: string[]) => __TAURI_INVOKE<void>("menu_set_disabled", { ids }),
+	minervaCall: (method: string, params: string) => typedError<string, IdeError>(__TAURI_INVOKE("minerva_call", { method, params })),
+	minervaWorkspace: () => typedError<string, IdeError>(__TAURI_INVOKE("minerva_workspace")),
 	/**
 	 *  Index definitions named `name` within the roots `from` may navigate into (its own root
 	 *  plus its configured dependencies).

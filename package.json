@@ -78,6 +78,7 @@
     "@xterm/xterm": "6.1.0-beta.338",
     "anser": "^2.3.5",
     "clsx": "^2.1.1",
+    "cordis": "4.0.0-rc.12",
     "dompurify": "^3.4.17",
     "emmet": "2.4.11",
     "immer": "^11.1.21",

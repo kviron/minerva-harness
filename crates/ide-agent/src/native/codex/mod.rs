@@ -131,7 +131,10 @@ async fn list_models(peer: &Peer) -> Result<Vec<ModelInfo>, ResponseError> {
     let mut cursor = Value::Null;
     let mut seen = HashSet::new();
     loop {
-        let page: Value = peer.request("model/list", json!({ "cursor": cursor }), None).await.map_err(from_codex)?;
+        let page: Value = peer
+            .request("model/list", json!({ "cursor": cursor, "limit": 100, "includeHidden": false }), None)
+            .await
+            .map_err(from_codex)?;
         let Some(data) = page.get("data").and_then(Value::as_array) else {
             return Err(error(codes::INTERNAL_ERROR, "Codex returned an invalid model list"));
         };

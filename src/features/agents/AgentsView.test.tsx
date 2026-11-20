@@ -140,6 +140,13 @@ function setup() {
 }
 
 describe("Agents selection", () => {
+  it("keeps a dedicated chat history list even while a conversation is docked elsewhere", () => {
+    useAgents.setState({ docked: "one" });
+    render(<AgentsView historyOnly />);
+    expect(screen.getByRole("tree", { name: "Chats" })).toBeVisible();
+    expect(screen.queryByTestId("docked-session")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search chats" })).toBeVisible();
+  });
   it("extends and shrinks a range without opening its lead or losing selection to an editor echo", () => {
     setup();
     select("one");

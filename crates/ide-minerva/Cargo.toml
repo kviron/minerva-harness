@@ -1,0 +1,16 @@
+[package]
+name = "ide-minerva"
+description = "Embedded Minerva runtime and project workspace bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+minerva-runtime = { path = "../../vendor/minerva/crates/runtime" }
+minerva-plugin-host = { path = "../../vendor/minerva/crates/plugin-host" }
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

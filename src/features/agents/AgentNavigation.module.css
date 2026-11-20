@@ -1,0 +1,61 @@
+.rail {
+  width: calc(var(--stripe-icon-button) + var(--stripe-outer-padding) + var(--island-gap));
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: calc(var(--h-titlebar) - var(--stripe-icon-button));
+  padding: calc((var(--h-titlebar) - var(--stripe-icon-button)) / 2) var(--island-gap) var(--space-1-5)
+    var(--stripe-outer-padding);
+}
+.rail > button {
+  width: var(--stripe-icon-button);
+  height: var(--stripe-icon-button);
+}
+.spacer {
+  flex: 1;
+}
+.history {
+  position: relative;
+  max-width: max(200px, calc(100vw - 360px));
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-right: var(--island-gap);
+  background: var(--bg-island);
+  border-radius: var(--island-radius);
+}
+.header {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  color: var(--fg-strong);
+}
+.history > :nth-child(2) {
+  flex: 1;
+  min-height: 0;
+}
+.resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: calc(-1 * var(--island-gap));
+  width: max(6px, var(--island-gap));
+  cursor: col-resize;
+  touch-action: none;
+}
+.resize:hover,
+.resize:focus-visible {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.resize:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.history[data-workspace-open] {
+  max-width: max(200px, min(320px, calc(100vw - 900px)));
+}

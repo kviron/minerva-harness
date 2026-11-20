@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Tabs } from "@/ui";
 import { useI18n } from "@/platform/i18n";
-import { registerToolWindow } from "../contributions";
+import { registerToolWindow, useWorkbenchChrome } from "../contributions";
 import { installToolWindowActions } from "./actions";
 import { isToolWindowVisible, resetToolWindowLayout, showToolWindow, useToolWindowLayout, viewModeOf } from "./store";
 import { ToolWindowLayout } from "./ToolWindows";
@@ -12,6 +12,7 @@ const closeContentTab = vi.fn();
 let disposers: Array<() => void> = [];
 
 beforeEach(() => {
+  useWorkbenchChrome.setState({ navigation: null, sidebar: null });
   resetToolWindowLayout();
   closeContentTab.mockClear();
   disposers = [
@@ -43,6 +44,21 @@ beforeEach(() => {
 afterEach(() => disposers.forEach((d) => d()));
 
 const header = (id: string) => document.querySelector<HTMLElement>(`[data-toolwindow="${id}"] header`)!;
+
+it("hides IDE tools under custom navigation without remounting the editor or losing panel state", () => {
+  showToolWindow("run");
+  render(<ToolWindowLayout editor={<input aria-label="Editor draft" defaultValue="Keep me" />} />);
+  const editor = screen.getByRole("textbox", { name: "Editor draft" });
+  expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
+  act(() => useWorkbenchChrome.setState({ navigation: () => <nav aria-label="Agent navigation" />, sidebar: Empty }));
+  expect(screen.getByRole("navigation", { name: "Agent navigation" })).toBeVisible();
+  expect(document.querySelector('[data-toolwindow="run"]')).not.toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Editor draft" })).toBe(editor);
+  expect(isToolWindowVisible("run")).toBe(true);
+  act(() => useWorkbenchChrome.setState({ navigation: null, sidebar: null }));
+  expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Editor draft" })).toHaveValue("Keep me");
+});
 
 it("middle click on the header hides the tool window", () => {
   showToolWindow("run");

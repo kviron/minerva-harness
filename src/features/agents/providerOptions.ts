@@ -5,6 +5,7 @@ import type { SelectOption } from "@/ui";
 
 /** Picker entry that opens Settings › Tools › Agents instead of choosing an agent. */
 export const ADD_AGENT = "__addAgent__";
+export const ADD_PROVIDER = "__addProvider__";
 
 /**
  * Installed agents first; the rest under a "Not installed" title, with the command they
@@ -23,6 +24,7 @@ export function providerOptions(
     ...installed.map((p) => ({ value: p.id, label: p.name, icon: icon(p.id), detail: version(p) })),
     ...(missing.length ? [{ value: "__missing__", label: tx("Not installed"), section: true }] : []),
     ...missing.map((p) => ({ value: p.id, label: p.name, icon: icon(p.id), detail: p.command })),
+    { value: ADD_PROVIDER, label: tx("Add model provider…"), icon: "add" },
     { value: ADD_AGENT, label: tx("More agents…") },
   ];
 }

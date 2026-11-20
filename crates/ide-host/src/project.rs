@@ -706,7 +706,7 @@ impl Host {
             .with_global_sources(self.data_dir.clone()),
         );
         let http_history = Arc::new(ide_http::History::new(self.data_dir.join("http-history").join(project_key)));
-        let agents = Arc::new(ide_agent::AgentManager::new(
+        let agents = Arc::new(ide_agent::AgentManager::with_minerva(
             ide_agent::AgentPaths {
                 project_root: root.to_path_buf(),
                 store_dir: self.data_dir.join("agents").join(project_key),
@@ -729,6 +729,7 @@ impl Host {
                 })),
             },
             self.runtime.clone(),
+            self.minerva.clone(),
         ));
         let settings = settings.clone();
         {

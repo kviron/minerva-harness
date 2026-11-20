@@ -23,6 +23,7 @@ pub mod java;
 pub mod jvm_icons;
 pub mod lsp;
 pub mod maven_placeholder;
+pub mod minerva;
 pub mod nav;
 pub mod notebook;
 pub mod project;
@@ -93,6 +94,7 @@ ide_command::domains!(
     java: crate::ops::java,
     jvm_icons: crate::ops::jvm_icons,
     lsp: crate::ops::lsp,
+    minerva: crate::ops::minerva,
     mcp: crate::mcp::service,
     mcp_reports: crate::mcp::reports,
     nav: crate::ops::nav,

@@ -95,7 +95,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-0-5);
-  padding: 0 6px 0 8px;
+  padding: 0 calc(6px + var(--editor-header-actions-inset, 0px)) 0 8px;
 }
 .pin {
   color: var(--fg-muted);

@@ -1,0 +1,48 @@
+.layout {
+  flex: 1;
+  min-width: 0;
+}
+.layout > .divider[aria-orientation="vertical"] {
+  width: var(--island-gap);
+}
+.content {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.content[hidden] {
+  display: none;
+}
+.frame {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+.frame[data-primary] {
+  --conversation-header-inset: calc(var(--h-control) + var(--space-1-5));
+}
+.frame[data-primary][data-expanded] {
+  --conversation-header-inset: 0px;
+  --editor-header-actions-inset: calc(2 * var(--h-control) + var(--space-2));
+}
+.controls {
+  position: absolute;
+  top: 0;
+  right: var(--space-1-5);
+  height: var(--h-header);
+  display: flex;
+  align-items: center;
+  gap: var(--space-0-5);
+  z-index: var(--z-panel);
+}
+.primary {
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+.primary[hidden] {
+  display: none;
+}
