@@ -11,6 +11,8 @@
   "Model Providers": "Model Providers",
   "Add model provider…": "Add model provider…",
   "Add a provider here, then select it and one of its models in the agent.": "Add a provider here, then select it and one of its models in the agent.",
+  "Known service": "Known service",
+  "Custom endpoint": "Custom endpoint",
   "Workspace mode": "Workspace mode",
   "Development": "Development",
   "Minerva": "Minerva",

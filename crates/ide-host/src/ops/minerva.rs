@@ -28,6 +28,7 @@ pub async fn minerva_call(host: &Host, window: &str, method: String, params: Str
         "providers.list" => {
             serde_json::to_value(runtime.plugins.providers().map_err(error)?.list().await).map_err(error)
         }
+        "providers.known" => serde_json::to_value(runtime.plugins.providers().map_err(error)?.known()).map_err(error),
         "providers.save" => {
             let input = serde_json::from_value(params).map_err(error)?;
             let providers = runtime.plugins.providers().map_err(error)?.save(input).await.map_err(error)?;

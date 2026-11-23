@@ -26,6 +26,242 @@ pub struct Provider {
 fn default_protocol() -> String {
     "openai-chat".into()
 }
+/// A provider this build knows by name: choosing it fills the endpoint, so only the key is typed.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(ts_rs::TS)]
+pub struct KnownProvider {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub protocol: String,
+    pub models: Vec<String>,
+    /// Environment variable read when no key is stored, if this preset has one.
+    pub env_var: Option<String>,
+}
+struct Preset {
+    id: &'static str,
+    name: &'static str,
+    base_url: &'static str,
+    protocol: &'static str,
+    models: &'static [&'static str],
+    env_var: Option<&'static str>,
+}
+/// Endpoints are rig-core's own dialect bases, and `id` is its dialect name where it has one,
+/// so a known endpoint reaches the vendor's routes and headers without extra configuration.
+// shortcut: models list a first guess; a vendor's `/models` route (discover) is the real source.
+const PRESETS: &[Preset] = &[
+    Preset {
+        id: "openai",
+        name: "OpenAI",
+        base_url: "https://api.openai.com/v1",
+        protocol: "openai-chat",
+        models: &["gpt-4.1-mini"],
+        env_var: Some("OPENAI_API_KEY"),
+    },
+    Preset {
+        id: "anthropic",
+        name: "Anthropic",
+        base_url: "https://api.anthropic.com",
+        protocol: "anthropic-messages",
+        models: &["claude-sonnet-4-6"],
+        env_var: Some("ANTHROPIC_API_KEY"),
+    },
+    Preset {
+        id: "deepseek",
+        name: "DeepSeek",
+        base_url: "https://api.deepseek.com",
+        protocol: "openai-chat",
+        models: &["deepseek-chat"],
+        env_var: Some("DEEPSEEK_API_KEY"),
+    },
+    Preset {
+        id: "openrouter",
+        name: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("OPENROUTER_API_KEY"),
+    },
+    Preset {
+        id: "groq",
+        name: "Groq",
+        base_url: "https://api.groq.com/openai/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("GROQ_API_KEY"),
+    },
+    Preset {
+        id: "mistral",
+        name: "Mistral AI",
+        base_url: "https://api.mistral.ai",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("MISTRAL_API_KEY"),
+    },
+    Preset {
+        id: "xai",
+        name: "xAI",
+        base_url: "https://api.x.ai",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("XAI_API_KEY"),
+    },
+    Preset {
+        id: "together",
+        name: "Together AI",
+        base_url: "https://api.together.xyz",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("TOGETHER_API_KEY"),
+    },
+    Preset {
+        id: "perplexity",
+        name: "Perplexity",
+        base_url: "https://api.perplexity.ai",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("PERPLEXITY_API_KEY"),
+    },
+    Preset {
+        id: "moonshot",
+        name: "Moonshot (Kimi)",
+        base_url: "https://api.moonshot.ai/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("MOONSHOT_API_KEY"),
+    },
+    Preset {
+        id: "zai",
+        name: "Z.AI",
+        base_url: "https://api.z.ai/api/paas/v4",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("ZAI_API_KEY"),
+    },
+    Preset {
+        id: "zai-coding",
+        name: "Z.AI Coding",
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("ZAI_API_KEY"),
+    },
+    Preset {
+        id: "minimax",
+        name: "MiniMax",
+        base_url: "https://api.minimax.io/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("MINIMAX_API_KEY"),
+    },
+    Preset {
+        id: "venice",
+        name: "Venice AI",
+        base_url: "https://api.venice.ai/api/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("VENICE_API_KEY"),
+    },
+    Preset {
+        id: "hyperbolic",
+        name: "Hyperbolic",
+        base_url: "https://api.hyperbolic.xyz",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("HYPERBOLIC_API_KEY"),
+    },
+    Preset {
+        id: "cohere",
+        name: "Cohere",
+        base_url: "https://api.cohere.ai/compatibility/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("COHERE_API_KEY"),
+    },
+    Preset {
+        id: "huggingface",
+        name: "Hugging Face",
+        base_url: "https://router.huggingface.co",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("HUGGINGFACE_API_KEY"),
+    },
+    Preset {
+        id: "mira",
+        name: "Mira",
+        base_url: "https://api.mira.network",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("MIRA_API_KEY"),
+    },
+    Preset {
+        id: "doubleword",
+        name: "Doubleword",
+        base_url: "https://api.doubleword.ai/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("DOUBLEWORD_API_KEY"),
+    },
+    Preset {
+        id: "xiaomimimo",
+        name: "Xiaomi MiMo",
+        base_url: "https://api.xiaomimimo.com/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("XIAOMI_MIMO_API_KEY"),
+    },
+    Preset {
+        id: "opencode",
+        name: "OpenCode Zen",
+        base_url: "https://opencode.ai/inference",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("OPENCODE_API_KEY"),
+    },
+    Preset {
+        id: "opencode-go",
+        name: "OpenCode Go",
+        base_url: "https://opencode.ai/inference/go",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: Some("OPENCODE_API_KEY"),
+    },
+    Preset {
+        id: "ollama",
+        name: "Ollama",
+        base_url: "http://localhost:11434/v1",
+        protocol: "ollama",
+        models: &[],
+        env_var: None,
+    },
+    Preset {
+        id: "llamacpp",
+        name: "llama.cpp",
+        base_url: "http://localhost:8080/v1",
+        protocol: "openai-chat",
+        models: &[],
+        env_var: None,
+    },
+];
+fn preset(id: &str) -> Option<&'static Preset> {
+    PRESETS.iter().find(|preset| preset.id == id)
+}
+/// The rig dialect for a known endpoint, so vendor-specific routes and session headers apply.
+/// A preset whose endpoint the user edited keeps the plain client instead.
+fn dialect(id: &str, base_url: &str) -> Option<&'static rig_core::providers::openai::wire::Dialect> {
+    let preset = preset(id)?;
+    (base_url.trim_end_matches('/') == preset.base_url)
+        .then(|| rig_core::providers::openai::wire::by_name(id))
+        .flatten()
+}
+fn openai_config(id: &str, base_url: &str, key: String) -> OpenAIConfig {
+    match dialect(id, base_url) {
+        Some(dialect) => OpenAIConfig::with_key(dialect, key),
+        None => OpenAIConfig::new(key),
+    }
+    .with_base_url(base_url)
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(ts_rs::TS)]
@@ -199,25 +435,28 @@ impl ProviderService {
         if !self.credentials.local_environment_fallback() || self.endpoint_policy == EndpointPolicy::Hosted {
             return None;
         }
-        let expected = match id {
-            "openai" => "https://api.openai.com/v1",
-            "deepseek" => "https://api.deepseek.com",
-            "anthropic" => "https://api.anthropic.com",
-            _ => return None,
-        };
-        if endpoint.trim_end_matches('/') != expected {
+        let preset = preset(id)?;
+        if endpoint.trim_end_matches('/') != preset.base_url {
             return None;
         }
-        let name = match id {
-            "openai" => "OPENAI_API_KEY",
-            "deepseek" => "DEEPSEEK_API_KEY",
-            "anthropic" => "ANTHROPIC_API_KEY",
-            _ => return None,
-        };
-        std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+        std::env::var(preset.env_var?).ok().filter(|s| !s.trim().is_empty())
     }
     fn has_key(&self, p: &Provider) -> bool {
         self.credentials.get(&self.scope, &p.id).ok().flatten().is_some() || self.env_key(&p.id, &p.base_url).is_some()
+    }
+    /// The endpoints this build knows, so a provider is configured by name and key alone.
+    pub fn known(&self) -> Vec<KnownProvider> {
+        PRESETS
+            .iter()
+            .map(|preset| KnownProvider {
+                id: preset.id.into(),
+                name: preset.name.into(),
+                base_url: preset.base_url.into(),
+                protocol: preset.protocol.into(),
+                models: preset.models.iter().map(|m| (*m).into()).collect(),
+                env_var: preset.env_var.map(Into::into),
+            })
+            .collect()
     }
     pub async fn list(&self) -> Vec<ProviderView> {
         self.providers
@@ -357,7 +596,7 @@ impl ProviderService {
         let request = async {
             match input.protocol.as_str() {
                 "openai-chat" | "openai-responses" | "ollama" => {
-                    OpenAIConfig::new(key).with_base_url(input.base_url).client().list_models().await
+                    openai_config(&input.id, &input.base_url, key).client().list_models().await
                 }
                 "anthropic-messages" => {
                     AnthropicConfig::new(key).with_base_url(input.base_url).client().list_models().await
@@ -532,10 +771,10 @@ impl ProviderService {
         }
         match provider.protocol.as_str() {
             "openai-chat" | "ollama" => {
-                run_agent!(OpenAIConfig::new(key).with_base_url(provider.base_url).client().chat(model))
+                run_agent!(openai_config(&provider.id, &provider.base_url, key).client().chat(model))
             }
             "openai-responses" => {
-                run_agent!(OpenAIConfig::new(key).with_base_url(provider.base_url).client().responses(model))
+                run_agent!(openai_config(&provider.id, &provider.base_url, key).client().responses(model))
             }
             "anthropic-messages" => {
                 run_agent!(AnthropicConfig::new(key).with_base_url(provider.base_url).client().completion(model))

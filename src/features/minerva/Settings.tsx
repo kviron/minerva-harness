@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Checkbox, Input, Select, T } from "@/ui";
 import { tx } from "@/platform/i18n";
-import { minervaCall, type MinervaPlugin, type MinervaProvider } from "@/platform/minerva";
+import { minervaCall, type MinervaKnownProvider, type MinervaPlugin, type MinervaProvider } from "@/platform/minerva";
 import styles from "./Settings.module.css";
 
 const empty = { id: "", name: "", baseUrl: "", models: "", apiKey: "", protocol: "openai-chat" };
 
 export function MinervaSettings() {
   const [providers, setProviders] = useState<MinervaProvider[]>([]);
+  const [known, setKnown] = useState<MinervaKnownProvider[]>([]);
   const [plugins, setPlugins] = useState<MinervaPlugin[]>([]);
   const [draft, setDraft] = useState(empty);
   const [editing, setEditing] = useState(false);
@@ -16,18 +17,20 @@ export function MinervaSettings() {
   const [packagePath, setPackagePath] = useState("");
   const [installed, setInstalled] = useState(false);
   const load = useCallback(async () => {
-    const [models, packages] = await Promise.all([
+    const [models, presets, packages] = await Promise.all([
       minervaCall<MinervaProvider[]>("providers.list"),
+      minervaCall<MinervaKnownProvider[]>("providers.known"),
       minervaCall<MinervaPlugin[]>("plugins.list"),
     ]);
-    return { models, packages };
+    return { models, presets, packages };
   }, []);
   useEffect(() => {
     let active = true;
     void load()
-      .then(({ models, packages }) => {
+      .then(({ models, presets, packages }) => {
         if (active) {
           setProviders(models);
+          setKnown(presets);
           setPlugins(packages);
         }
       })
@@ -105,6 +108,34 @@ export function MinervaSettings() {
           });
         }}
       >
+        <label className={styles.field}>
+          <span>
+            <T>Known service</T>
+          </span>
+          <Select
+            aria-label="Known service"
+            value={known.some((preset) => preset.id === draft.id) ? draft.id : ""}
+            disabled={busy || editing}
+            searchable
+            options={[
+              { value: "", label: tx("Custom endpoint") },
+              ...known.map((preset) => ({ value: preset.id, label: preset.name })),
+            ]}
+            onChange={(id) => {
+              const preset = known.find((item) => item.id === id);
+              if (preset) {
+                setDraft({
+                  ...draft,
+                  id: preset.id,
+                  name: preset.name,
+                  baseUrl: preset.baseUrl,
+                  protocol: preset.protocol,
+                  models: preset.models.join(", "),
+                });
+              }
+            }}
+          />
+        </label>
         <label className={styles.field}>
           <span>
             <T>Provider ID</T>

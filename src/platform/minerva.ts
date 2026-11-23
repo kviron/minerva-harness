@@ -8,6 +8,14 @@ export interface MinervaProvider {
   protocol: string;
   hasKey: boolean;
 }
+export interface MinervaKnownProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  protocol: string;
+  models: string[];
+  envVar: string | null;
+}
 export interface MinervaPlugin {
   id: string;
   name: string;
