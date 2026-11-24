@@ -846,6 +846,7 @@ mod tests {
                 "wrapAtMargin": false,
                 "disabledPluginChecks": [],
                 "doubleClickOpensDiff": null,
+                "includeChangesByDefault": true,
                 "agentInstructions": "",
                 "agent": "",
                 "agentModel": "",
@@ -896,6 +897,16 @@ mod tests {
             store.set(SettingsScope::Global, "vcs.commit.doubleClickOpensDiff", json!("yes")).unwrap_err().kind,
             ide_core::error::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn commit_default_inclusion_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::load(tmp.path(), None);
+        assert!(store.effective().vcs.commit.include_changes_by_default);
+        let settings = store.set(SettingsScope::Global, "vcs.commit.includeChangesByDefault", json!(false)).unwrap();
+        assert!(!settings.vcs.commit.include_changes_by_default);
+        assert!(!SettingsStore::load(tmp.path(), None).effective().vcs.commit.include_changes_by_default);
     }
 
     #[test]

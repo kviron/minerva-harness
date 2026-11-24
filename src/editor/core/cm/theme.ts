@@ -167,15 +167,14 @@ export const openideaTheme = EditorView.theme({
     "--editor-fold-chip": "var(--bg-fold-placeholder, color-mix(in srgb, var(--fg-muted) 14%, transparent))",
   },
   "&.cm-focused": { outline: "none" },
-  ".cm-scroller": {
-    // The scroll container keeps the arrow cursor so its scrollbar does not turn into the I-beam.
+  ".cm-scroller, .cm-openidea-sticky": {
     fontFamily: "var(--openidea-editor-font, var(--font-mono))",
     fontWeight: "var(--fw-code, 400)",
     fontSize: "var(--openidea-editor-font-size, var(--fs-code))",
     lineHeight: "var(--openidea-editor-line-height, var(--lh-code))",
     fontVariantLigatures: "none",
-    overscrollBehavior: "contain",
   },
+  ".cm-scroller": { overscrollBehavior: "contain" },
   ".cm-content": {
     // no top padding: the first line starts at the top edge, as in IDEA, and so does its selection
     padding: "0 0 8px 0",
@@ -246,7 +245,7 @@ export const openideaTheme = EditorView.theme({
   ".cm-specialChar": { color: "var(--danger)" },
 
   // Gutter: numbers | VCS bar | fold chevrons | hairline
-  ".cm-gutters": {
+  ".cm-gutters, .cm-openidea-stickyGutter": {
     cursor: "default",
     backgroundColor: "var(--bg-editor-gutter, var(--bg-editor, var(--bg-island, var(--bg-app))))",
     color: "var(--editor-line-number)",
@@ -255,7 +254,7 @@ export const openideaTheme = EditorView.theme({
     WebkitUserSelect: "none",
     userSelect: "none",
   },
-  ".cm-lineNumbers .cm-gutterElement": {
+  ".cm-lineNumbers .cm-gutterElement, .cm-openidea-stickyNumber": {
     minWidth: "32px",
     padding: "0 8px 0 10px",
     textAlign: "right",
@@ -303,9 +302,9 @@ export const openideaTheme = EditorView.theme({
     cursor: "pointer",
     transition: "opacity var(--dur-fast) var(--ease)",
   },
-  ".cm-foldGutter .cm-openidea-foldOpen": { opacity: "0", display: "inline-flex" },
-  ".cm-foldGutter .cm-openidea-foldClosed": { display: "inline-flex" },
-  ".cm-gutters:hover .cm-foldGutter .cm-openidea-foldOpen": { opacity: "1" },
+  ".cm-foldGutter .cm-openidea-foldOpen, .cm-foldGutter .cm-openidea-foldClosed": { display: "inline-flex" },
+  ".cm-foldGutter .cm-openidea-foldOnHover": { opacity: "0" },
+  ".cm-gutters:hover .cm-foldGutter .cm-openidea-foldOnHover": { opacity: "1" },
   ".cm-foldGutter .cm-gutterElement:hover": { color: "var(--fg-secondary)" },
   ".cm-foldPlaceholder": {
     backgroundColor: "var(--editor-fold-chip)",
@@ -395,28 +394,20 @@ export const openideaTheme = EditorView.theme({
   // Sticky lines (cm/stickyScroll.ts)
   ".cm-openidea-sticky": {
     position: "absolute",
-    top: "0",
-    left: "0",
-    right: "12px",
-    zIndex: "4",
+    zIndex: "2",
+    boxSizing: "border-box",
     backgroundColor: "var(--bg-editor, var(--bg-island, var(--bg-app)))",
     borderBottom: "1px solid var(--editor-gutter-border)",
     boxShadow: "0 3px 6px -2px color-mix(in srgb, var(--fg-strong) 12%, transparent)",
-    fontFamily: "var(--openidea-editor-font, var(--font-mono))",
-    fontWeight: "var(--fw-code, 400)",
-    fontSize: "var(--openidea-editor-font-size, var(--fs-code))",
-    lineHeight: "var(--openidea-editor-line-height, var(--lh-code))",
     overflow: "hidden",
     cursor: "pointer",
   },
   ".cm-openidea-stickyLine": { display: "flex", whiteSpace: "pre" },
   ".cm-openidea-stickyLine:hover": { backgroundColor: "var(--editor-caret-row)" },
+  ".cm-openidea-stickyGutter": { flex: "none", boxSizing: "border-box" },
   ".cm-openidea-stickyNumber": {
-    flex: "none",
-    textAlign: "right",
-    color: "var(--editor-line-number)",
+    display: "block",
     boxSizing: "border-box",
-    paddingRight: "8px",
   },
   ".cm-openidea-stickyText": { flex: "1", overflow: "hidden", position: "relative" },
   ".cm-openidea-stickyInner": { position: "relative" },
