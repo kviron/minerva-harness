@@ -444,7 +444,7 @@ test("code editor and terminal do not mutate the previously focused docked agent
   await expectNoSubmission(page);
 });
 
-test("hidden kept-alive editor tasks stay isolated", async ({ workbench: page }) => {
+test("background chats retain isolated drafts and effort", async ({ workbench: page }) => {
   await seed(page, "editor");
   await box(page).fill("first draft");
   await page.evaluate(async (id) => {
@@ -455,7 +455,7 @@ test("hidden kept-alive editor tasks stay isolated", async ({ workbench: page })
   await box(page).fill("second draft");
   await page.keyboard.press("Alt+t");
   await expectEffort(page, "Balanced");
-  await page.getByRole("tab", { name: firstTask.title, exact: true }).click();
+  await page.getByRole("treeitem", { name: new RegExp(firstTask.title) }).click();
   await expectEffort(page, "Gentle");
   await expect(box(page)).toHaveText("first draft");
   await box(page).focus();

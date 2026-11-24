@@ -14,10 +14,12 @@ export const test = base.extend<{ workbench: Page }>({
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto("/");
-    await expect(page.getByRole("tree", { name: "Project" })).toBeVisible();
-    await expect(page.getByRole("treeitem", { name: /acme-api/ })).toBeVisible();
     // The start-up splash swallows raw mouse presses until it has faded out.
     await expect(page.locator("#splash")).toHaveCount(0);
+    await page.getByRole("button", { name: "Workspace mode" }).click();
+    await page.getByRole("option", { name: "Development", exact: true }).click();
+    await expect(page.getByRole("tree", { name: "Project" })).toBeVisible();
+    await expect(page.getByRole("treeitem", { name: /acme-api/ })).toBeVisible();
     await provide(page);
     expect(errors, "uncaught page errors").toEqual([]);
   },

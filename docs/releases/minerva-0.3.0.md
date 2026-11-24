@@ -6,6 +6,7 @@
 - Preserved the API conversation when changing providers between turns. Within one provider, model and effort changes apply at the next model request during an active turn.
 - Allowed permission changes during an active Minerva API turn. Tools check the current policy before execution and after an approval answer.
 - Added durable model-selection revisions and migration backups for the session database.
+- Updated `url` to 2.5.9 and `cookie` to 0.18.3 for their latest security fixes.
 
 Windows x64: install the `setup.exe` asset. Automatic updates use the existing Minerva signing key and update channel.
 

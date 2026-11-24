@@ -26,5 +26,9 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # SQLx at a pinned rev: upstream's unreleased SQLite dependency ceiling fix plus the MySQL
 # `deprecate_eof` option (transact-rs/sqlx#4507), until a release carries both.
-allow-git = ["https://github.com/l0ng-ai/sqlx"]
+allow-git = [
+    "https://github.com/l0ng-ai/sqlx",
+    # Minerva's MIT-licensed framing fix; Cargo.toml pins its revision.
+    "https://github.com/kviron/minerva-harness-tokio-lsp-client",
+]
 required-git-spec = "rev"

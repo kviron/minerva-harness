@@ -6,7 +6,7 @@
   gap: var(--space-4);
   height: 100%;
   overflow: auto;
-  padding: var(--space-6);
+  padding: var(--space-4);
 }
 .start h2 {
   color: var(--fg-strong);
