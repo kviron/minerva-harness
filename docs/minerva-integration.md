@@ -131,8 +131,9 @@ Chat/Development, узкая ширина, labels и A/B/A drafts. Fixture не 
 Последний Rust-прогон: `ide-agent` 355 passed, 5 ignored, 1 filtered;
 `ide-minerva` 3 passed. Последний targeted frontend-прогон: 6 файлов, 102 passed,
 6 skipped. Исходный plugin SDK: ранее 9 passed. Генератор bindings: 2 passed.
-Knip оставляет два upstream замечания: `Chip` и `DragCursor`; новые интеграционные
-модули не отмечены как неиспользуемые. Lint новых модулей и TypeScript прошли.
+Knip проходит после удаления неиспользуемых экспортов прежнего plugin registry.
+Общий CSS Select сохранён; анализатор учитывает зависимости CSS Modules composes.
+Lint новых модулей и TypeScript прошли.
 Нативное приложение пересобрано и запущено для `C:\dev\minerva-harness`.
 Наблюдался штатный Trust Project dialog; сквозной UI-прогон после него не
 завершён из-за конфликтующего ручного ввода. Независимые browser fixtures

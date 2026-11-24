@@ -41,7 +41,7 @@ describe("theme token reference", () => {
   });
 
   it("is current in plugins/themes.md (run pnpm gen:theme-docs)", () => {
-    const doc = read("plugins/themes.md");
+    const doc = read("plugins/themes.md").replace(/\r\n/g, "\n");
     expect(withReference(doc, referenceMarkdown(groups))).toBe(doc);
   });
 });
