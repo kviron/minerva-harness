@@ -1,3 +1,4 @@
+import { auxiliaryWindow } from "@/platform/auxWindow";
 import { Select } from "@/ui";
 import { executeAction } from "@/platform/actions";
 import { useProject } from "@/platform/project";
@@ -7,6 +8,7 @@ import { openHome, openTask, setSessionLocation, useAgents } from "./store";
 let modeRequest = 0;
 
 export async function setWorkspaceMode(value: "chat" | "development") {
+  if (auxiliaryWindow()) return;
   const request = ++modeRequest;
   const root = useProject.getState().project?.root;
   if (value === "development") {
@@ -37,7 +39,7 @@ export async function setWorkspaceMode(value: "chat" | "development") {
 export function WorkspaceMode() {
   const location = useAgents((s) => s.sessionLocation);
   const project = useProject((s) => s.project);
-  if (!project) return null;
+  if (!project || auxiliaryWindow()) return null;
   return (
     <Select
       aria-label="Workspace mode"

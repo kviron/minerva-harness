@@ -362,7 +362,9 @@ describe("StreamTraceEditor", () => {
       }),
     );
     const { container } = show();
-    expect(screen.getByText("Each step shows its first 1,000 values")).toBeTruthy();
+    expect(
+      screen.getByText(`Each step shows its first ${CELL_LIMIT.toLocaleString().replace(/\s/g, " ")} values`),
+    ).toBeTruthy();
     const [first, second] = screen.getAllByTestId("stream-trace-column");
     expect(within(first!).getAllByRole("listitem")).toHaveLength(CELL_LIMIT);
     expect(within(second!).getAllByRole("listitem")).toHaveLength(2);

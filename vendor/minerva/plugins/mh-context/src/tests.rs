@@ -304,3 +304,89 @@ fn skill_symlink_outside_project_is_denied() {
     std::os::unix::fs::symlink(outside.path(), dir.path().join(".agents/skills/outside")).unwrap();
     assert!(files::discover_skills(dir.path()).is_err());
 }
+
+#[test]
+fn permission_update_preserves_settings_and_does_not_revalidate_the_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.sqlite3");
+    let service = ContextService::open(&path).unwrap();
+    let folder = dir.path().join("removed-workspace");
+    fs::create_dir(&folder).unwrap();
+    let settings = service
+        .workspace_save(
+            "one",
+            WorkspaceSettings {
+                cwd: Some(folder.to_str().unwrap().into()),
+                permission_policy: tools::PermissionPolicy::Ask,
+                context_window: 8192,
+                auto_compact: false,
+                model_effort: Some(("model".into(), "high".into())),
+            },
+        )
+        .unwrap();
+    service.db().unwrap().execute("INSERT INTO selected_skills VALUES ('one','existing-skill')", []).unwrap();
+    fs::remove_dir(&folder).unwrap();
+    let mut expected = serde_json::to_value(settings).unwrap();
+    expected["permissionPolicy"] = json!("allow");
+    assert_eq!(
+        service.workspace_set_permission_policy("one", tools::PermissionPolicy::Allow).unwrap(),
+        tools::PermissionPolicy::Allow
+    );
+    assert_eq!(
+        service
+            .db()
+            .unwrap()
+            .query_row("SELECT name FROM selected_skills WHERE session='one'", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "existing-skill"
+    );
+    drop(service);
+    let service = ContextService::open(&path).unwrap();
+    assert_eq!(serde_json::to_value(service.workspace_get("one").unwrap()).unwrap(), expected);
+    service.workspace_set_permission_policy("two", tools::PermissionPolicy::Ask).unwrap();
+    let mut defaults = serde_json::to_value(WorkspaceSettings::default()).unwrap();
+    defaults["permissionPolicy"] = json!("ask");
+    assert_eq!(serde_json::to_value(service.workspace_get("two").unwrap()).unwrap(), defaults);
+    assert!(service.workspace_set_permission_policy("", tools::PermissionPolicy::Allow).is_err());
+}
+
+#[test]
+fn rejected_permission_write_preserves_the_previous_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = ContextService::open(&dir.path().join("policy.sqlite3")).unwrap();
+    let before = service.workspace_save("one", WorkspaceSettings::default()).unwrap();
+    service
+        .db()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_policy BEFORE UPDATE ON workspace BEGIN SELECT RAISE(ABORT,'write rejected'); END;",
+        )
+        .unwrap();
+    assert!(service.workspace_set_permission_policy("one", tools::PermissionPolicy::Allow).is_err());
+    assert_eq!(
+        serde_json::to_value(service.workspace_get("one").unwrap()).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
+
+#[test]
+fn permission_update_preserves_fields_unknown_to_this_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = ContextService::open(&dir.path().join("policy.sqlite3")).unwrap();
+    let mut original = serde_json::to_value(WorkspaceSettings::default()).unwrap();
+    original["futureSettings"] = json!({"skills":["existing"],"instructions":"leave intact"});
+    original["cwd"] = json!("missing-or-unavailable-path");
+    service
+        .db()
+        .unwrap()
+        .execute("INSERT INTO workspace VALUES (?1,?2)", params!["one", original.to_string()])
+        .unwrap();
+    service.workspace_set_permission_policy("one", tools::PermissionPolicy::Ask).unwrap();
+    let actual: String = service
+        .db()
+        .unwrap()
+        .query_row("SELECT settings FROM workspace WHERE session=?1", ["one"], |r| r.get(0))
+        .unwrap();
+    original["permissionPolicy"] = json!("ask");
+    assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), original);
+}

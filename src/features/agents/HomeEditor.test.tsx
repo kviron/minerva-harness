@@ -244,7 +244,7 @@ it("does not reuse a previous page's cached agent version when opened again", as
 
 /** The agent picker shows its icon; the name and version are in its tooltip. */
 function agentTooltip() {
-  return screen.getByRole("button", { name: "Agent" }).parentElement?.getAttribute("data-tooltip");
+  return screen.getByRole("button", { name: "Provider" }).parentElement?.getAttribute("data-tooltip");
 }
 
 it("offers Hermes profiles next to the model and starts the chosen one with -p", async () => {

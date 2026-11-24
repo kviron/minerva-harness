@@ -1,3 +1,4 @@
+import { auxiliaryWindow } from "@/platform/auxWindow";
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { Button, IconButton, T, lockDragCursor } from "@/ui";
 import { useChromeIconSize } from "@/ui/density";
@@ -115,6 +116,7 @@ export function AgentHistory() {
 }
 
 export function activateAgentNavigation() {
+  if (auxiliaryWindow()) return () => {};
   const sync = () => {
     const mainAgent = useAgents.getState().sessionLocation === "editor";
     useAgents.setState({ mainAgent });

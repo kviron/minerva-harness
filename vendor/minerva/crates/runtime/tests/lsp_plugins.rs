@@ -66,6 +66,7 @@ async fn installed_language_plugin_follows_enable_and_pause_lifecycle() {
         call_id: "call".into(),
         cwd: Some(dir.path().join("data/default-workspace")),
         policy: PermissionPolicy::ReadOnly,
+        live_policy: None,
         cancellation: Cancellation::default(),
         interactions: runtime.plugins.harness.interactions.clone(),
         sink: None,

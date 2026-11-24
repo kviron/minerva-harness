@@ -3,6 +3,8 @@
 //! approval/questions use per-call oneshots rather than Cordis waterfalls.
 pub mod files;
 mod interaction;
+#[cfg(test)]
+mod permission_tests;
 pub use interaction::InteractionBroker;
 pub use minerva_plugin_sdk::tools::*;
 use serde_json::{json, Value};
@@ -73,16 +75,34 @@ pub trait ToolEventSink: Send + Sync {
         result: Option<&Result<Value, String>>,
     ) -> Result<(), String>;
 }
+pub trait LivePermissionPolicy: Send + Sync {
+    fn read_policy(&self, session_id: &str) -> Result<PermissionPolicy, String>;
+}
 #[derive(Clone)]
 pub struct ToolContext {
     pub session_id: String,
     pub run_id: String,
     pub call_id: String,
     pub cwd: Option<PathBuf>,
+    /// Admission upper bound; a live reader may further restrict this call.
     pub policy: PermissionPolicy,
+    pub live_policy: Option<Arc<dyn LivePermissionPolicy>>,
     pub cancellation: Cancellation,
     pub interactions: Arc<InteractionBroker>,
     pub sink: Option<Arc<dyn ToolEventSink>>,
+}
+impl ToolContext {
+    pub fn effective_policy(&self) -> Result<PermissionPolicy, String> {
+        let current = match &self.live_policy {
+            Some(reader) => reader.read_policy(&self.session_id)?,
+            None => self.policy,
+        };
+        Ok(match (self.policy, current) {
+            (PermissionPolicy::ReadOnly, _) | (_, PermissionPolicy::ReadOnly) => PermissionPolicy::ReadOnly,
+            (PermissionPolicy::Ask, _) | (_, PermissionPolicy::Ask) => PermissionPolicy::Ask,
+            _ => PermissionPolicy::Allow,
+        })
+    }
 }
 struct Registration {
     owner: String,
@@ -203,9 +223,11 @@ impl AdmittedTools {
                 return Err("tool owner was revoked".into());
             }
             tool.input.validate(&args).map_err(|e| format!("invalid tool input: {e}"))?;
+            let mut approved = false;
             if tool.definition.side_effect {
-                match ctx.policy {
-                    PermissionPolicy::ReadOnly | PermissionPolicy::Ask => {
+                match ctx.effective_policy()? {
+                    PermissionPolicy::ReadOnly => return Err("tool writes are forbidden in read-only mode".into()),
+                    PermissionPolicy::Ask => {
                         emit("requires-approval", None)?;
                         let answer = ctx
                             .interactions
@@ -214,6 +236,7 @@ impl AdmittedTools {
                         if answer != "allow" {
                             return Err("tool approval denied".into());
                         }
+                        approved = true;
                     }
                     PermissionPolicy::Allow => {}
                 }
@@ -223,6 +246,13 @@ impl AdmittedTools {
             }
             if !tool.active.load(Ordering::SeqCst) {
                 return Err("tool owner was revoked".into());
+            }
+            if tool.definition.side_effect {
+                match ctx.effective_policy()? {
+                    PermissionPolicy::ReadOnly => return Err("tool writes are forbidden in read-only mode".into()),
+                    PermissionPolicy::Ask if !approved => return Err("tool policy changed; approval required".into()),
+                    _ => {}
+                }
             }
             emit("running", None)?;
             let output = (tool.handler)(ctx.clone(), args.clone()).await?;

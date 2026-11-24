@@ -3,6 +3,8 @@
 use super::*;
 use tokio::io::duplex;
 
+mod minerva_routes;
+
 #[test]
 fn permission_uses_its_own_command_payload() {
     let command = "python3 -c 'import pathlib\npathlib.Path(\"a.txt\").touch()'";
@@ -49,6 +51,7 @@ struct FakeAgent {
     hold_session_new: AtomicBool,
     /// Sleeps this long at the start of `session/set_config_option`, after noting the time.
     delay_config: Duration,
+    reject_model: Mutex<Option<String>>,
     config_entered: Mutex<Option<std::time::Instant>>,
     /// Config options `session/new` reports after the model one (per-model efforts, say).
     extra_options: Mutex<Vec<Value>>,
@@ -238,6 +241,10 @@ impl Handler for FakeAgent {
                 }
                 self.calls.lock().push(format!("{method} {}", params.get("value").or(params.get("modeId")).unwrap()));
                 if params["configId"] == "model" {
+                    let rejected = self.reject_model.lock().clone();
+                    if rejected.as_deref().is_some_and(|value| Some(value) == params["value"].as_str()) {
+                        return Err((codes::INVALID_PARAMS, "model rejected by fixture".into()));
+                    }
                     let gate = self.model_config_gate.lock().take();
                     if let Some(gate) = gate {
                         gate.recv().unwrap();

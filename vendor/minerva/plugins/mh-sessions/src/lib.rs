@@ -5,7 +5,9 @@ pub mod sessions;
 pub mod transcript {
     pub use minerva_plugin_sdk::transcript::*;
 }
-pub use run_types::{RunHandle, RunMessage, RunSnapshot, StartRunRequest};
+pub use run_types::{
+    DispatchAdmission, RouteDispatch, RouteSelection, RunHandle, RunMessage, RunSnapshot, StartRunRequest,
+};
 
 use cordis::{Context, Plugin};
 use sessions::SessionService;

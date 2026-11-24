@@ -2131,7 +2131,7 @@ describe("meters in the task header", () => {
     fireEvent.click(meter);
     expect(await screen.findByText("System tools")).toBeInTheDocument();
     expect(commands.agentContextUsage).toHaveBeenCalledWith("A");
-    expect(screen.getByText("196,800")).toBeInTheDocument();
+    expect(screen.getByText((196_800).toLocaleString().replace(/\s/g, " "))).toBeInTheDocument();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Context window" })).toBeNull();
   });

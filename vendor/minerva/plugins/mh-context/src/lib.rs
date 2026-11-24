@@ -23,6 +23,11 @@ pub struct ContextService {
 impl cordis::Service for ContextService {
     const NAME: &'static str = "studio.context";
 }
+impl tools::LivePermissionPolicy for ContextService {
+    fn read_policy(&self, session_id: &str) -> Result<tools::PermissionPolicy, String> {
+        Ok(self.workspace_get(session_id)?.permission_policy)
+    }
+}
 
 pub struct PreparedContext {
     pub system_prompt: String,
@@ -154,6 +159,21 @@ impl ContextService {
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+    pub fn workspace_set_permission_policy(
+        &self,
+        session: &str,
+        policy: tools::PermissionPolicy,
+    ) -> Result<tools::PermissionPolicy, String> {
+        valid_id(session)?;
+        let defaults = WorkspaceSettings { permission_policy: policy, ..Default::default() };
+        let defaults = serde_json::to_string(&defaults).map_err(|e| e.to_string())?;
+        let policy_json = serde_json::to_string(&policy).map_err(|e| e.to_string())?;
+        self.db()?.execute(
+            "INSERT INTO workspace VALUES (?1,?2) ON CONFLICT(session) DO UPDATE SET settings=json_set(workspace.settings,'$.permissionPolicy',json(?3))",
+            params![session, defaults, policy_json],
+        ).map_err(|e| e.to_string())?;
+        Ok(policy)
     }
     pub fn workspace_save(&self, session: &str, mut settings: WorkspaceSettings) -> Result<WorkspaceSettings, String> {
         valid_id(session)?;

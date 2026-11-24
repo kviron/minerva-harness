@@ -77,6 +77,12 @@ struct Workspace {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PermissionPolicyUpdate {
+    session_id: String,
+    permission_policy: crate::tools::PermissionPolicy,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Upload {
     session_id: String,
     name: String,
@@ -370,6 +376,14 @@ impl Runtime {
                 let a: Session = args(params)?;
                 self.sessions.get(&a.session_id)?;
                 encoded(harness.context.workspace_get(&a.session_id)?)
+            }
+            "workspace.set_permission_policy" => {
+                let a: PermissionPolicyUpdate = args(params)?;
+                self.sessions.get(&a.session_id)?;
+                if !harness.local {
+                    return Err("Live permission changes are unavailable in this profile".into());
+                }
+                encoded(harness.context.workspace_set_permission_policy(&a.session_id, a.permission_policy)?)
             }
             "workspace.save" => {
                 let a: Workspace = args(params)?;

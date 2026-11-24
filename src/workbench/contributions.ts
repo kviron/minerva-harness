@@ -432,16 +432,6 @@ export interface WorkspaceItem {
   input: EditorInput;
 }
 export const useWorkspaceItems = create<{ items: Map<string, WorkspaceItem> }>(() => ({ items: new Map() }));
-export function registerWorkspaceItem(item: WorkspaceItem): () => void {
-  useWorkspaceItems.setState((s) => ({ items: new Map(s.items).set(item.id, item) }));
-  return () =>
-    useWorkspaceItems.setState((s) => {
-      if (s.items.get(item.id) !== item) return s;
-      const items = new Map(s.items);
-      items.delete(item.id);
-      return { items };
-    });
-}
 export const registerTitleItem = (c: TitleItemContribution) => register("titleItems", c.id, c);
 export const registerServiceView = (c: ServiceViewContribution) => register("serviceViews", c.id, c);
 

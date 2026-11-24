@@ -80,6 +80,7 @@ async fn setup(dir: &std::path::Path, address: std::net::SocketAddr) -> Provider
 fn run(context: Arc<ContextService>, tools: &ToolRegistry, cancellation: Cancellation) -> ProviderRunContext {
     ProviderRunContext {
         reasoning_effort: None,
+        selection: None,
         session_id: "session".into(),
         run_id: "run".into(),
         tools: tools.snapshot(),
@@ -89,6 +90,7 @@ fn run(context: Arc<ContextService>, tools: &ToolRegistry, cancellation: Cancell
             call_id: String::new(),
             cwd: None,
             policy: PermissionPolicy::ReadOnly,
+            live_policy: None,
             cancellation,
             interactions: Arc::new(InteractionBroker::default()),
             sink: None,

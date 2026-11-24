@@ -17,6 +17,7 @@ mod elicitation;
 mod external;
 pub mod hermes;
 pub mod mcp;
+mod minerva_routes;
 mod model;
 mod native;
 mod provider;
@@ -195,6 +196,16 @@ impl Shared {
 
     fn spec(&self, id: &str) -> Option<provider::ProviderSpec> {
         self.providers.read().iter().find(|p| p.id == id).cloned()
+    }
+
+    fn saved_task_spec(&self, id: &str) -> Option<provider::ProviderSpec> {
+        self.spec(id).or_else(|| {
+            id.strip_prefix("minerva.api.").filter(|suffix| !suffix.is_empty())?;
+            let mut spec = self.spec("minerva").filter(|spec| spec.driver == provider::Driver::Minerva)?;
+            spec.id = id.to_owned();
+            spec.args = vec![format!("api:{}/", id.strip_prefix("minerva.api.")?)];
+            Some(spec)
+        })
     }
 
     fn env_secrets(&self) -> Option<&dyn EnvSecrets> {
@@ -496,6 +507,10 @@ struct Task {
     live: Mutex<Option<Live>>,
     /// Serializes starting the agent.
     connecting: tokio::sync::Mutex<()>,
+    /// Serializes notification application with connection replacement.
+    connection_events: Mutex<u64>,
+    /// Settings and message admission agree on the provider before dispatch.
+    setting_changes: tokio::sync::Mutex<()>,
     /// Serializes replies from multiple windows to the same async question.
     answering_questions: tokio::sync::Mutex<()>,
     /// Unanswered permission requests: where to send the chosen option id.
@@ -1078,6 +1093,8 @@ impl AgentManager {
     /// is cancelled and the message goes next.
     pub async fn prompt(&self, id: &str, prompt: AgentPrompt, now: bool) -> IdeResult<()> {
         let task = self.task(id)?;
+        let _settings = if task.uses_minerva_driver() { Some(task.setting_changes.lock().await) } else { None };
+        task.validate_minerva_route()?;
         let prompt = clean(prompt).ok_or_else(|| IdeError::invalid("empty message"))?;
         // An agent that takes messages mid-turn gets it right away.
         let prompt = match now {
@@ -1108,6 +1125,7 @@ impl AgentManager {
                 Some(prompt)
             }
         };
+        drop(_settings);
         match start {
             Some(prompt) => {
                 self.shared.runtime.spawn(async move { task.run(prompt).await });
@@ -1162,6 +1180,8 @@ impl AgentManager {
     /// messages mid-turn, else next, cancelling the current turn if there is one.
     pub async fn send_queued_now(&self, id: &str, queued: &str) -> IdeResult<()> {
         let task = self.task(id)?;
+        let _settings = if task.uses_minerva_driver() { Some(task.setting_changes.lock().await) } else { None };
+        task.validate_minerva_route()?;
         let (item, busy) = {
             let mut s = task.state.lock();
             let i =
@@ -1175,6 +1195,7 @@ impl AgentManager {
         };
         task.persist();
         task.emit_task();
+        drop(_settings);
         if !busy {
             self.shared.runtime.spawn(async move { task.run(item.prompt).await });
             return Ok(());
@@ -1212,6 +1233,12 @@ impl AgentManager {
     /// Changes a session setting (model, mode…): right away when the agent runs, else when it next starts.
     pub async fn set_config(&self, id: &str, option: &str, value: String) -> IdeResult<()> {
         let task = self.task(id)?;
+        let minerva = task.uses_minerva_driver();
+        let _settings = if minerva { Some(task.setting_changes.lock().await) } else { None };
+        if option == "provider" && task.uses_minerva_driver() {
+            return self.switch_minerva_provider(id, value).await;
+        }
+        let connecting = if minerva { Some(task.connecting.lock().await) } else { None };
         let provider = task.state.lock().task.provider.clone();
         let discovered = self
             .shared
@@ -1269,6 +1296,9 @@ impl AgentManager {
                     s.pending_model = None;
                     s.discovering_model = None;
                 }
+                let previous_choices =
+                    (minerva && switching_model && target.current.as_deref() != Some(value.as_str()))
+                        .then(|| task.clear_minerva_model_choices(&mut s));
                 let previous_levels = (switching_model && target.current.as_deref() != Some(value.as_str()))
                     .then(|| s.task.config.extract_if(.., |o| config::is_per_model_option(o)).collect::<Vec<_>>());
                 s.wanted.retain(|c| c.id != option);
@@ -1276,10 +1306,17 @@ impl AgentManager {
                 s.task.config.iter_mut().find(|o| o.id == option).expect("selected setting").current =
                     Some(value.clone());
                 s.task.model = model_of(&s.task.config).or(s.task.model.take());
-                (target, Some((s.model_choice, previous_levels)))
+                (
+                    target,
+                    Some((
+                        s.model_choice,
+                        ConfigRollback { levels: previous_levels, minerva_choices: previous_choices },
+                    )),
+                )
             }
         };
-        let Some((model_choice, previous_levels)) = change else {
+        let Some((model_choice, rollback)) = change else {
+            drop(connecting);
             return task.switch_discovered_model(target, value).await;
         };
         let previous = target.current.clone();
@@ -1307,7 +1344,7 @@ impl AgentManager {
             let levels = match levels {
                 Ok(levels) => levels,
                 Err(error) => {
-                    restore_config_choice(&task, &target, &value, previous.as_deref(), model_choice, previous_levels);
+                    restore_config_choice(&task, &target, &value, previous.as_deref(), model_choice, rollback);
                     task.persist();
                     task.emit_task();
                     return Err(IdeError::unavailable(error));
@@ -1327,7 +1364,7 @@ impl AgentManager {
             let reply: Value = match live.peer.request(method, params, None).await {
                 Ok(reply) => reply,
                 Err(e) => {
-                    restore_config_choice(&task, &target, &value, previous.as_deref(), model_choice, previous_levels);
+                    restore_config_choice(&task, &target, &value, previous.as_deref(), model_choice, rollback);
                     task.persist();
                     task.emit_task();
                     return Err(IdeError::internal(task.describe(e)));
@@ -2217,6 +2254,8 @@ impl Task {
             }),
             live: Mutex::new(None),
             connecting: tokio::sync::Mutex::new(()),
+            connection_events: Mutex::new(0),
+            setting_changes: tokio::sync::Mutex::new(()),
             answering_questions: tokio::sync::Mutex::new(()),
             permissions: Mutex::new(HashMap::new()),
             next_permission: AtomicU32::new(1),
@@ -2392,28 +2431,29 @@ impl Task {
         if *deleted {
             return;
         }
-        let bytes = {
-            let s = self.state.lock();
-            serde_json::to_vec(&TaskFile {
-                task: s.task.clone(),
-                session_id: s.session_id.clone(),
-                entries: s.conversation.main.entries.clone(),
-                wanted: s.wanted.clone(),
-                pending_model: None,
-                pending_switch: s.pending_model.clone(),
-                before: (*s.before).clone(),
-                saved: s.saved.clone(),
-                touched: s.touched.as_deref().cloned(),
-                turn: s.turn.as_deref().cloned(),
-                subagents: s.conversation.saved_subagents(),
-                pending_rollback: s.pending_rollback,
-                title_renamed: s.title_renamed,
-            })
-        };
-        let path = self.shared.paths.store_dir.join(format!("{}.json", self.id));
-        if let Err(e) = bytes.map_err(|e| e.to_string()).and_then(|b| write_file(&path, &b)) {
+        if let Err(e) = self.persist_state(&self.state.lock()) {
             tracing::warn!("saving agent task {}: {e}", self.id);
         }
+    }
+
+    fn persist_state(&self, s: &TaskState) -> Result<(), String> {
+        let bytes = serde_json::to_vec(&TaskFile {
+            task: s.task.clone(),
+            session_id: s.session_id.clone(),
+            entries: s.conversation.main.entries.clone(),
+            wanted: s.wanted.clone(),
+            pending_model: None,
+            pending_switch: s.pending_model.clone(),
+            before: (*s.before).clone(),
+            saved: s.saved.clone(),
+            touched: s.touched.as_deref().cloned(),
+            turn: s.turn.as_deref().cloned(),
+            subagents: s.conversation.saved_subagents(),
+            pending_rollback: s.pending_rollback,
+            title_renamed: s.title_renamed,
+        });
+        let path = self.shared.paths.store_dir.join(format!("{}.json", self.id));
+        bytes.map_err(|e| e.to_string()).and_then(|b| write_file(&path, &b))
     }
 
     fn mark_dirty(self: &Arc<Self>, indices: impl IntoIterator<Item = (Session, usize)>) {
@@ -2550,6 +2590,8 @@ impl Task {
 
     async fn switch_discovered_model(&self, target: AgentConfigOption, value: String) -> IdeResult<()> {
         let provider = self.state.lock().task.provider.clone();
+        let minerva =
+            self.shared.saved_task_spec(&provider).is_some_and(|spec| spec.driver == provider::Driver::Minerva);
         let candidate = self.shared.paths.catalogs.listed_model(&self.shared, &provider, &value).ok_or_else(|| {
             IdeError::invalid(format!("{} has no value {value} in the current model catalog", target.name))
         })?;
@@ -2596,6 +2638,9 @@ impl Task {
                     }
                     if s.task.status == AgentStatus::Archived {
                         return Err(IdeError::invalid("the task is archived"));
+                    }
+                    if minerva && s.task.model.as_deref() != Some(value.as_str()) {
+                        self.clear_minerva_model_choices(&mut s);
                     }
                     if let Some(options) = reply.get("configOptions") {
                         config::merge_update(&mut s.task.config, options);
@@ -2945,7 +2990,9 @@ impl Task {
             (s.task.provider.clone(), s.task.cwd.0.clone(), s.session_id.clone(), s.pending_model.clone())
         };
         let pending_model = pending.as_ref();
-        let raw_spec = self.shared.spec(&provider_id).ok_or_else(|| format!("unknown agent {provider_id}"))?;
+        let raw_spec =
+            if saved.is_some() { self.shared.saved_task_spec(&provider_id) } else { self.shared.spec(&provider_id) }
+                .ok_or_else(|| format!("unknown agent {provider_id}"))?;
         let can_fallback =
             raw_spec.driver == provider::Driver::Copilot && !self.shared.uses_copilot_acp_fallback(&raw_spec);
         let primary_spec = if raw_spec.driver == provider::Driver::Copilot && !can_fallback {
@@ -3045,7 +3092,8 @@ impl Task {
         let mut tried_auth = false;
         let mut session = None;
         let start_fresh = self.start_fresh.load(Ordering::Acquire);
-        if pending_model.is_some() && (saved.is_none() || !can_load || start_fresh) {
+        let requires_resume = pending_model.is_some() || (spec.driver == provider::Driver::Minerva && saved.is_some());
+        if requires_resume && (saved.is_none() || !can_load || start_fresh) {
             return Err(SessionOpenError {
                 message: "The agent does not support resuming this session.".into(),
                 allow_acp_fallback: false,
@@ -3066,7 +3114,7 @@ impl Task {
                     if let Some(message) = self.sign_in_error(&e, Some(&sign_in_message)) {
                         return Err(SessionOpenError { message, allow_acp_fallback: false });
                     }
-                    if pending_model.is_some() {
+                    if requires_resume {
                         return Err(SessionOpenError {
                             message: format!(
                                 "Couldn't reopen this conversation's {} session: {}",
@@ -3143,6 +3191,9 @@ impl Task {
             let options = if known { reported } else { s.task.config.clone() };
             let mut wanted = s.wanted.clone();
             if let Some(pending) = pending_model {
+                if spec.driver == provider::Driver::Minerva {
+                    wanted.retain(|choice| choice.id != "reasoning_effort");
+                }
                 pending.apply(&mut wanted, &s.task.config);
             }
             (options, wanted)
@@ -3266,6 +3317,9 @@ impl Task {
                     });
                 }
                 let TaskState { task, wanted, .. } = &mut *s;
+                if spec.driver == provider::Driver::Minerva {
+                    wanted.retain(|choice| choice.id != "reasoning_effort");
+                }
                 pending.apply(wanted, &task.config);
             }
             s.task.model = model_of(&options).or(s.task.model.take());
@@ -3319,11 +3373,24 @@ impl Task {
         }
         let task = self.clone();
         self.shared.runtime.spawn(async move {
+            let minerva = task.uses_minerva_driver();
+            let _settings = if minerva { Some(task.setting_changes.lock().await) } else { None };
+            if minerva && (live.peer.is_closed() || task.state.lock().task.provider != live.provider) {
+                return;
+            }
             for (option, value) in due {
+                if minerva
+                    && !task.state.lock().wanted.iter().any(|choice| choice.id == option.id && choice.value == value)
+                {
+                    task.config_sent.lock().remove(&(option.id.clone(), value));
+                    continue;
+                }
                 let (method, mut params) = config::set_request(&option, &value);
                 params["sessionId"] = json!(live.session);
                 match live.peer.request::<_, Value>(method, params, None).await {
-                    Ok(reply) => {
+                    Ok(reply)
+                        if !minerva || (!live.peer.is_closed() && task.state.lock().task.provider == live.provider) =>
+                    {
                         let mut s = task.state.lock();
                         if let Some(fresh) = reply.get("configOptions") {
                             config::merge_update(&mut s.task.config, fresh);
@@ -3345,6 +3412,7 @@ impl Task {
                         drop(s);
                         task.shared.remember(&provider, Some(&options), None, model.as_deref());
                     }
+                    Ok(_) => return,
                     Err(e) => tracing::warn!("agent task {}: setting {} to {value} failed: {e}", task.id, option.id),
                 }
             }
@@ -3756,6 +3824,7 @@ impl Task {
 /// Answers the agent's requests on behalf of one task.
 struct Client {
     task: Weak<Task>,
+    epoch: u64,
     opening_config: Mutex<Option<OpeningConfig>>,
 }
 
@@ -3769,6 +3838,7 @@ impl Client {
     fn new(task: &Arc<Task>, opening_session: Option<&str>) -> Arc<Self> {
         Arc::new(Self {
             task: Arc::downgrade(task),
+            epoch: *task.connection_events.lock(),
             opening_config: Mutex::new(
                 opening_session.map(|id| OpeningConfig { session: id.to_owned(), options: None }),
             ),
@@ -3782,6 +3852,11 @@ impl Client {
 
 impl Handler for Client {
     fn on_notification(&self, method: &str, params: Value) {
+        let Some(owner) = self.task.upgrade() else { return };
+        let events = owner.connection_events.lock();
+        if *events != self.epoch {
+            return;
+        }
         if method == WARNING_NOTIFICATION {
             if let Some(task) = self.task.upgrade()
                 && let Some(message) = params.get("message").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
@@ -3808,11 +3883,18 @@ impl Handler for Client {
 
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         let task = self.task.upgrade().ok_or((codes::INTERNAL_ERROR, "task closed".to_owned()))?;
-        match method {
+        if *task.connection_events.lock() != self.epoch {
+            return Err((codes::INVALID_REQUEST, "agent connection was replaced".to_owned()));
+        }
+        let result = match method {
             "session/request_permission" => Ok(task.ask_permission(&params)),
             "elicitation/create" => task.elicit(&params, None).map_err(|e| (codes::INVALID_PARAMS, e)),
             _ => Err((codes::METHOD_NOT_FOUND, format!("unsupported method {method}"))),
+        };
+        if *task.connection_events.lock() != self.epoch {
+            return Err((codes::INVALID_REQUEST, "agent connection was replaced".to_owned()));
         }
+        result
     }
 
     fn on_request_raw(&self, method: &str, params: Value, raw: &[u8]) -> Result<Value, (i64, String, Option<Value>)> {
@@ -3820,7 +3902,14 @@ impl Handler for Client {
             return self.on_request_with_data(method, params);
         }
         let task = self.task.upgrade().ok_or((codes::INTERNAL_ERROR, "task closed".to_owned(), None))?;
-        task.elicit(&params, Some(raw)).map_err(|e| (codes::INVALID_PARAMS, e, None))
+        if *task.connection_events.lock() != self.epoch {
+            return Err((codes::INVALID_REQUEST, "agent connection was replaced".to_owned(), None));
+        }
+        let result = task.elicit(&params, Some(raw)).map_err(|e| (codes::INVALID_PARAMS, e, None));
+        if *task.connection_events.lock() != self.epoch {
+            return Err((codes::INVALID_REQUEST, "agent connection was replaced".to_owned(), None));
+        }
+        result
     }
 }
 
@@ -4077,6 +4166,7 @@ fn stage_key(driver: provider::Driver) -> &'static str {
         provider::Driver::Codex => "codex",
         provider::Driver::Copilot => "copilot",
         provider::Driver::Acp => "acp",
+        provider::Driver::Minerva => "minerva",
     }
 }
 
@@ -4120,13 +4210,18 @@ fn retry_of(update: &Value, now: f64) -> Option<AgentRetry> {
     })
 }
 
+struct ConfigRollback {
+    levels: Option<Vec<AgentConfigOption>>,
+    minerva_choices: Option<minerva_routes::ModelChoiceRollback>,
+}
+
 fn restore_config_choice(
     task: &Task,
     target: &AgentConfigOption,
     value: &str,
     previous: Option<&str>,
     model_choice: u64,
-    previous_levels: Option<Vec<AgentConfigOption>>,
+    rollback: ConfigRollback,
 ) {
     let option = target.id.as_str();
     let is_model = target.category.as_deref() == Some("model");
@@ -4143,9 +4238,12 @@ fn restore_config_choice(
     if let Some(o) = s.task.config.iter_mut().find(|o| o.id == option) {
         o.current = previous.map(str::to_owned);
     }
-    if let Some(levels) = previous_levels {
+    if let Some(levels) = rollback.levels {
         s.task.config.retain(|o| !config::is_per_model_option(o));
         s.task.config.extend(levels);
+    }
+    if let Some(choices) = rollback.minerva_choices {
+        choices.restore(&mut s, &mut task.config_sent.lock());
     }
     s.task.model = model_of(&s.task.config).or(s.task.model.take());
 }

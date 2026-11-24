@@ -5,6 +5,21 @@ use crate::{
     sessions::{ContentPart, IntegrationState, SessionMessage, SessionService},
 };
 use serde_json::{json, Map};
+
+#[derive(Clone, Copy)]
+pub(crate) enum PolicyAdmission {
+    Snapshot,
+    NativeUserMutable,
+}
+
+impl PolicyAdmission {
+    fn ceiling(self, initial: crate::tools::PermissionPolicy) -> crate::tools::PermissionPolicy {
+        match self {
+            Self::Snapshot => initial,
+            Self::NativeUserMutable => crate::tools::PermissionPolicy::Allow,
+        }
+    }
+}
 #[derive(serde::Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
@@ -48,7 +63,7 @@ pub async fn run(
     request: RunRequest,
 ) -> Result<SessionRunResult, String> {
     let mut guard = runs.acquire(id, &request.response_id)?;
-    run_inner(store, manager, id, request, &mut guard, false).await
+    run_inner(store, manager, id, request, &mut guard, false, PolicyAdmission::Snapshot).await
 }
 
 pub(crate) async fn run_inner(
@@ -58,6 +73,7 @@ pub(crate) async fn run_inner(
     request: RunRequest,
     guard: &mut crate::runs::RunGuard,
     accepted: bool,
+    admission: PolicyAdmission,
 ) -> Result<SessionRunResult, String> {
     let messages = store.branch(id, &request.last_message_id)?;
     let parent = messages.last().and_then(|m| m.parent_id.clone());
@@ -111,10 +127,22 @@ pub(crate) async fn run_inner(
         )
     });
     let result: Result<SessionRunResult, String> = async {
+        let requested_effort = match request.options.get("reasoningEffort") {
+            None => None,
+            Some(value) => Some(value.as_str().filter(|s| !s.is_empty() && s.len() <= 32).ok_or("invalid reasoningEffort")?.to_owned()),
+        };
+        let (selection, effective_model, reasoning_effort) = if request.options.get("liveSelection").and_then(serde_json::Value::as_bool) == Some(true) && request.model.starts_with("api:") {
+            let (control, initial) = crate::selection_control::SessionSelection::admit(
+                store.clone(), id.into(), request.response_id.clone(), request.model.clone(), requested_effort,
+            ).await?;
+            (Some(control), initial.model, initial.reasoning_effort)
+        } else {
+            (None, request.model.clone(), requested_effort)
+        };
         let mut prepared = manager.harness.context.prepare_enriched(id, &messages).await?;
         if prepared.budget.should_compact && !crate::context::compact_prefix(&messages, 4).is_empty() {
             manager
-                .compact_messages_cancellable(id, &request.model, &messages, &mut guard.cancel)
+                .compact_messages_cancellable(id, &effective_model, &messages, &mut guard.cancel)
                 .await?;
             prepared = manager.harness.context.prepare_enriched(id, &messages).await?;
         }
@@ -161,16 +189,15 @@ pub(crate) async fn run_inner(
             },
             context: manager.harness.context.clone(),
             messages,
-            reasoning_effort: match request.options.get("reasoningEffort") {
-                None => None,
-                Some(value) => Some(value.as_str().filter(|s| !s.is_empty() && s.len() <= 32).ok_or("invalid reasoningEffort")?.to_owned()),
-            },
+            reasoning_effort,
+            selection,
             tool_context: crate::tools::ToolContext {
                 session_id: id.into(),
                 run_id: request.response_id.clone(),
                 call_id: String::new(),
                 cwd: settings.cwd.map(std::path::PathBuf::from),
-                policy: settings.permission_policy,
+                policy: admission.ceiling(settings.permission_policy),
+                live_policy: Some(manager.harness.context.clone()),
                 cancellation,
                 interactions: manager.harness.interactions.clone(),
                 sink: None,
@@ -187,7 +214,7 @@ pub(crate) async fn run_inner(
             tokio::select! {
                 biased;
                 _ = async { if !*guard.cancel.borrow() { let _ = guard.cancel.changed().await; } } => Err("Запрос отменён.".to_string()),
-                result = execute(manager,&request,turns,sink,run_context) => result,
+                result = execute(manager,&effective_model,turns,sink,run_context) => result,
             }
         }
     }.await;
@@ -220,12 +247,11 @@ pub(crate) async fn run_inner(
 
 async fn execute(
     manager: &PluginManager,
-    request: &RunRequest,
+    model: &str,
     turns: Vec<crate::sessions::Turn>,
     sink: crate::transcript::TranscriptSink,
     context: crate::harness::AgentRunContext,
 ) -> Result<SessionRunResult, String> {
-    let model = request.model.as_str();
     let value = model.strip_prefix("api:").ok_or("Выберите модель в настройках.")?;
     let (provider, model) = value.split_once('/').ok_or("Некорректный ID модели")?;
     let transcript = manager.providers()?.chat_agent(provider, model, turns, sink, context).await?;

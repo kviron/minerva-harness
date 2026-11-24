@@ -182,10 +182,12 @@ describe("MemoryView", () => {
     render(<MemoryView session={session} />);
     await screen.findByText("Heap$Live");
     expect(screen.getByText("java.base")).toBeTruthy();
-    expect(screen.getByText((1_000_000).toLocaleString())).toBeTruthy();
+    expect(screen.getByText((1_000_000).toLocaleString().replace(/\s/g, " "))).toBeTruthy();
     expect(screen.getByText("15.3 MB")).toBeTruthy();
     expect(screen.getByText("+3")).toBeTruthy();
-    expect(screen.getByText(`3 classes · ${(1_000_042).toLocaleString()} objects · 15.3 MB`)).toBeTruthy();
+    expect(
+      screen.getByText(`3 classes · ${(1_000_042).toLocaleString().replace(/\s/g, " ")} objects · 15.3 MB`),
+    ).toBeTruthy();
     expect(screen.getByText("Counts include objects that are unreachable but not yet collected.")).toBeTruthy();
   });
 
@@ -255,7 +257,9 @@ describe("MemoryView", () => {
     await screen.findByText("Instances of Heap$Live");
     try {
       await act(() => setLocale("zh"));
-      expect(screen.getByText(`3 个类 · ${(1_000_042).toLocaleString()} 个对象 · 15.3 MB`)).toBeTruthy();
+      expect(
+        screen.getByText(`3 个类 · ${(1_000_042).toLocaleString().replace(/\s/g, " ")} 个对象 · 15.3 MB`),
+      ).toBeTruthy();
       expect(screen.getByText("Heap$Live 的实例")).toBeTruthy();
       expect(screen.getByText("仅显示前 0 个实例。")).toBeTruthy();
       expect(screen.getByRole("toolbar", { name: "内存" })).toBeTruthy();

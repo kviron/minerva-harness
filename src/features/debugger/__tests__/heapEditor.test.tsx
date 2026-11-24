@@ -267,7 +267,9 @@ describe("HeapSnapshotEditor", () => {
     fireEvent.mouseDown(rowOf(classTable(), "Node"));
     fireEvent.mouseDown(rowOf(await screen.findByRole("grid", { name: "Biggest objects of Node" }), "Node@0x10"));
     const path = await screen.findByRole("region", { name: "Path to GC Root" });
-    const gap = await within(path).findByText(`Path truncated: ${(2000).toLocaleString()} steps not shown`);
+    const gap = await within(path).findByText(
+      `Path truncated: ${(2000).toLocaleString().replace(/\s/g, " ")} steps not shown`,
+    );
     const rows = within(path).getAllByRole("option");
     expect(rows.map((r) => r.textContent)).toEqual([
       expect.stringContaining(".next"),

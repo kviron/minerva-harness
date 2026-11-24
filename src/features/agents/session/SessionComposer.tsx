@@ -37,6 +37,8 @@ import { PermissionLine } from "./QuestionForm";
 import { SessionStatus } from "./SessionStatus";
 import { Elapsed } from "./WorkingRow";
 import { WorkingSubagents } from "./toolEntries";
+import { SessionProviderPicker } from "./SessionProviderPicker";
+import { useSessionProvider } from "./useSessionProvider";
 
 /**
  * What needs the user or tells where the agent is, above the composer: an approval it
@@ -169,6 +171,7 @@ export function SessionComposer({
     (!!model || !!task.model || !!catalogModel) &&
     !!provider?.installed &&
     project?.trusted !== false;
+  const currentModel = model?.current;
   const pickerConfig = useMemo(() => {
     if (!canRefreshModels) return task.config;
     if (!model) {
@@ -191,18 +194,19 @@ export function SessionComposer({
     const offered = catalogModel?.values;
     if (!offered?.length) return task.config;
     const kept = model.values.filter(
-      (v) => (v.value === model.current || v.value === task.model) && !offered.some((o) => o.value === v.value),
+      (v) => (v.value === currentModel || v.value === task.model) && !offered.some((o) => o.value === v.value),
     );
     return task.config.map((o) => (o === model ? { ...model, values: [...offered, ...kept] } : o));
-  }, [task.config, task.model, model, model?.current, catalogModel, canRefreshModels]);
+  }, [task.config, task.model, model, currentModel, catalogModel, canRefreshModels]);
   const [sending, setSending] = useState(false);
-  const configChange = useRef<{ loadingModel: boolean } | null>(null);
+  const configChange = useRef<{ loadingModel: boolean; provider?: boolean } | null>(null);
   const [configuring, setConfiguring] = useState<typeof configChange.current>(null);
   const [mcpOpenRequest, setMcpOpenRequest] = useState(0);
   const [skillsOpenRequest, setSkillsOpenRequest] = useState(0);
   const [assetFocus, setAssetFocus] = useState(0);
   const agentCommands = useAgentCommands(task.provider, task.id, task.commands);
   const busy = isBusy(task.status);
+  const sessionProvider = useSessionProvider(task.id, task.provider, task.model);
   const shellRunning = useAgents((s) => s.shellRunning.has(task.id));
   // ↑ recalls this conversation's messages, newest first.
   const history = useMemo(
@@ -217,7 +221,14 @@ export function SessionComposer({
     task.status === "running" &&
     (composer.images.length === 0 || !!task.capabilities.images);
   const send = (now: boolean) => {
-    if (!canSend(composer) || sending || configChange.current || task.status === "archived") return;
+    if (
+      !canSend(composer) ||
+      sending ||
+      configChange.current ||
+      task.status === "archived" ||
+      sessionProvider?.modelAvailable === false
+    )
+      return;
     setSending(true);
     sendMessage(task.id, now && (whileRunning !== "steer" || steers))
       .catch((e: unknown) =>
@@ -230,11 +241,17 @@ export function SessionComposer({
       .finally(() => setSending(false));
   };
   const setOption = (id: string, value: string) => {
+    if (configChange.current?.provider) return;
     const pickerModel = pickerConfig.find((o) => o.category === "model");
+    const changingProvider = id === "provider";
     const changingModel = id === pickerModel?.id;
     const loadingModel = changingModel && !model?.values.some((v) => v.value === value);
     const pendingModel = model?.current != null && model.current !== task.model;
-    const change = loadingModel || (changingModel && configChange.current) || pendingModel ? { loadingModel } : null;
+    if (changingProvider && (busy || configChange.current || value === task.provider)) return;
+    const change =
+      changingProvider || loadingModel || (changingModel && configChange.current) || pendingModel
+        ? { loadingModel, provider: changingProvider }
+        : null;
     if (change) {
       configChange.current = change;
       setConfiguring(change);
@@ -270,6 +287,13 @@ export function SessionComposer({
             title="Unarchive"
             onClick={() => void executeAction("agents.unarchiveTasks", [task.id])}
           />
+        </div>
+      )}
+      {sessionProvider?.modelAvailable === false && task.status !== "archived" && (
+        <div className={styles.banner} role="status">
+          <span className={styles.bannerText}>
+            <T>Choose a model from this provider to continue.</T>
+          </span>
         </div>
       )}
       <Tray task={task} entries={entries}>
@@ -308,6 +332,13 @@ export function SessionComposer({
         ]}
         toolbar={
           <>
+            {sessionProvider && (
+              <SessionProviderPicker
+                {...sessionProvider}
+                disabled={busy || configuring !== null || task.status === "archived"}
+                onChange={(value) => setOption("provider", value)}
+              />
+            )}
             <HermesProfilePicker provider={task.provider} />
             <ConfigPickers
               config={pickerConfig}
@@ -368,7 +399,13 @@ export function SessionComposer({
               label={busy ? "Queue" : "Send"}
               pending={sending}
               variant={busy ? "secondary" : "primary"}
-              disabled={!canSend(composer) || sending || configuring !== null || task.status === "archived"}
+              disabled={
+                !canSend(composer) ||
+                sending ||
+                configuring !== null ||
+                task.status === "archived" ||
+                sessionProvider?.modelAvailable === false
+              }
               onClick={() => send(false)}
             />
           </>

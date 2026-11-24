@@ -2,12 +2,16 @@ import { beforeEach, expect, it, vi } from "vitest";
 
 const fixture = vi.hoisted(() => ({
   tasks: new Map(),
+  auxiliary: false,
   openHome: vi.fn(),
   placement: vi.fn(),
   show: vi.fn(),
   hide: vi.fn(),
   close: vi.fn<() => Promise<boolean>>(),
   reset: vi.fn(),
+}));
+vi.mock("@/platform/auxWindow", () => ({
+  auxiliaryWindow: () => (fixture.auxiliary ? { kind: "editor", parent: "main" } : null),
 }));
 vi.mock("./store", () => ({
   openHome: fixture.openHome,
@@ -23,6 +27,7 @@ import { setWorkspaceMode } from "./WorkspaceMode";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  fixture.auxiliary = false;
   fixture.close.mockResolvedValue(true);
 });
 
@@ -57,4 +62,14 @@ it("does not apply an old Development transition after the user returns to Agent
   await leaving;
   expect(fixture.placement).toHaveBeenCalledTimes(1);
   expect(fixture.placement).toHaveBeenLastCalledWith("editor");
+});
+
+it("leaves auxiliary editor windows in their existing layout", async () => {
+  fixture.auxiliary = true;
+  await setWorkspaceMode("chat");
+  await setWorkspaceMode("development");
+  expect(fixture.placement).not.toHaveBeenCalled();
+  expect(fixture.openHome).not.toHaveBeenCalled();
+  expect(fixture.close).not.toHaveBeenCalled();
+  expect(fixture.reset).not.toHaveBeenCalled();
 });

@@ -68,7 +68,7 @@ fn migration_preserves_history_and_restart_emits_interruption() {
     s.begin_run("one", "r", "u", &json!({}), None).unwrap();
     drop(s);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("DROP TRIGGER events_session_insert; DROP TRIGGER events_session_update; DROP TRIGGER events_message_insert; DROP TRIGGER events_message_update; DROP TRIGGER events_run_insert; DROP TRIGGER events_run_update; DROP TABLE session_events; PRAGMA user_version=4;").unwrap();
+    db.execute_batch("DROP TRIGGER events_session_insert; DROP TRIGGER events_session_update; DROP TRIGGER events_message_insert; DROP TRIGGER events_message_update; DROP TRIGGER events_run_insert; DROP TRIGGER events_run_update; DROP TABLE run_selection_dispatches; DROP TABLE session_selections; DROP TABLE session_events; PRAGMA user_version=4;").unwrap();
     drop(db);
     let s = SessionService::open(&path).unwrap();
     let events = s.events_after("one", 0, 100).unwrap();

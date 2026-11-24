@@ -1,4 +1,11 @@
 //! Embedded model/API engine. Uses the same in-process event normalization as native drivers.
+#[cfg(test)]
+mod live_selection_tests;
+#[cfg(test)]
+mod permission_tests;
+mod selection;
+#[cfg(test)]
+mod session_tests;
 use ide_jsonrpc::{Handler, Peer, codes};
 use ide_minerva::{
     Service,
@@ -7,7 +14,7 @@ use ide_minerva::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -33,7 +40,12 @@ pub(crate) async fn discover(
     Ok(crate::catalogs::Discovered {
         config: crate::config::options_of(&reply),
         commands: None,
-        levels: Default::default(),
+        levels: reply["thoughtLevels"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(model, options)| (model.clone(), crate::config::options_of(&json!({"configOptions":options}))))
+            .collect(),
     })
 }
 
@@ -70,7 +82,22 @@ struct Engine {
 #[derive(Clone)]
 struct ActiveRun {
     id: String,
+    provider: String,
     cancelled: Arc<AtomicBool>,
+}
+
+fn effort_label(value: &str) -> String {
+    match value {
+        "xhigh" => "Extra high".into(),
+        value => {
+            let mut chars = value.chars();
+            chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+        }
+    }
+}
+
+fn has_choice(option: &Value, value: &Value) -> bool {
+    option["options"].as_array().into_iter().flatten().any(|choice| &choice["value"] == value)
 }
 
 impl Engine {
@@ -82,31 +109,36 @@ impl Engine {
             .map_err(|e| e.to_string())
     }
 
-    async fn options(&self, runtime: &Runtime, current: Option<&str>) -> Result<Value, String> {
+    async fn catalog(&self, runtime: &Runtime) -> Result<(Vec<Value>, BTreeMap<String, Vec<Value>>), String> {
         let providers = serde_json::to_value(runtime.plugins.providers()?.list().await).map_err(|e| e.to_string())?;
         let mut models = Vec::new();
+        let mut levels = BTreeMap::new();
         for provider in providers.as_array().ok_or("Invalid provider catalog")? {
             let id = provider["id"].as_str().ok_or("Provider has no ID")?;
+            let prefix = format!("api:{id}/");
+            if self.model_prefix.as_ref().is_some_and(|selected| selected != &prefix) {
+                continue;
+            }
             for model in provider["models"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                models.push(json!({"value":format!("api:{id}/{model}"),"name":format!("{} · {model}",provider["name"].as_str().unwrap_or(id))}));
+                let value = format!("{prefix}{model}");
+                models.push(json!({"value":value,"name":model}));
+                let choices = provider["reasoning"][model]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|choice| json!({"value":choice,"name":effort_label(choice)}))
+                    .collect::<Vec<_>>();
+                let model_levels = if choices.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![json!({"id":"reasoning_effort","name":"Reasoning","category":"thought_level",
+                        "type":"select","currentValue":"default","options":choices})]
+                };
+                levels.insert(value, model_levels);
             }
         }
-        for model in runtime.plugins.models().await? {
-            models.push(json!({"value":model.id,"name":format!("{} · {}",model.group,model.name)}));
-        }
-        if let Some(prefix) = &self.model_prefix {
-            models.retain(|model| model["value"].as_str().is_some_and(|value| value.starts_with(prefix)));
-        }
-        let selected = current
-            .map(str::to_owned)
-            .or_else(|| models.first().and_then(|v| v["value"].as_str()).map(str::to_owned))
-            .unwrap_or_default();
-        Ok(json!([
-            {"id":"model","name":"Model","category":"model","type":"select","currentValue":selected,"options":models},
-            {"id":"mode","name":"Permissions","category":"mode","type":"select","currentValue":"ask","options":[
-                {"value":"ask","name":"Ask before changes"},{"value":"allow","name":"Allow changes"}
-            ]}
-        ]))
+        Ok((models, levels))
     }
 
     async fn check_session(&self, runtime: &Arc<Runtime>, id: &str) -> Result<(), String> {
@@ -114,21 +146,8 @@ impl Engine {
         if !workspace.session_ids.iter().any(|session| session == id) {
             return Err("Session belongs to another project".into());
         }
-        let session = runtime.sessions.get(id)?;
-        if let (Some(prefix), Some(model)) = (&self.model_prefix, session.model.as_deref()) {
-            if !model.starts_with(prefix) {
-                return Err("Session belongs to another model provider".into());
-            }
-        }
+        runtime.sessions.get(id)?;
         Ok(())
-    }
-
-    async fn session_options(&self, runtime: &Arc<Runtime>, id: &str) -> Result<Value, String> {
-        let session = runtime.sessions.get(id)?;
-        let mut options = self.options(runtime, session.model.as_deref()).await?;
-        let settings = runtime.harness_call("workspace.get", json!({"sessionId":id})).await?;
-        options[1]["currentValue"] = json!(if settings["permissionPolicy"] == "allow" { "allow" } else { "ask" });
-        Ok(options)
     }
 
     async fn handle(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -139,15 +158,23 @@ impl Engine {
         }
         let runtime = self.service.runtime().await?;
         match method {
-            "_minerva/config" => Ok(json!({"configOptions":self.options(&runtime,params["model"].as_str()).await?})),
+            "_minerva/config" => {
+                let (models, levels) = self.catalog(&runtime).await?;
+                let options = Self::options(models, &levels, params["model"].as_str(), &Value::Null);
+                Ok(json!({"configOptions":options,"thoughtLevels":levels}))
+            }
             "session/new" => {
                 let workspace = self.service.workspace(&self.cwd).await?;
                 let id = uuid::Uuid::new_v4().to_string();
                 runtime.create_session(&id, Some(&workspace.id))?;
-                let options = self.options(&runtime, None).await?;
+                let mut settings = runtime.harness_call("workspace.get", json!({"sessionId":id})).await?;
+                settings["permissionPolicy"] = json!("ask");
+                runtime.harness_call("workspace.save", json!({"sessionId":id,"settings":settings})).await?;
+                let (models, levels) = self.catalog(&runtime).await?;
+                let options = Self::options(models, &levels, None, &Value::Null);
                 let model = options[0]["currentValue"].as_str().unwrap_or_default();
                 if !model.is_empty() {
-                    runtime.sessions.set_model(&id, model)?;
+                    runtime.sessions.request_selection(&id, model, None)?;
                 }
                 Ok(json!({"sessionId":id,"configOptions":options}))
             }
@@ -175,22 +202,19 @@ impl Engine {
                 let id = string(&params, "sessionId")?;
                 self.check_session(&runtime, id).await?;
                 match string(&params, "configId")? {
-                    "model" => {
-                        let model = string(&params, "value")?;
-                        let options = self.options(&runtime, None).await?;
-                        if !options[0]["options"].as_array().into_iter().flatten().any(|v| v["value"] == model) {
-                            return Err("Unknown API model".into());
-                        }
-                        runtime.sessions.set_model(id, model)?;
-                    }
+                    "model" => self.select_model(&runtime, id, string(&params, "value")?).await?,
+                    "reasoning_effort" => self.select_effort(&runtime, id, string(&params, "value")?).await?,
                     "mode" => {
                         let policy = string(&params, "value")?;
-                        if !matches!(policy, "ask" | "allow") {
+                        if !matches!(policy, "read-only" | "ask" | "allow") {
                             return Err("Unknown permission mode".into());
                         }
-                        let mut settings = runtime.harness_call("workspace.get", json!({"sessionId":id})).await?;
-                        settings["permissionPolicy"] = json!(policy);
-                        runtime.harness_call("workspace.save", json!({"sessionId":id,"settings":settings})).await?;
+                        runtime
+                            .harness_call(
+                                "workspace.set_permission_policy",
+                                json!({"sessionId":id,"permissionPolicy":policy}),
+                            )
+                            .await?;
                     }
                     _ => return Err("Unsupported Minerva option".into()),
                 }
@@ -207,6 +231,7 @@ impl Engine {
         if self.early_cancel.lock().remove(id).is_some_and(|time| time.elapsed() < Duration::from_secs(2)) {
             return Ok(json!({"stopReason":"cancelled"}));
         }
+        let (model, effort) = self.prompt_selection(&runtime, id).await?;
         let content = params["prompt"].as_array().ok_or("Missing prompt")?;
         let mut text = String::new();
         let mut attachments = Vec::new();
@@ -235,14 +260,16 @@ impl Engine {
         if text.trim().is_empty() && attachments.is_empty() {
             return Err("Prompt is empty".into());
         }
-        let model =
-            self.session_options(&runtime, id).await?[0]["currentValue"].as_str().unwrap_or_default().to_owned();
-        if model.is_empty() {
-            return Err("Configure an API model in Minerva settings first".into());
+        let mut options = json!({"attachments":attachments,"liveSelection":true});
+        if let Some(effort) = effort {
+            options["reasoningEffort"] = effort;
         }
-        runtime.sessions.set_model(id, &model)?;
         let run = uuid::Uuid::new_v4().to_string();
-        let active = ActiveRun { id: run.clone(), cancelled: Arc::new(AtomicBool::new(false)) };
+        let active = ActiveRun {
+            id: run.clone(),
+            provider: model.split_once('/').ok_or("Invalid API model route")?.0.into(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
         {
             let mut runs = self.runs.lock();
             if runs.contains_key(id) {
@@ -253,7 +280,7 @@ impl Engine {
         if self.early_cancel.lock().remove(id).is_some_and(|time| time.elapsed() < Duration::from_secs(2)) {
             active.cancelled.store(true, Ordering::Release);
         }
-        let result = self.run_prompt(&runtime, id, &active, model, text, attachments).await;
+        let result = self.run_prompt(&runtime, id, &active, model, text, options).await;
         if result.is_err() {
             let _ = runtime.cancel_run(id, &run);
         }
@@ -271,18 +298,18 @@ impl Engine {
         active: &ActiveRun,
         model: String,
         text: String,
-        attachments: Vec<Value>,
+        options: Value,
     ) -> Result<Value, String> {
         let run = active.id.as_str();
         let baseline = runtime.sessions.baseline(id)?;
         runtime
-            .start_run(StartRunRequest {
+            .start_native_api_run(StartRunRequest {
                 session_id: id.into(),
                 request_id: run.into(),
                 parent_id: baseline.messages.last().map(|m| m.id.clone()),
                 message: RunMessage { id: uuid::Uuid::new_v4().to_string(), text },
                 model,
-                options: json!({"attachments":attachments}),
+                options,
             })
             .await?;
         let mut rendered = HashMap::<usize, String>::new();
@@ -441,7 +468,7 @@ impl super::Shim for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Client(Arc<Mutex<Vec<Value>>>);
+    pub(super) struct Client(pub(super) Arc<Mutex<Vec<Value>>>);
     impl Handler for Client {
         fn on_notification(&self, _: &str, params: Value) {
             self.0.lock().push(params);
@@ -479,6 +506,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_api_models_report_and_restore_their_reasoning_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_id = format!("effort-{}", uuid::Uuid::new_v4());
+        let service = Arc::new(Service::new(dir.path().join("data"), dir.path().join("config")));
+        let runtime = service.runtime().await.unwrap();
+        runtime.plugins.providers().unwrap().save(serde_json::from_value(json!({
+            "id":provider_id,"name":"OpenCode Go","baseUrl":"https://opencode.ai/inference/go",
+            "models":["deepseek-v4.1-flash","unknown-fixture-model"],"apiKey":null,"isNew":true,"protocol":"openai-chat"
+        })).unwrap()).await.unwrap();
+        let peer =
+            connect(service.clone(), dir.path(), Arc::new(Client(Arc::default())), Some(format!("api:{provider_id}/")));
+        let known = format!("api:{provider_id}/deepseek-v4.1-flash");
+        let unknown = format!("api:{provider_id}/unknown-fixture-model");
+        let catalog: Value = peer.request("_minerva/config", json!({}), None).await.unwrap();
+        assert_eq!(catalog["configOptions"][0]["options"][0]["name"], "deepseek-v4.1-flash");
+        assert!(has_choice(&catalog["thoughtLevels"][&known][0], &json!("high")));
+        assert_eq!(catalog["thoughtLevels"][&unknown], json!([]));
+        let new: Value = peer.request("session/new", json!({}), None).await.unwrap();
+        let session = &new["sessionId"];
+        let set = |option, value| json!({"sessionId":session,"configId":option,"value":value});
+        let _: Value = peer.request("session/set_config_option", set("reasoning_effort", "high"), None).await.unwrap();
+        let loaded: Value = peer.request("session/load", json!({"sessionId":session}), None).await.unwrap();
+        assert_eq!(loaded["configOptions"][2]["currentValue"], "high");
+        let selection = runtime.sessions.selection(session.as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        let _: Value = peer.request("session/set_config_option", set("model", &known), None).await.unwrap();
+        assert_eq!(runtime.sessions.selection(session.as_str().unwrap()).unwrap().unwrap(), selection);
+        let switched: Value = peer.request("session/set_config_option", set("model", &unknown), None).await.unwrap();
+        assert_eq!(switched["configOptions"].as_array().unwrap().len(), 2);
+        let replacement = runtime.sessions.selection(session.as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(replacement.model, unknown);
+        assert_eq!(replacement.reasoning_effort, None);
+        assert!(replacement.revision > selection.revision);
+        assert!(
+            peer.request::<_, Value>("session/set_config_option", set("reasoning_effort", "high"), None).await.is_err()
+        );
+        peer.kill();
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn embedded_sessions_are_project_scoped_and_models_are_validated() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
@@ -494,6 +562,19 @@ mod tests {
         assert!(service.runtime().await.unwrap().sessions.list().unwrap().is_empty());
         let new: Value = peer.request("session/new", json!({}), None).await.unwrap();
         let id = new["sessionId"].as_str().unwrap();
+        assert_eq!(new["configOptions"][1]["currentValue"], "ask");
+        let runtime = service.runtime().await.unwrap();
+        let settings = runtime.harness_call("workspace.get", json!({"sessionId":id})).await.unwrap();
+        assert_eq!(settings["permissionPolicy"], "ask");
+        let readonly: Value = peer
+            .request("session/set_config_option", json!({"sessionId":id,"configId":"mode","value":"read-only"}), None)
+            .await
+            .unwrap();
+        assert_eq!(readonly["configOptions"][1]["currentValue"], "read-only");
+        let resumed: Value = peer.request("session/resume", json!({"sessionId":id}), None).await.unwrap();
+        assert_eq!(resumed["configOptions"][1]["currentValue"], "read-only");
+        let stored = runtime.harness_call("workspace.get", json!({"sessionId":id})).await.unwrap();
+        assert_eq!(stored["permissionPolicy"], "read-only");
         assert!(
             peer.request::<_, Value>(
                 "session/set_config_option",

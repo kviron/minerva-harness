@@ -439,7 +439,7 @@ it("ignores a delayed refresh after switching agents and preserves the new draft
   const pending = deferred<CatalogReply>();
   backend.refresh.mockReturnValueOnce(pending.promise);
   render(<HomeEditor />);
-  fireEvent.click(screen.getByRole("button", { name: "Agent" }));
+  fireEvent.click(screen.getByRole("button", { name: "Provider" }));
   fireEvent.click(screen.getByRole("option", { name: "second" }));
   await waitFor(() => expect(backend.refresh).toHaveBeenLastCalledWith("second", false, "big"));
   fireEvent.click(screen.getByRole("button", { name: "Model" }));

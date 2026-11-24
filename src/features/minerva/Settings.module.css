@@ -14,7 +14,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  max-width: 560px;
 }
 .row {
   display: flex;
@@ -26,14 +25,80 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.plugin {
+.models {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-block-size: 320px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+.dragHandle[draggable="true"] {
+  cursor: grab;
 }
 .field {
   display: grid;
   grid-template-columns: 140px minmax(0, 1fr);
   align-items: center;
   gap: var(--space-2);
+}
+
+.modelRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+}
+.modelRow[data-reordering="true"]:hover {
+  background: var(--bg-hover);
+}
+.modelId {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.dragHandle {
+  display: grid;
+  place-items: center;
+  padding: var(--space-1);
+  color: var(--fg-secondary);
+}
+
+.providers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.providerCard {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-small);
+}
+.providerCard > form {
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-strong);
+}
+.providerRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+}
+.providerName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.modelCount,
+.providerRow > button {
+  flex: none;
+  white-space: nowrap;
+}
+.addProvider {
+  align-self: stretch;
 }

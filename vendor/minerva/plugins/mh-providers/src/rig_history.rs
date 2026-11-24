@@ -202,6 +202,7 @@ struct HistoryState {
     reasoning_parts: std::collections::HashMap<usize, usize>,
     tool_states: std::collections::HashMap<String, serde_json::Value>,
     usage: Vec<serde_json::Value>,
+    notices: Vec<(usize, ContentPart)>,
 }
 
 #[derive(Clone)]
@@ -213,6 +214,31 @@ pub struct HistoryHook {
 impl HistoryHook {
     pub fn new(sink: TranscriptSink) -> Self {
         Self { state: Arc::new(Mutex::new(HistoryState::default())), sink }
+    }
+    pub(crate) fn selection_boundary(&self) -> Result<(), String> {
+        if !self.state.lock().map_err(|e| e.to_string())?.active.is_empty() {
+            return Err("Cannot change selection after an unfinished model fragment; start a new turn".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn selection_notice(&self, dispatch: &mh_sessions::RouteDispatch) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|e| e.to_string())?;
+        if state.notices.iter().any(|(_, part)| part.data["effectId"] == dispatch.effect_id) {
+            return Ok(());
+        }
+        if !state.active.is_empty() {
+            return Err("Cannot change selection after an unfinished model fragment; start a new turn".into());
+        }
+        let index = capture(&state.messages)?.parts.len();
+        let model =
+            dispatch.selection.model.split_once('/').map_or(dispatch.selection.model.as_str(), |(_, model)| model);
+        let effort = dispatch.selection.reasoning_effort.as_deref().unwrap_or("default");
+        let mut part = ContentPart::text("reasoning", format!("Next model request: {model} ({effort})\n"));
+        part.data["source"] = json!("model-selection");
+        part.data["effectId"] = json!(dispatch.effect_id);
+        part.data["selectionRevision"] = json!(dispatch.selection.revision);
+        state.notices.push((index, part));
+        self.publish(&state)
     }
     pub fn finish(&self, messages: &[Message]) -> Result<Transcript, String> {
         let mut state = self.state.lock().map_err(|e| e.to_string())?;
@@ -233,6 +259,9 @@ impl HistoryHook {
                     target.extend(extra.iter().map(|(key, value)| (key.clone(), value.clone())));
                 }
             }
+        }
+        for (offset, (index, notice)) in state.notices.iter().enumerate() {
+            transcript.parts.insert((index + offset).min(transcript.parts.len()), notice.clone());
         }
         Ok(transcript)
     }
@@ -414,6 +443,31 @@ impl crate::tools::ToolEventSink for HistoryHook {
 
 #[cfg(test)]
 mod stream_tests {
+    #[test]
+    fn selection_notice_rejects_unfinished_fragments_without_reordering_them() {
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let snapshots = saved.clone();
+        let hook = super::HistoryHook::new(std::sync::Arc::new(move |value| {
+            snapshots.lock().unwrap().push(value.clone());
+            Ok(())
+        }));
+        hook.fragment("text", None, "partial").unwrap();
+        let before = serde_json::to_value(saved.lock().unwrap().last().unwrap()).unwrap();
+        let result = hook.selection_notice(&mh_sessions::RouteDispatch {
+            run_id: "run".into(),
+            effect_id: "2".into(),
+            turn: 2,
+            selection: mh_sessions::RouteSelection {
+                revision: 2,
+                model: "api:fixture/b".into(),
+                reasoning_effort: None,
+            },
+        });
+        assert!(result.is_err());
+        assert_eq!(saved.lock().unwrap().len(), 1);
+        assert_eq!(serde_json::to_value(saved.lock().unwrap().last().unwrap()).unwrap(), before);
+    }
+
     use super::*;
     #[test]
     fn interrupted_image_keeps_job_identity_in_tool_state() {
@@ -425,6 +479,7 @@ mod stream_tests {
             call_id: "c".into(),
             cwd: None,
             policy: crate::tools::PermissionPolicy::Allow,
+            live_policy: None,
             cancellation: Default::default(),
             interactions: Arc::new(crate::tools::InteractionBroker::default()),
             sink: None,
@@ -467,6 +522,7 @@ mod stream_tests {
             call_id: "shell-call".into(),
             cwd: None,
             policy: crate::tools::PermissionPolicy::ReadOnly,
+            live_policy: None,
             cancellation: Default::default(),
             interactions: Arc::new(crate::tools::InteractionBroker::default()),
             sink: None,

@@ -3,7 +3,21 @@ pub use mh_context as context;
 pub use mh_runtime_support::{credential_store, network_policy};
 pub use mh_sessions::{sessions, transcript};
 pub use mh_tool_runtime as tools;
+mod budget;
+mod execution;
+mod reasoning;
+mod route_handler;
+mod routes;
+mod selection;
+mod selection_hook;
+#[cfg(test)]
+mod selection_tests;
+pub use selection::SelectionControl;
+#[cfg(test)]
+mod reasoning_http_tests;
 pub mod rig_history;
+#[cfg(test)]
+mod route_switch_tests;
 use cordis::{Context, Plugin, Service};
 use rig_agent::AgentBuilder;
 use rig_core::providers::{anthropic::AnthropicConfig, openai::OpenAIConfig};
@@ -43,6 +57,7 @@ struct Preset {
     id: &'static str,
     name: &'static str,
     base_url: &'static str,
+    public_catalog_base: Option<&'static str>,
     protocol: &'static str,
     models: &'static [&'static str],
     env_var: Option<&'static str>,
@@ -55,6 +70,7 @@ const PRESETS: &[Preset] = &[
         id: "openai",
         name: "OpenAI",
         base_url: "https://api.openai.com/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &["gpt-4.1-mini"],
         env_var: Some("OPENAI_API_KEY"),
@@ -63,6 +79,7 @@ const PRESETS: &[Preset] = &[
         id: "anthropic",
         name: "Anthropic",
         base_url: "https://api.anthropic.com",
+        public_catalog_base: None,
         protocol: "anthropic-messages",
         models: &["claude-sonnet-4-6"],
         env_var: Some("ANTHROPIC_API_KEY"),
@@ -71,6 +88,7 @@ const PRESETS: &[Preset] = &[
         id: "deepseek",
         name: "DeepSeek",
         base_url: "https://api.deepseek.com",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &["deepseek-chat"],
         env_var: Some("DEEPSEEK_API_KEY"),
@@ -79,6 +97,7 @@ const PRESETS: &[Preset] = &[
         id: "openrouter",
         name: "OpenRouter",
         base_url: "https://openrouter.ai/api/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("OPENROUTER_API_KEY"),
@@ -87,6 +106,7 @@ const PRESETS: &[Preset] = &[
         id: "groq",
         name: "Groq",
         base_url: "https://api.groq.com/openai/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("GROQ_API_KEY"),
@@ -95,6 +115,7 @@ const PRESETS: &[Preset] = &[
         id: "mistral",
         name: "Mistral AI",
         base_url: "https://api.mistral.ai",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("MISTRAL_API_KEY"),
@@ -103,6 +124,7 @@ const PRESETS: &[Preset] = &[
         id: "xai",
         name: "xAI",
         base_url: "https://api.x.ai",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("XAI_API_KEY"),
@@ -111,6 +133,7 @@ const PRESETS: &[Preset] = &[
         id: "together",
         name: "Together AI",
         base_url: "https://api.together.xyz",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("TOGETHER_API_KEY"),
@@ -119,6 +142,7 @@ const PRESETS: &[Preset] = &[
         id: "perplexity",
         name: "Perplexity",
         base_url: "https://api.perplexity.ai",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("PERPLEXITY_API_KEY"),
@@ -127,6 +151,7 @@ const PRESETS: &[Preset] = &[
         id: "moonshot",
         name: "Moonshot (Kimi)",
         base_url: "https://api.moonshot.ai/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("MOONSHOT_API_KEY"),
@@ -135,6 +160,7 @@ const PRESETS: &[Preset] = &[
         id: "zai",
         name: "Z.AI",
         base_url: "https://api.z.ai/api/paas/v4",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("ZAI_API_KEY"),
@@ -143,6 +169,7 @@ const PRESETS: &[Preset] = &[
         id: "zai-coding",
         name: "Z.AI Coding",
         base_url: "https://api.z.ai/api/coding/paas/v4",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("ZAI_API_KEY"),
@@ -151,6 +178,7 @@ const PRESETS: &[Preset] = &[
         id: "minimax",
         name: "MiniMax",
         base_url: "https://api.minimax.io/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("MINIMAX_API_KEY"),
@@ -159,6 +187,7 @@ const PRESETS: &[Preset] = &[
         id: "venice",
         name: "Venice AI",
         base_url: "https://api.venice.ai/api/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("VENICE_API_KEY"),
@@ -167,6 +196,7 @@ const PRESETS: &[Preset] = &[
         id: "hyperbolic",
         name: "Hyperbolic",
         base_url: "https://api.hyperbolic.xyz",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("HYPERBOLIC_API_KEY"),
@@ -175,6 +205,7 @@ const PRESETS: &[Preset] = &[
         id: "cohere",
         name: "Cohere",
         base_url: "https://api.cohere.ai/compatibility/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("COHERE_API_KEY"),
@@ -183,6 +214,7 @@ const PRESETS: &[Preset] = &[
         id: "huggingface",
         name: "Hugging Face",
         base_url: "https://router.huggingface.co",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("HUGGINGFACE_API_KEY"),
@@ -191,6 +223,7 @@ const PRESETS: &[Preset] = &[
         id: "mira",
         name: "Mira",
         base_url: "https://api.mira.network",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("MIRA_API_KEY"),
@@ -199,6 +232,7 @@ const PRESETS: &[Preset] = &[
         id: "doubleword",
         name: "Doubleword",
         base_url: "https://api.doubleword.ai/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("DOUBLEWORD_API_KEY"),
@@ -207,6 +241,7 @@ const PRESETS: &[Preset] = &[
         id: "xiaomimimo",
         name: "Xiaomi MiMo",
         base_url: "https://api.xiaomimimo.com/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: Some("XIAOMI_MIMO_API_KEY"),
@@ -215,6 +250,7 @@ const PRESETS: &[Preset] = &[
         id: "opencode",
         name: "OpenCode Zen",
         base_url: "https://opencode.ai/inference",
+        public_catalog_base: Some("https://opencode.ai/inference/v1"),
         protocol: "openai-chat",
         models: &[],
         env_var: Some("OPENCODE_API_KEY"),
@@ -223,6 +259,7 @@ const PRESETS: &[Preset] = &[
         id: "opencode-go",
         name: "OpenCode Go",
         base_url: "https://opencode.ai/inference/go",
+        public_catalog_base: Some("https://opencode.ai/inference/go/v1"),
         protocol: "openai-chat",
         models: &[],
         env_var: Some("OPENCODE_API_KEY"),
@@ -231,6 +268,7 @@ const PRESETS: &[Preset] = &[
         id: "ollama",
         name: "Ollama",
         base_url: "http://localhost:11434/v1",
+        public_catalog_base: None,
         protocol: "ollama",
         models: &[],
         env_var: None,
@@ -239,6 +277,7 @@ const PRESETS: &[Preset] = &[
         id: "llamacpp",
         name: "llama.cpp",
         base_url: "http://localhost:8080/v1",
+        public_catalog_base: None,
         protocol: "openai-chat",
         models: &[],
         env_var: None,
@@ -249,11 +288,12 @@ fn preset(id: &str) -> Option<&'static Preset> {
 }
 /// The rig dialect for a known endpoint, so vendor-specific routes and session headers apply.
 /// A preset whose endpoint the user edited keeps the plain client instead.
-fn dialect(id: &str, base_url: &str) -> Option<&'static rig_core::providers::openai::wire::Dialect> {
-    let preset = preset(id)?;
-    (base_url.trim_end_matches('/') == preset.base_url)
-        .then(|| rig_core::providers::openai::wire::by_name(id))
-        .flatten()
+fn dialect(_id: &str, base_url: &str) -> Option<&'static rig_core::providers::openai::wire::Dialect> {
+    let preset = PRESETS.iter().find(|preset| preset.base_url == base_url.trim_end_matches('/'))?;
+    if preset.id == "zai-coding" {
+        return Some(&rig_core::providers::openai::wire::ZAI_CODING);
+    }
+    rig_core::providers::openai::wire::by_name(preset.id)
 }
 fn openai_config(id: &str, base_url: &str, key: String) -> OpenAIConfig {
     match dialect(id, base_url) {
@@ -273,30 +313,22 @@ pub struct ProviderView {
     /// as DeepSeek Harness exposes `reasoning.efforts`; absent for models without controls.
     reasoning: std::collections::BTreeMap<String, Vec<String>>,
 }
-/// The rig catalog entry for `model` on `provider`, found by vendor.
-// shortcut: vendor is guessed from protocol and base URL; add an explicit vendor field when a gateway is misread.
+fn route_preset(provider: &Provider) -> Option<&'static Preset> {
+    PRESETS.iter().find(|preset| {
+        preset.base_url == provider.base_url.trim_end_matches('/')
+            && (preset.protocol == provider.protocol
+                || (provider.protocol == "openai-responses" && preset.protocol == "openai-chat"))
+    })
+}
+
 fn catalog_spec(provider: &Provider, model: &str) -> Option<&'static rig_core::catalog::ModelSpec> {
-    let url = provider.base_url.to_ascii_lowercase();
-    let vendor = match provider.protocol.as_str() {
-        "anthropic-messages" => "anthropic",
-        "ollama" => "ollama",
-        _ if url.contains("deepseek") => "deepseek",
-        _ if url.contains("openrouter") => "openrouter",
-        _ if url.contains("api.openai.com") => "openai",
-        _ => provider.id.as_str(),
-    };
+    let preset = route_preset(provider)?;
+    let vendor = if preset.id == "zai-coding" { "zai" } else { preset.id };
     rig_core::catalog::Catalog::builtin().resolve(&format!("{vendor}/{model}")).ok().map(|resolved| resolved.spec)
 }
-/// Choice names the catalog lists for `model`; empty when only the provider default exists.
+
 fn reasoning_choices(provider: &Provider, model: &str) -> Vec<String> {
-    let choices: Vec<String> = catalog_spec(provider, model)
-        .map(|spec| spec.reasoning.choices().iter().map(|c| c.name.to_owned()).collect())
-        .unwrap_or_default();
-    if choices.len() > 1 {
-        choices
-    } else {
-        Vec::new()
-    }
+    reasoning::choices(provider, model)
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -314,6 +346,18 @@ use crate::credential_store::{CredentialScope, CredentialStore, LocalKeyring};
 use crate::network_policy::EndpointPolicy;
 use crate::sessions::Turn;
 pub const PREAMBLE: &str = "Ты помощник разработчика. Отвечай на русском, если пользователь не просит иначе.";
+
+pub struct AgentRunContext {
+    pub session_id: String,
+    pub run_id: String,
+    pub tools: crate::tools::AdmittedTools,
+    pub tool_context: crate::tools::ToolContext,
+    pub context: Arc<context::ContextService>,
+    pub messages: Vec<crate::sessions::SessionMessage>,
+    /// A choice name from `ProviderView::reasoning`; `None` keeps the provider default.
+    pub reasoning_effort: Option<String>,
+    pub selection: Option<Arc<dyn SelectionControl>>,
+}
 
 pub type ProviderRunContext = AgentRunContext;
 struct ProviderStepHook {
@@ -348,7 +392,10 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
             return CompletionCallAction::Stop("Context budget exhausted; compact the conversation".into());
         }
         CompletionCallAction::Patch(
-            RequestPatch::new().preamble(preamble).history(history).max_tokens(available.min(4096) as u64),
+            RequestPatch::new()
+                .preamble(preamble)
+                .history(history)
+                .max_tokens(available.min(budget::DEFAULT_OUTPUT_CAP as usize) as u64),
         )
     }
     async fn on_dispatch(
@@ -372,7 +419,7 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
     }
 }
 
-fn project_message(message: &rig_core::message::Message) -> rig_core::message::Message {
+pub(crate) fn project_message(message: &rig_core::message::Message) -> rig_core::message::Message {
     let mut message = message.clone();
     if let rig_core::message::Message::User { content } = &mut message {
         for part in content {
@@ -387,7 +434,7 @@ fn project_message(message: &rig_core::message::Message) -> rig_core::message::M
     message
 }
 
-fn estimate_message(message: &rig_core::message::Message) -> usize {
+pub(crate) fn estimate_message(message: &rig_core::message::Message) -> usize {
     let mut message = message.clone();
     let mut images = 0;
     for image in message.images_mut() {
@@ -401,9 +448,10 @@ fn estimate_message(message: &rig_core::message::Message) -> usize {
         .saturating_add(images * 1024)
 }
 
+#[derive(Clone)]
 pub struct ProviderService {
     path: PathBuf,
-    providers: Mutex<Vec<Provider>>,
+    providers: Arc<Mutex<Vec<Provider>>>,
     scope: CredentialScope,
     credentials: Arc<dyn CredentialStore>,
     endpoint_policy: EndpointPolicy,
@@ -429,7 +477,7 @@ impl ProviderService {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.to_string()),
         };
-        Ok(Self { path, providers: Mutex::new(providers), scope, credentials, endpoint_policy })
+        Ok(Self { path, providers: Arc::new(Mutex::new(providers)), scope, credentials, endpoint_policy })
     }
     fn env_key(&self, id: &str, endpoint: &str) -> Option<String> {
         if !self.credentials.local_environment_fallback() || self.endpoint_policy == EndpointPolicy::Hosted {
@@ -489,8 +537,8 @@ impl ProviderService {
         if !matches!(input.protocol.as_str(), "openai-chat" | "openai-responses" | "anthropic-messages" | "ollama") {
             return Err("Неизвестный протокол API.".into());
         }
-        if input.name.trim().is_empty() || input.models.is_empty() || input.models.iter().any(|m| m.trim().is_empty()) {
-            return Err("Укажите название и хотя бы одну модель.".into());
+        if input.name.trim().is_empty() || input.models.iter().any(|m| m.trim().is_empty()) {
+            return Err("Укажите название провайдера и непустые ID моделей.".into());
         }
         self.endpoint_policy.validate(&input.base_url)?;
 
@@ -573,6 +621,11 @@ impl ProviderService {
     pub async fn discover(&self, input: ProviderInput) -> Result<Vec<String>, String> {
         self.endpoint_policy.require_safe_transport(&input.base_url)?;
 
+        let public_catalog_base = preset(&input.id)
+            .filter(|preset| {
+                input.base_url.trim_end_matches('/') == preset.base_url && input.protocol == preset.protocol
+            })
+            .and_then(|preset| preset.public_catalog_base);
         let key =
             {
                 let saved = self.providers.lock().await;
@@ -591,12 +644,35 @@ impl ProviderService {
                     })
                     .or_else(|| self.env_key(&input.id, &input.base_url))
                     .or_else(|| (input.protocol == "ollama").then(|| "ollama".into()))
+                    .or_else(|| public_catalog_base.map(|_| String::new()))
                     .ok_or("Введите API-ключ для указанного адреса.")?
             };
         let request = async {
             match input.protocol.as_str() {
                 "openai-chat" | "openai-responses" | "ollama" => {
-                    openai_config(&input.id, &input.base_url, key).client().list_models().await
+                    if let Some(base) = public_catalog_base {
+                        let authenticated = !key.is_empty();
+                        let catalog = |key: String| {
+                            OpenAIConfig::new(key)
+                                .with_base_url(base)
+                                .with_auth(rig_core::providers::openai::wire::Auth::OptionalBearer)
+                                .client()
+                        };
+                        match catalog(key).list_models().await {
+                            Err(error)
+                                if authenticated
+                                    && error
+                                        .provider_response()
+                                        .and_then(|response| response.status)
+                                        .is_some_and(|status| matches!(status.as_u16(), 401 | 403)) =>
+                            {
+                                catalog(String::new()).list_models().await
+                            }
+                            result => result,
+                        }
+                    } else {
+                        openai_config(&input.id, &input.base_url, key).client().list_models().await
+                    }
                 }
                 "anthropic-messages" => {
                     AnthropicConfig::new(key).with_base_url(input.base_url).client().list_models().await
@@ -647,140 +723,6 @@ impl ProviderService {
         )
         .await
         .map(|t| t.text())
-    }
-    async fn chat_inner(
-        &self,
-        id: &str,
-        model: &str,
-        messages: Vec<Turn>,
-        sink: crate::transcript::TranscriptSink,
-        run: Option<ProviderRunContext>,
-    ) -> Result<crate::transcript::Transcript, String> {
-        let (provider, key) = {
-            let providers = self.providers.lock().await;
-            let provider = providers.iter().find(|p| p.id == id).cloned().ok_or("Provider not found")?;
-            if !provider.models.iter().any(|m| m == model) {
-                return Err("Model not found".into());
-            }
-            self.endpoint_policy.require_safe_transport(&provider.base_url)?;
-            let key = self
-                .credentials
-                .get(&self.scope, id)?
-                .or_else(|| self.env_key(id, &provider.base_url))
-                .or_else(|| (provider.protocol == "ollama").then(|| "ollama".into()))
-                .ok_or("API key not configured")?;
-            (provider, key)
-        };
-        let (last, prev) = messages.split_last().ok_or("Сообщение пустое.")?;
-        if last.role != "user" || (last.text().trim().is_empty() && !last.parts.iter().any(|p| p.kind == "image")) {
-            return Err("Нужно сообщение пользователя.".into());
-        }
-        let history = crate::rig_history::replay(prev)?;
-        let prompt = crate::rig_history::user_message(last)?;
-        let hook = crate::rig_history::HistoryHook::new(sink);
-        let mut dynamic_tools = Vec::new();
-        let mut step_hook = None;
-        let mut identity_hook = crate::tools::AdmittedTools::default().identity_hook();
-        let mut image_generation_admitted = false;
-        let streaming = run.is_some();
-        let reasoning_effort = run.as_ref().and_then(|r| r.reasoning_effort.clone());
-        let cancellation = run.as_ref().map(|r| r.tool_context.cancellation.clone());
-        if let Some(mut run) = run {
-            image_generation_admitted = run.tools.definitions().iter().any(|tool| tool.name == "generate_image");
-            run.tool_context.sink = Some(Arc::new(hook.clone()));
-            dynamic_tools = run.tools.rig_tools(run.tool_context.clone());
-            identity_hook = run.tools.identity_hook();
-            step_hook = Some(ProviderStepHook {
-                schema_tokens: serde_json::to_string(&run.tools.definitions())
-                    .map_err(|e| e.to_string())?
-                    .len()
-                    .div_ceil(3),
-                run,
-            });
-        }
-        let has_tools = !dynamic_tools.is_empty();
-        let reasoning = match reasoning_effort.as_deref() {
-            None | Some("default") => None,
-            Some(name) => {
-                catalog_spec(&provider, model)
-                    .ok_or("Для этой модели нельзя выбрать уровень размышления.")?
-                    .reasoning
-                    .named(name)
-                    .map_err(|e| format!("Уровень размышления недоступен: {e}"))?
-                    .reasoning
-            }
-        };
-        // A token budget must fit under the output cap, so lift the cap above it.
-        let budget_cap = match reasoning {
-            Some(rig_core::completion::Reasoning::Budget { tokens }) => Some(u64::from(tokens) + 4096),
-            _ => None,
-        };
-        macro_rules! run_agent {
-            ($model:expr) => {{
-                let builder = AgentBuilder::new($model).preamble(PREAMBLE).dynamic_tools(dynamic_tools);
-                let builder = if let Some(cap) = budget_cap {
-                    builder.max_tokens(cap)
-                } else if provider.protocol == "anthropic-messages" || (streaming && !has_tools) {
-                    builder.max_tokens(4096)
-                } else {
-                    builder
-                };
-                let builder = match reasoning {
-                    Some(reasoning) => builder.reasoning(reasoning),
-                    None => builder,
-                };
-                let agent = builder.build();
-                let mut request = agent.prompt(prompt).history(history).add_hook(hook.clone());
-                if let Some(step_hook) = step_hook {
-                    request = request.add_hook(step_hook);
-                }
-                let request = request.add_hook(identity_hook);
-                let request = if streaming { request.max_turns(if has_tools { 32 } else { 1 }) } else { request };
-                if !streaming {
-                    let response = tokio::time::timeout(std::time::Duration::from_secs(90), request)
-                        .await
-                        .map_err(|_| "Provider timed out".to_string())?
-                        .map_err(|e| format!("Provider run failed: {e}"))?;
-                    return hook.finish(response.messages.get(1..).ok_or("Rig returned no response history")?);
-                }
-                let mut stream = request.stream();
-                let drive = async {
-                    use futures_util::StreamExt;
-                    while let Some(item) = stream.next().await {
-                        match item.map_err(|e| format!("Provider run failed: {e}"))? {
-                            rig_agent::agent::MultiTurnStreamItem::FinalResponse(response) => {
-                                return hook
-                                    .finish(response.messages.get(1..).ok_or("Rig returned no response history")?);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err("Provider stream ended without a final response".into())
-                };
-                let limit = if image_generation_admitted { 1080 } else { 90 };
-                let bounded = tokio::time::timeout(std::time::Duration::from_secs(limit), drive);
-                if let Some(cancellation) = cancellation {
-                    tokio::select! {
-                        result = bounded => result.map_err(|_| "Provider timed out".to_string())?,
-                        _ = cancellation.cancelled() => Err("Run cancelled".into()),
-                    }
-                } else {
-                    bounded.await.map_err(|_| "Provider timed out".to_string())?
-                }
-            }};
-        }
-        match provider.protocol.as_str() {
-            "openai-chat" | "ollama" => {
-                run_agent!(openai_config(&provider.id, &provider.base_url, key).client().chat(model))
-            }
-            "openai-responses" => {
-                run_agent!(openai_config(&provider.id, &provider.base_url, key).client().responses(model))
-            }
-            "anthropic-messages" => {
-                run_agent!(AnthropicConfig::new(key).with_base_url(provider.base_url).client().completion(model))
-            }
-            _ => Err("Неизвестный протокол API.".into()),
-        }
     }
 }
 pub struct ProviderPlugin(pub Arc<ProviderService>);
@@ -1187,15 +1129,4 @@ mod tests {
         server.join().unwrap();
         service.delete(&id).await.unwrap();
     }
-}
-
-pub struct AgentRunContext {
-    pub session_id: String,
-    pub run_id: String,
-    pub tools: crate::tools::AdmittedTools,
-    pub tool_context: crate::tools::ToolContext,
-    pub context: Arc<context::ContextService>,
-    pub messages: Vec<crate::sessions::SessionMessage>,
-    /// A choice name from `ProviderView::reasoning`; `None` keeps the provider default.
-    pub reasoning_effort: Option<String>,
 }

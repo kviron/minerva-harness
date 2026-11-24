@@ -130,6 +130,19 @@ impl Host {
     }
     /// Hosted mode is deliberately disabled until a sandbox execution provider is integrated.
     pub fn open(config: PathBuf, local: bool) -> Result<Self, String> {
+        Self::open_with_packages(config, local, true)
+    }
+    pub fn open_with_packages(config: PathBuf, local: bool, load_packages: bool) -> Result<Self, String> {
+        if !load_packages {
+            return Ok(Self {
+                optional: std::sync::atomic::AtomicBool::new(false),
+                example: std::sync::atomic::AtomicBool::new(false),
+                lifecycle: tokio::sync::Mutex::new(()),
+                config,
+                entries: BTreeMap::new(),
+                local,
+            });
+        }
         let composition = config::ConfigStore::open(&config)?.snapshot()?;
         let lock = read_lock(&config)?;
         let mut entries = BTreeMap::new();

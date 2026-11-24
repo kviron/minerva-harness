@@ -142,6 +142,7 @@ async fn optional_learning_persists_and_enforces_scope() {
                 call_id: "load".into(),
                 cwd: None,
                 policy: minerva_runtime::tools::PermissionPolicy::ReadOnly,
+                live_policy: None,
                 cancellation: minerva_runtime::tools::Cancellation::default(),
                 interactions: rt.plugins.harness.interactions.clone(),
                 sink: None,
@@ -163,13 +164,14 @@ async fn optional_learning_persists_and_enforces_scope() {
         call_id: "remember".into(),
         cwd: None,
         policy,
+        live_policy: None,
         cancellation: minerva_runtime::tools::Cancellation::default(),
         interactions: rt.plugins.harness.interactions.clone(),
         sink: None,
     };
     let denied = tokio::spawn({
         let tools = tools.clone();
-        let context = tool_context(minerva_runtime::tools::PermissionPolicy::ReadOnly);
+        let context = tool_context(minerva_runtime::tools::PermissionPolicy::Ask);
         async move { tools.execute("memory_remember", json!({"text":"Tool memory retained"}), context).await }
     });
     let interactions = &rt.plugins.harness.interactions;

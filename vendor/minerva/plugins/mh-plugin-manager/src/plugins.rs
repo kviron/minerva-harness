@@ -341,10 +341,20 @@ impl PluginManager {
         scope: crate::credential_store::CredentialScope,
         context_path: PathBuf,
     ) -> Result<Self, String> {
+        Self::start_with_packages(settings_path, local, scope, context_path, true).await
+    }
+    pub async fn start_with_packages(
+        settings_path: PathBuf,
+        local: bool,
+        scope: crate::credential_store::CredentialScope,
+        context_path: PathBuf,
+        load_packages: bool,
+    ) -> Result<Self, String> {
         let harness = Arc::new(crate::harness::Harness::prepare(&context_path, local)?);
-        let external = Arc::new(minerva_plugin_host::Host::open(
+        let external = Arc::new(minerva_plugin_host::Host::open_with_packages(
             settings_path.parent().ok_or("settings path has no parent")?.to_path_buf(),
             local,
+            load_packages,
         )?);
         external.restore().await?;
         // Read fallible configuration before publishing any lifecycle effects.

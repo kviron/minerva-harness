@@ -1,4 +1,4 @@
-import { Children, Fragment, forwardRef, isValidElement, useState, type ReactNode } from "react";
+import { Children, forwardRef, isValidElement, useState, type ReactNode } from "react";
 import * as ui from "@/ui";
 
 type SelectChildProps = {
@@ -21,8 +21,6 @@ export function SelectTrigger(_props: SelectChildProps) {
 export function SelectContent(_props: SelectChildProps) {
   return null;
 }
-export const SelectGroup = Fragment;
-export const SelectLabel = Fragment;
 
 function selectOptions(children: ReactNode, result: ui.SelectOption[] = []): ui.SelectOption[] {
   Children.forEach(children, (child) => {
@@ -113,15 +111,3 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
     />
   );
 });
-
-export const minervaWidgets = {
-  ...ui,
-  Button,
-  Select,
-  SelectItem,
-  SelectValue,
-  SelectTrigger,
-  SelectContent,
-  SelectGroup,
-  SelectLabel,
-};

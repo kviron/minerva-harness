@@ -116,7 +116,7 @@ impl LaunchContext {
             &mut hash,
             match self.spec.driver {
                 provider::Driver::Acp => b"acp",
-                provider::Driver::Minerva => b"minerva",
+                provider::Driver::Minerva => b"minerva-v2",
                 provider::Driver::Codex => b"codex",
                 provider::Driver::Claude => b"claude",
                 provider::Driver::Copilot => b"copilot",

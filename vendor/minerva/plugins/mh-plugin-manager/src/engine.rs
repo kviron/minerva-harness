@@ -180,7 +180,8 @@ async fn engine_interaction(
         }
         "approval" => {
             use crate::tools::PermissionPolicy;
-            let decision = match tool_context.policy {
+            let policy = tool_context.effective_policy()?;
+            let mut decision = match policy {
                 PermissionPolicy::ReadOnly => "deny".into(),
                 PermissionPolicy::Allow => "allow".into(),
                 PermissionPolicy::Ask => {
@@ -196,6 +197,13 @@ async fn engine_interaction(
                         .await?
                 }
             };
+            let current_policy = tool_context.effective_policy()?;
+            if tool_context.cancellation.is_cancelled()
+                || current_policy == PermissionPolicy::ReadOnly
+                || (policy == PermissionPolicy::Allow && current_policy == PermissionPolicy::Ask)
+            {
+                decision = "deny".into();
+            }
             Ok(json!({"decision":decision}))
         }
         "question" => {
@@ -368,6 +376,7 @@ mod tests {
             call_id: "c".into(),
             cwd: None,
             policy: crate::tools::PermissionPolicy::Allow,
+            live_policy: None,
             cancellation: Default::default(),
             interactions: std::sync::Arc::new(crate::tools::InteractionBroker::default()),
             sink: None,

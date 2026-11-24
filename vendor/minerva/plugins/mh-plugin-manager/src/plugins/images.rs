@@ -223,6 +223,7 @@ mod tests {
             call_id: "c".into(),
             cwd: None,
             policy: PermissionPolicy::Allow,
+            live_policy: None,
             cancellation: Cancellation::default(),
             interactions: Arc::new(InteractionBroker::default()),
             sink: None,

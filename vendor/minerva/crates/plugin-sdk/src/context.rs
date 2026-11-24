@@ -8,6 +8,9 @@ pub struct WorkspaceSettings {
     pub permission_policy: crate::tools::PermissionPolicy,
     pub context_window: usize,
     pub auto_compact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_effort: Option<(String, String)>,
 }
 impl Default for WorkspaceSettings {
     fn default() -> Self {
@@ -16,6 +19,7 @@ impl Default for WorkspaceSettings {
             permission_policy: crate::tools::PermissionPolicy::ReadOnly,
             context_window: 32768,
             auto_compact: true,
+            model_effort: None,
         }
     }
 }

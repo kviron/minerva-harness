@@ -343,7 +343,9 @@ describe("markdown preview re-rendering", () => {
       same(render, readme);
       for (const at of [0.1, 0.5, 0.9]) {
         const from = Math.floor(readme.length * at);
-        const i = from + readme.slice(from).search(/\n\n[A-Z][a-z]/) + 2;
+        const boundary = /\r?\n\r?\n(?=[A-Z][a-z])/.exec(readme.slice(from));
+        expect(boundary).not.toBeNull();
+        const i = from + boundary!.index + boundary![0].length;
         const edited = `${readme.slice(0, i)}Typed ${readme.slice(i)}`;
         const parse = vi.spyOn(DOMParser.prototype, "parseFromString");
         const html = render(edited);

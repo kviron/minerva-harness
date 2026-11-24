@@ -7,10 +7,10 @@ license.workspace = true
 
 [dependencies]
 minerva-runtime = { path = "../../vendor/minerva/crates/runtime" }
-minerva-plugin-host = { path = "../../vendor/minerva/crates/plugin-host" }
 serde_json.workspace = true
 serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+minerva-plugin-host = { path = "../../vendor/minerva/crates/plugin-host" }
 tempfile.workspace = true

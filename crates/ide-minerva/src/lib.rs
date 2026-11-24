@@ -1,4 +1,4 @@
-//! Minerva lives inside the IDE backend; its plugin host and agent loop stay intact.
+//! Minerva lives inside the IDE backend; its agent loop uses the configured API providers.
 use minerva_runtime::{Runtime, RuntimeConfig};
 use std::{
     path::{Path, PathBuf},
@@ -32,22 +32,14 @@ impl Service {
             serde_json::to_value(runtime.plugins.providers()?.list().await).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        let mut connections: Vec<_> = providers
+        Ok(providers
             .into_iter()
             .map(|provider| Connection {
                 id: format!("minerva.api.{}", provider.id),
                 name: provider.name,
                 model_prefix: format!("api:{}/", provider.id),
             })
-            .collect();
-        for model in runtime.plugins.models().await? {
-            let Some((owner, _)) = model.id.strip_prefix("plugin:").and_then(|id| id.split_once('/')) else { continue };
-            let id = format!("minerva.plugin.{owner}");
-            if !connections.iter().any(|connection| connection.id == id) {
-                connections.push(Connection { id, name: model.group, model_prefix: format!("plugin:{owner}/") });
-            }
-        }
-        Ok(connections)
+            .collect())
     }
 
     pub fn new(data_dir: PathBuf, config_dir: PathBuf) -> Self {
@@ -73,7 +65,7 @@ impl Service {
         if let Some(runtime) = slot.as_ref() {
             return Ok(runtime.clone());
         }
-        let runtime = Arc::new(Runtime::start(self.config.clone()).await.map_err(|e| e.to_string())?);
+        let runtime = Arc::new(Runtime::start_without_packages(self.config.clone()).await.map_err(|e| e.to_string())?);
         *slot = Some(runtime.clone());
         Ok(runtime)
     }
@@ -93,17 +85,6 @@ impl Service {
             runtime.shutdown().await.map_err(|e| e.to_string())?;
         }
         Ok(())
-    }
-
-    pub async fn install_plugin(&self, source: PathBuf) -> Result<String, String> {
-        let stopped = self.stopped.lock().await;
-        if *stopped {
-            return Err("Minerva is stopped".into());
-        }
-        let config = self.config.config_dir.clone();
-        tokio::task::spawn_blocking(move || minerva_plugin_host::install_local(&source, &config))
-            .await
-            .map_err(|e| e.to_string())?
     }
 }
 
@@ -163,19 +144,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_packages_are_preserved_disabled_until_explicit_enablement() {
+    async fn installed_packages_are_ignored_and_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("package");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("backend.exe"), b"not executed").unwrap();
         std::fs::write(source.join("plugin.json"), r#"{"id":"test.import","name":"Imported package","version":"1.0.0","description":"Fixture","apiVersion":1,"requires":{},"capabilities":[],"backend":{"kind":"process","entry":"backend.exe"}}"#).unwrap();
         let service = Service::new(dir.path().join("data"), dir.path().join("config"));
-        assert_eq!(service.install_plugin(source.clone()).await.unwrap(), "test.import");
-        assert!(service.install_plugin(source).await.is_err());
+        minerva_plugin_host::install_local(&source, &dir.path().join("config")).unwrap();
         let runtime = service.runtime().await.unwrap();
         let list = serde_json::to_value(runtime.plugins.list().await.unwrap()).unwrap();
-        let plugin = list.as_array().unwrap().iter().find(|p| p["id"] == "test.import").unwrap();
-        assert_eq!(plugin["enabled"], false);
+        assert!(!list.as_array().unwrap().iter().any(|p| p["id"] == "test.import"));
         assert!(dir.path().join("config/plugins/test.import/backend.exe").is_file());
         service.shutdown().await.unwrap();
     }

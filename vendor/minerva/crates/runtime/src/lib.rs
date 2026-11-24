@@ -71,6 +71,12 @@ impl Runtime {
         &self.config
     }
     pub async fn start(config: RuntimeConfig) -> Result<Self, RuntimeError> {
+        Self::start_with_packages(config, true).await
+    }
+    pub async fn start_without_packages(config: RuntimeConfig) -> Result<Self, RuntimeError> {
+        Self::start_with_packages(config, false).await
+    }
+    async fn start_with_packages(config: RuntimeConfig, load_packages: bool) -> Result<Self, RuntimeError> {
         if [&config.tenant_id, &config.workspace_id, &config.profile].iter().any(|s| s.trim().is_empty())
             || !config.data_dir.is_absolute()
             || !config.config_dir.is_absolute()
@@ -83,7 +89,7 @@ impl Runtime {
             .map_err(RuntimeError::Configuration)?;
         let ownership = learning::Learning::acquire_ownership(&config).map_err(RuntimeError::Bootstrap)?;
         let plugins = Arc::new(
-            PluginManager::start_scoped_at(
+            PluginManager::start_with_packages(
                 config.config_dir.join("shell.json"),
                 matches!(config.profile.as_str(), "local" | "desktop"),
                 credential_store::CredentialScope::new(
@@ -92,6 +98,7 @@ impl Runtime {
                 )
                 .map_err(RuntimeError::Configuration)?,
                 config.data_dir.join("context.sqlite3"),
+                load_packages,
             )
             .await
             .map_err(RuntimeError::Bootstrap)?,

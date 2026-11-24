@@ -45,6 +45,21 @@ jobs:
           if ($config.identifier -ne 'ru.minerva.ide') { throw "Unexpected app identity" }
           if ($config.plugins.updater.endpoints[0] -ne 'https://github.com/kviron/minerva-harness/releases/latest/download/latest.json') { throw "Unexpected update source" }
       - run: pnpm install --frozen-lockfile
+      - name: Read release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $path = "docs/releases/minerva-$version.md"
+          $body = if (Test-Path -LiteralPath $path) {
+            Get-Content -LiteralPath $path -Raw
+          } else {
+            "Minerva IDE $env:TAG. Windows x64: download the setup.exe installer. Signed automatic updates are delivered from this repository."
+          }
+          $delimiter = [guid]::NewGuid().ToString()
+          "body<<$delimiter" >> $env:GITHUB_OUTPUT
+          $body >> $env:GITHUB_OUTPUT
+          $delimiter >> $env:GITHUB_OUTPUT
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -53,10 +68,7 @@ jobs:
         with:
           tagName: ${{ env.TAG }}
           releaseName: Minerva IDE ${{ env.TAG }}
-          releaseBody: |
-            Minerva IDE on the OpenIDEA foundation: integrated agent conversations, workspace tabs, native development tools and Minerva plugins.
-
-            Windows x64: download the setup.exe installer. Signed automatic updates are delivered from this repository.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true
           prerelease: false
           args: --bundles nsis

@@ -1,5 +1,28 @@
 use crate::sessions::ContentPart;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSelection {
+    pub revision: i64,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDispatch {
+    pub run_id: String,
+    pub effect_id: String,
+    pub turn: u64,
+    pub selection: RouteSelection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchAdmission {
+    Recorded { changed: bool },
+    Duplicate,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(ts_rs::TS)]

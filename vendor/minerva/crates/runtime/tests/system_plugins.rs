@@ -38,6 +38,7 @@ fn call(manager: &PluginManager, root: PathBuf) -> ToolContext {
         call_id: "call".into(),
         cwd: Some(root),
         policy: PermissionPolicy::Allow,
+        live_policy: None,
         cancellation: Cancellation::default(),
         interactions: manager.harness.interactions.clone(),
         sink: None,

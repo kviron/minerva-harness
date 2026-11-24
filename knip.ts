@@ -24,8 +24,11 @@ const config: KnipConfig = {
   // System tools used by formatting and language smoke fixtures.
   ignoreBinaries: ["rustfmt", "composer", "make"],
   compilers: {
-    // Fonts come in through `@import` in global.css.
-    css: (text: string) => [...text.matchAll(/(?<=@)import[^;]+/g)].join("\n"),
+    // CSS Modules can share styles through composes, alongside ordinary imports.
+    css: (text: string) =>
+      [...text.matchAll(/(?:@import|composes:[^;]*?\bfrom)\s+("[^"]+"|'[^']+')/g)]
+        .map(([, path]) => `import ${path};`)
+        .join("\n"),
   },
 };
 

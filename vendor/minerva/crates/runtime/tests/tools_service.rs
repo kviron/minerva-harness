@@ -25,6 +25,7 @@ async fn write_requires_permission_and_paths_stay_contained() {
     register_native(&registry).unwrap();
     let admitted = registry.snapshot();
     let mut ctx = context(Some(dir.path().into()));
+    ctx.policy = PermissionPolicy::Ask;
     let task = tokio::spawn({
         let admitted = admitted.clone();
         let ctx = ctx.clone();
@@ -116,6 +117,7 @@ fn context(cwd: Option<std::path::PathBuf>) -> ToolContext {
         call_id: "call".into(),
         cwd,
         policy: PermissionPolicy::ReadOnly,
+        live_policy: None,
         cancellation: Cancellation::default(),
         interactions: Arc::new(InteractionBroker::default()),
         sink: None,
@@ -123,7 +125,7 @@ fn context(cwd: Option<std::path::PathBuf>) -> ToolContext {
 }
 #[tokio::test]
 async fn restricted_calls_wait_for_one_time_approval() {
-    for policy in [PermissionPolicy::ReadOnly, PermissionPolicy::Ask] {
+    for policy in [PermissionPolicy::Ask] {
         for decision in ["allow", "deny"] {
             let registry = ToolRegistry::default();
             let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));

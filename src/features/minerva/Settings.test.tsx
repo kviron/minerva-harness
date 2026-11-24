@@ -20,52 +20,65 @@ beforeEach(() => {
           envVar: "DEEPSEEK_API_KEY",
         },
       ];
-    if (method === "plugins.list")
-      return [{ id: "test", name: "Test package", description: "", enabled: false, canToggle: true, error: null }];
-    if (method === "plugins.setEnabled") throw new Error("package could not start");
+    if (method === "providers.discover") return ["one", "two", "three", "one"];
     throw new Error(method);
   });
 });
 
 it("sends API configuration through the backend and clears the key after saving", async () => {
   render(<MinervaSettings />);
-  await screen.findByText("Test package");
+  fireEvent.click(screen.getByRole("button", { name: "Add model provider…" }));
   fireEvent.change(screen.getByLabelText("Provider ID"), { target: { value: "local" } });
   fireEvent.change(screen.getByLabelText("Provider name"), { target: { value: "Local" } });
   fireEvent.change(screen.getByLabelText("API base URL"), { target: { value: "https://example.test/v1" } });
-  fireEvent.change(screen.getByLabelText("Models separated by commas"), { target: { value: "one, two ," } });
+  fireEvent.click(screen.getByRole("button", { name: "Fetch model list" }));
+  await screen.findByText("three");
+  fireEvent.click(screen.getAllByRole("button", { name: "Move model up" })[1]!);
+  fireEvent.click(screen.getAllByRole("button", { name: "Remove model" })[2]!);
   fireEvent.change(screen.getByLabelText("API key"), { target: { value: "fixture-key" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save API provider" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
   await waitFor(() =>
     expect(rpc).toHaveBeenCalledWith("providers.save", {
       id: "local",
       name: "Local",
       baseUrl: "https://example.test/v1",
-      models: ["one", "two"],
+      models: ["two", "one"],
       apiKey: "fixture-key",
       protocol: "openai-chat",
       isNew: true,
     }),
   );
-  await waitFor(() => expect(screen.getByLabelText("API key")).toHaveValue(""));
+  await screen.findByRole("button", { name: "Add model provider…" });
+  expect(screen.queryByLabelText("API key")).not.toBeInTheDocument();
 });
 
 it("fills the endpoint from a known service so only the key is typed", async () => {
   render(<MinervaSettings />);
-  await screen.findByText("Test package");
+  fireEvent.click(screen.getByRole("button", { name: "Add model provider…" }));
   fireEvent.click(screen.getByLabelText("Known service"));
   const options = await screen.findAllByText("DeepSeek");
   fireEvent.click(options[options.length - 1]!);
   await waitFor(() => expect(screen.getByLabelText("API base URL")).toHaveValue("https://api.deepseek.com"));
   expect(screen.getByLabelText("Provider ID")).toHaveValue("deepseek");
-  expect(screen.getByLabelText("Models separated by commas")).toHaveValue("deepseek-chat");
+  expect(screen.getByText("deepseek-chat")).toBeInTheDocument();
 });
 
-it("keeps failed plugin enablement visible and does not pretend the package started", async () => {
+it("lists all saved providers and opens only the selected provider", async () => {
+  const provider = { baseUrl: "https://example.test/v1", protocol: "openai-chat", hasKey: true };
+  rpc.mockImplementationOnce(async () => [
+    { ...provider, id: "first", name: "First provider", models: ["first-model"] },
+    { ...provider, id: "second", name: "Second provider", models: ["second-model"] },
+  ]);
   render(<MinervaSettings />);
-  const toggle = await screen.findByRole("checkbox", { name: "Test package" });
-  fireEvent.click(toggle);
-  await screen.findByRole("alert");
-  expect(screen.getByRole("alert")).toHaveTextContent("package could not start");
-  expect(toggle).not.toBeChecked();
+  expect(await screen.findByText(/First provider/)).toBeInTheDocument();
+  expect(screen.getByText(/Second provider/)).toBeInTheDocument();
+  expect(screen.queryByLabelText("Provider ID")).not.toBeInTheDocument();
+  fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[1]!);
+  expect(screen.getByLabelText("Provider ID")).toHaveValue("second");
+  expect(screen.getByText("second-model")).toBeInTheDocument();
+  expect(screen.getByText(/First provider/)).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "Edit" })[1]).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByText(/First provider/)).toBeInTheDocument();
+  expect(screen.getByText(/Second provider/)).toBeInTheDocument();
 });

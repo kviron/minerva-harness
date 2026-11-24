@@ -3,6 +3,7 @@ use crate::sessions::{ContentPart, IntegrationState, SessionInfo, SessionMessage
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::{path::Path, sync::Mutex};
+mod selections;
 
 // Keep a live connection guard for existing transaction code, while permitting
 // explicit shutdown even when hosts retain service handles.
@@ -79,17 +80,23 @@ impl SessionStore {
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
         db.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(|e| e.to_string())?;
-        if version > 6 {
+        if version > 7 {
             return Err("База диалогов создана более новой версией приложения".into());
         }
-        if (1..6).contains(&version) {
+        if (1..7).contains(&version) {
             // SQLite's backup API includes committed WAL data and leaves the source untouched.
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_nanos();
             let name = path.file_name().ok_or("database filename required")?.to_string_lossy();
-            let target_version = if version < 5 { 5 } else { 6 };
+            let target_version = if version < 5 {
+                5
+            } else if version < 6 {
+                6
+            } else {
+                7
+            };
             let backup = path.with_file_name(format!("{name}.pre-v{target_version}-{stamp}.sqlite3"));
             std::fs::OpenOptions::new().write(true).create_new(true).open(&backup).map_err(|e| e.to_string())?;
             db.backup(rusqlite::MAIN_DB, &backup, None::<fn(rusqlite::backup::Progress)>)
@@ -114,6 +121,9 @@ impl SessionStore {
         }
         if version < 6 {
             db.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS internal_sessions(session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,purpose TEXT NOT NULL,parent_job TEXT NOT NULL); PRAGMA user_version=6; COMMIT;").map_err(|e|e.to_string())?;
+        }
+        if version < 7 {
+            selections::migrate(&mut db)?;
         }
         db.execute("UPDATE runs SET status='interrupted',error='Приложение завершилось до сохранения результата' WHERE status='running'", []).map_err(|e| e.to_string())?;
         Ok(Self { connection: Database(Mutex::new(Some(db))), _lock: lock })
@@ -325,11 +335,7 @@ impl SessionStore {
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn set_model(&self, id: &str, model: &str) -> Result<(), String> {
-        let db = self.connection.lock().map_err(|e| e.to_string())?;
-        if db.execute("UPDATE sessions SET model=?2 WHERE id=?1", params![id, model]).map_err(|e| e.to_string())? == 0 {
-            return Err("Диалог не найден".into());
-        }
-        Ok(())
+        self.set_model_with_selection(id, model)
     }
     pub fn integration_state(&self, id: &str, namespace: &str) -> Result<Option<Value>, String> {
         let db = self.connection.lock().map_err(|e| e.to_string())?;
@@ -423,7 +429,7 @@ impl SessionStore {
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
-            "UPDATE sessions SET title=CASE WHEN title='Новый диалог' THEN ?3 ELSE title END,updated_at=unixepoch(),model=?2 WHERE id=?1",
+            "UPDATE sessions SET title=CASE WHEN title='Новый диалог' THEN ?3 ELSE title END,updated_at=unixepoch(),model=CASE WHEN EXISTS(SELECT 1 FROM session_selections WHERE session_id=?1) THEN model ELSE ?2 END WHERE id=?1",
             params![request.session_id, request.model,request.message.text.chars().take(80).collect::<String>()],
         )
         .map_err(|e| e.to_string())?;

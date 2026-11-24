@@ -1,5 +1,5 @@
 use crate::{
-    conversation::{run_inner, RunRequest},
+    conversation::{run_inner, PolicyAdmission, RunRequest},
     plugins::PluginManager,
     runs::Runs,
     sessions::SessionService,
@@ -55,7 +55,21 @@ impl AgentLoopService {
 }
 pub use mh_sessions::{RunHandle, RunMessage, RunSnapshot, StartRunRequest};
 impl AgentLoopService {
-    pub async fn start_run(&self, mut request: StartRunRequest) -> Result<RunHandle, String> {
+    pub async fn start_run(&self, request: StartRunRequest) -> Result<RunHandle, String> {
+        self.start(request, PolicyAdmission::Snapshot).await
+    }
+
+    /// Trusted IDE entry, after the native adapter checks workspace membership.
+    pub async fn start_native_api_run(&self, request: StartRunRequest) -> Result<RunHandle, String> {
+        let plugins = self.plugins.upgrade().ok_or("plugin services are stopped")?;
+        let api = request.model.strip_prefix("api:").and_then(|model| model.split_once('/'));
+        if !plugins.harness.local || !api.is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()) {
+            return Err("Native policy admission requires a local API conversation".into());
+        }
+        self.start(request, PolicyAdmission::NativeUserMutable).await
+    }
+
+    async fn start(&self, mut request: StartRunRequest, admission: PolicyAdmission) -> Result<RunHandle, String> {
         let stopped = self.stopped.lock().await;
         if *stopped {
             return Err("runtime is stopped".into());
@@ -117,7 +131,7 @@ impl AgentLoopService {
                 created_at,
                 options: request.options,
             };
-            let result = run_inner(&sessions, &plugins, &session, execution, &mut guard, true).await;
+            let result = run_inner(&sessions, &plugins, &session, execution, &mut guard, true, admission).await;
             if let Err(error) = result {
                 let _ = sessions.fail_run(&session, &run_id, *guard.cancel.borrow(), &error);
             }
@@ -146,7 +160,8 @@ impl AgentLoopService {
         let mut tasks = self.tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         tasks.push(tokio::spawn(async move {
-            let result = run_inner(&sessions, &plugins, &session, request, &mut guard, false).await;
+            let result =
+                run_inner(&sessions, &plugins, &session, request, &mut guard, false, PolicyAdmission::Snapshot).await;
             let _ = send.send(result);
         }));
         drop(tasks);

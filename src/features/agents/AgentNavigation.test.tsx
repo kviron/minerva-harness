@@ -5,6 +5,11 @@ import { useAgents } from "./store";
 import { AgentHistory, AgentNavigation, activateAgentNavigation } from "./AgentNavigation";
 import * as actions from "@/platform/actions";
 
+const windowState = vi.hoisted(() => ({ auxiliary: false }));
+vi.mock("@/platform/auxWindow", () => ({
+  auxiliaryWindow: () => (windowState.auxiliary ? { kind: "editor", parent: "main" } : null),
+}));
+
 vi.mock("./AgentsView", () => ({
   AgentsView: ({ historyOnly }: { historyOnly: boolean }) => <div>{historyOnly ? "History only" : "Conversation"}</div>,
 }));
@@ -58,4 +63,17 @@ it("resizes chat history by dragging and restores the saved width on remount", (
   fireEvent.keyDown(restored, { key: "ArrowLeft" });
   expect(localStorage.getItem("minerva.chatHistory.width")).toBe("392");
   localStorage.removeItem("minerva.chatHistory.width");
+});
+
+it("preserves the chrome of an auxiliary task window", () => {
+  windowState.auxiliary = true;
+  const previous = useWorkbenchChrome.getState();
+  try {
+    const stop = activateAgentNavigation();
+    expect(useWorkbenchChrome.getState()).toBe(previous);
+    stop();
+    expect(useWorkbenchChrome.getState()).toBe(previous);
+  } finally {
+    windowState.auxiliary = false;
+  }
 });

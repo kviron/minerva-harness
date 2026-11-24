@@ -3,6 +3,7 @@ use crate::session_store::SessionStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::Path;
+mod selections;
 
 /// A consistent projection and its durable event cursor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -281,6 +282,7 @@ impl SessionService {
         Ok((turns, parent))
     }
     pub fn set_model(&self, id: &str, model: &str) -> Result<(), String> {
+        selections::validate_selection(id, model, None)?;
         self.store.set_model(id, model)
     }
     pub fn integration_state(&self, id: &str, namespace: &str) -> Result<Option<Value>, String> {
@@ -339,7 +341,7 @@ mod tests {
         assert!(SessionService::open(&path).is_err());
         drop(service);
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("DROP TABLE runs; PRAGMA user_version=2;").unwrap();
+        db.execute_batch("DROP TABLE run_selection_dispatches; DROP TABLE session_selections; DROP TABLE runs; PRAGMA user_version=2;").unwrap();
         drop(db);
         let service = SessionService::open(&path).unwrap();
         service.begin_run("one", "a1", "u1", &serde_json::json!({}), None).unwrap();
@@ -426,7 +428,7 @@ mod tests {
         assert!(service.integration_state("one", "codex").unwrap().is_none());
         drop(service);
         let db = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
     }
     #[test]
     fn migration_failure_does_not_change_v1() {
@@ -526,7 +528,7 @@ mod v6_backup_tests {
         }
         {
             let db = rusqlite::Connection::open(&path).unwrap();
-            db.execute_batch("DROP TABLE internal_sessions; PRAGMA user_version=5;").unwrap();
+            db.execute_batch("DROP TABLE run_selection_dispatches; DROP TABLE session_selections; DROP TABLE internal_sessions; PRAGMA user_version=5;").unwrap();
         }
         {
             let service = SessionService::open(&path).unwrap();
@@ -545,6 +547,6 @@ mod v6_backup_tests {
         assert!(content.contains("preserved history"));
         let upgraded = rusqlite::Connection::open(&path).unwrap();
         let version: i64 = upgraded.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 }

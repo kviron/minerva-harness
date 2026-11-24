@@ -48,6 +48,7 @@ fn context(manager: &PluginManager, call: &str) -> ToolContext {
         call_id: call.into(),
         cwd: None,
         policy: PermissionPolicy::Allow,
+        live_policy: None,
         cancellation: Cancellation::default(),
         interactions: manager.harness.interactions.clone(),
         sink: None,
