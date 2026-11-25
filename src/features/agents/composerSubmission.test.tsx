@@ -440,34 +440,61 @@ describe("Minerva provider continuity", () => {
   };
   function setup() {
     useAgents.setState({
+      modelCatalogs: new Map([
+        [
+          "minerva",
+          {
+            provider: "minerva",
+            config: [
+              {
+                ...model,
+                values: [...model.values, { value: "api:openai-codex/two", name: "Model B", description: null }],
+              },
+            ],
+            thoughtLevels: {},
+            refreshing: true,
+            refreshedAtMs: null,
+            retryAtMs: null,
+            error: null,
+          },
+        ],
+      ]),
       providers: [
-        { ...provider, id: "minerva.api.a", name: "Provider A" },
-        { ...provider, id: "minerva.api.b", name: "Provider B" },
+        {
+          ...provider,
+          id: "minerva",
+          name: "Minerva",
+          config: [
+            {
+              ...model,
+              values: [...model.values, { value: "api:openai-codex/two", name: "Model B", description: null }],
+            },
+          ],
+        },
       ],
       tasks: new Map([["A", { ...task("A"), provider: "minerva.api.a", model: "api:a/one", config: [model, mode] }]]),
     });
     updateComposer("A", { text: "Keep this draft" });
     return render(<SessionEditor input={{ kind: SESSION_KIND, key: sessionKey("A"), data: { task: "A" } }} />);
   }
-  it("blocks other settings and submission while provider selection is pending", async () => {
+  it("blocks submission while a new backend model selection is pending", async () => {
     const response = deferred();
     backend.config.mockReturnValue(response.promise);
     setup();
-    fireEvent.click(screen.getByRole("button", { name: "Provider" }));
-    fireEvent.click(screen.getByRole("option", { name: "Provider B" }));
-    expect(backend.config).toHaveBeenCalledExactlyOnceWith("A", "provider", "minerva.api.b");
+    backend.tauri = true;
+    expect(screen.getByRole("button", { name: "Provider" })).toHaveTextContent("Minerva");
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    fireEvent.click(await screen.findByRole("option", { name: /Model B/ }), { detail: 1 });
+    await waitFor(() => expect(backend.config).toHaveBeenCalledExactlyOnceWith("A", "model", "api:openai-codex/two"));
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-    fireEvent.click(screen.getByRole("option", { name: "Allow changes" }));
-    expect(backend.config).toHaveBeenCalledTimes(1);
     expect(composerDraft("A").text).toBe("Keep this draft");
     await act(async () => response.resolve(ok(null)));
   });
-  it("requires a matching model after provider selection and keeps the draft", () => {
+  it("requires an available model and keeps the legacy session draft", () => {
     setup();
     act(() =>
       useAgents.setState((state) => ({
-        tasks: new Map(state.tasks).set("A", { ...state.tasks.get("A")!, provider: "minerva.api.b" }),
+        tasks: new Map(state.tasks).set("A", { ...state.tasks.get("A")!, model: "api:removed/model" }),
       })),
     );
     expect(screen.getByText("Choose a model from this provider to continue.")).toBeInTheDocument();

@@ -6233,6 +6233,7 @@ dependencies = [
 name = "mh-providers"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "cordis-rs",
  "futures-util",
  "mh-context",
@@ -6241,6 +6242,7 @@ dependencies = [
  "mh-tool-runtime",
  "rig-agent",
  "rig-core",
+ "rig-reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -6346,8 +6348,10 @@ dependencies = [
  "cordis-rs",
  "mh-context",
  "mh-tool-runtime",
+ "serde",
  "serde_json",
  "tokio",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

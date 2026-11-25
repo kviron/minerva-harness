@@ -1,4 +1,7 @@
 //! Embedded model/API engine. Uses the same in-process event normalization as native drivers.
+mod jobs;
+#[cfg(test)]
+mod jobs_tests;
 #[cfg(test)]
 mod live_selection_tests;
 #[cfg(test)]
@@ -6,6 +9,9 @@ mod permission_tests;
 mod selection;
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod test_http;
+mod tool_updates;
 use ide_jsonrpc::{Handler, Peer, codes};
 use ide_minerva::{
     Service,
@@ -14,7 +20,7 @@ use ide_minerva::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -63,6 +69,7 @@ pub(crate) fn connect(
             client: OnceLock::new(),
             runs: Arc::new(Mutex::new(HashMap::new())),
             early_cancel: Mutex::new(HashMap::new()),
+            job_sessions: Arc::new(Mutex::new(HashSet::new())),
             runtime: tokio::runtime::Handle::current(),
         }),
         client,
@@ -76,13 +83,13 @@ struct Engine {
     client: OnceLock<Peer>,
     runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
     early_cancel: Mutex<HashMap<String, Instant>>,
+    job_sessions: Arc<Mutex<HashSet<String>>>,
     runtime: tokio::runtime::Handle,
 }
 
 #[derive(Clone)]
 struct ActiveRun {
     id: String,
-    provider: String,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -116,12 +123,9 @@ impl Engine {
         for provider in providers.as_array().ok_or("Invalid provider catalog")? {
             let id = provider["id"].as_str().ok_or("Provider has no ID")?;
             let prefix = format!("api:{id}/");
-            if self.model_prefix.as_ref().is_some_and(|selected| selected != &prefix) {
-                continue;
-            }
             for model in provider["models"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 let value = format!("{prefix}{model}");
-                models.push(json!({"value":value,"name":model}));
+                models.push(json!({"value":value,"name":model,"description":provider["name"]}));
                 let choices = provider["reasoning"][model]
                     .as_array()
                     .into_iter()
@@ -138,6 +142,10 @@ impl Engine {
                 levels.insert(value, model_levels);
             }
         }
+        // Legacy provider-specific connections keep their initial choice, but share the full catalog.
+        if let Some(prefix) = &self.model_prefix {
+            models.sort_by_key(|model| !model["value"].as_str().is_some_and(|value| value.starts_with(prefix)));
+        }
         Ok((models, levels))
     }
 
@@ -153,7 +161,7 @@ impl Engine {
     async fn handle(&self, method: &str, params: Value) -> Result<Value, String> {
         if method == "initialize" {
             return Ok(
-                json!({"protocolVersion":1,"agentInfo":{"name":"minerva","title":"Minerva","version":env!("CARGO_PKG_VERSION")},"authMethods":[],"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"embeddedContext":true}}}),
+                json!({"protocolVersion":1,"agentInfo":{"name":"minerva","title":"Minerva","version":env!("CARGO_PKG_VERSION")},"authMethods":[],"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"embeddedContext":true},"_meta":{"openidea":{"backgroundTasks":true}}}}),
             );
         }
         let runtime = self.service.runtime().await?;
@@ -176,6 +184,7 @@ impl Engine {
                 if !model.is_empty() {
                     runtime.sessions.request_selection(&id, model, None)?;
                 }
+                self.watch_jobs(&runtime, &id)?;
                 Ok(json!({"sessionId":id,"configOptions":options}))
             }
             "session/load" | "session/resume" => {
@@ -196,7 +205,15 @@ impl Engine {
                         }
                     }
                 }
-                Ok(json!({"configOptions":self.session_options(&runtime,id).await?}))
+                let options = self.session_options(&runtime, id).await?;
+                self.watch_jobs(&runtime, id)?;
+                Ok(json!({"configOptions":options}))
+            }
+            "_openidea/stop_task" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                runtime.plugins.jobs()?.kill(id, string(&params, "taskId")?)?;
+                Ok(json!({}))
             }
             "session/set_config_option" => {
                 let id = string(&params, "sessionId")?;
@@ -228,6 +245,7 @@ impl Engine {
     async fn prompt(&self, runtime: Arc<Runtime>, params: Value) -> Result<Value, String> {
         let id = string(&params, "sessionId")?;
         self.check_session(&runtime, id).await?;
+        self.watch_jobs(&runtime, id)?;
         if self.early_cancel.lock().remove(id).is_some_and(|time| time.elapsed() < Duration::from_secs(2)) {
             return Ok(json!({"stopReason":"cancelled"}));
         }
@@ -265,11 +283,7 @@ impl Engine {
             options["reasoningEffort"] = effort;
         }
         let run = uuid::Uuid::new_v4().to_string();
-        let active = ActiveRun {
-            id: run.clone(),
-            provider: model.split_once('/').ok_or("Invalid API model route")?.0.into(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+        let active = ActiveRun { id: run.clone(), cancelled: Arc::new(AtomicBool::new(false)) };
         {
             let mut runs = self.runs.lock();
             if runs.contains_key(id) {
@@ -277,7 +291,9 @@ impl Engine {
             }
             runs.insert(id.into(), active.clone());
         }
-        if self.early_cancel.lock().remove(id).is_some_and(|time| time.elapsed() < Duration::from_secs(2)) {
+        if self.client.get().is_none_or(Peer::is_closed)
+            || self.early_cancel.lock().remove(id).is_some_and(|time| time.elapsed() < Duration::from_secs(2))
+        {
             active.cancelled.store(true, Ordering::Release);
         }
         let result = self.run_prompt(&runtime, id, &active, model, text, options).await;
@@ -300,6 +316,9 @@ impl Engine {
         text: String,
         options: Value,
     ) -> Result<Value, String> {
+        if active.cancelled.load(Ordering::Acquire) || self.client.get().is_none_or(Peer::is_closed) {
+            return Ok(json!({"stopReason":"cancelled"}));
+        }
         let run = active.id.as_str();
         let baseline = runtime.sessions.baseline(id)?;
         runtime
@@ -337,7 +356,7 @@ impl Engine {
                         let call = &part.data;
                         let call_id = call["callId"].as_str().unwrap_or_default();
                         if tools.get(call_id) != Some(call) {
-                            self.update(id,json!({"sessionUpdate":if tools.contains_key(call_id){"tool_call_update"}else{"tool_call"},"toolCallId":call_id,"title":call["name"],"kind":"other","status":match call["status"].as_str(){Some("completed")=>"completed",Some("failed")=>"failed",_=>"in_progress"},"rawInput":call["arguments"]}))?;
+                            self.update(id, tool_updates::call_update(call, tools.contains_key(call_id)))?;
                             tools.insert(call_id.into(), call.clone());
                         }
                     }
@@ -452,7 +471,7 @@ impl super::Shim for Engine {
         let service = self.service.clone();
         self.runtime.spawn(async move {
             client.closed().await;
-            let pending: Vec<_> = runs.lock().drain().collect();
+            let pending: Vec<_> = runs.lock().iter().map(|(id, run)| (id.clone(), run.clone())).collect();
             if !pending.is_empty()
                 && let Ok(runtime) = service.runtime().await
             {
@@ -479,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn each_connection_only_offers_and_accepts_its_own_models() {
+    async fn legacy_connection_can_switch_providers_without_replacing_its_session() {
         let dir = tempfile::tempdir().unwrap();
         let service = Arc::new(Service::new(dir.path().join("data"), dir.path().join("config")));
         let runtime = service.runtime().await.unwrap();
@@ -490,17 +509,22 @@ mod tests {
         }
         let peer = connect(service.clone(), dir.path(), Arc::new(Client(Arc::default())), Some("api:one/".into()));
         let new: Value = peer.request("session/new", json!({}), None).await.unwrap();
-        assert_eq!(new["configOptions"][0]["options"].as_array().unwrap().len(), 1);
+        assert_eq!(new["configOptions"][0]["options"].as_array().unwrap().len(), 2);
         assert_eq!(new["configOptions"][0]["currentValue"], "api:one/model");
-        assert!(
-            peer.request::<_, Value>(
-                "session/set_config_option",
-                json!({"sessionId":new["sessionId"],"configId":"model","value":"api:two/model"}),
-                None
-            )
-            .await
-            .is_err()
+        assert_eq!(new["configOptions"][0]["options"][1]["description"], "two");
+        peer.request::<_, Value>(
+            "session/set_config_option",
+            json!({"sessionId":new["sessionId"],"configId":"model","value":"api:two/model"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.sessions.selection(new["sessionId"].as_str().unwrap()).unwrap().unwrap().model,
+            "api:two/model"
         );
+        let loaded: Value = peer.request("session/resume", json!({"sessionId":new["sessionId"]}), None).await.unwrap();
+        assert_eq!(loaded["configOptions"][0]["currentValue"], "api:two/model");
         peer.kill();
         service.shutdown().await.unwrap();
     }

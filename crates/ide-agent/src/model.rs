@@ -103,7 +103,7 @@ pub struct AgentTask {
     /// by its next output or any status change.
     #[serde(default)]
     pub retry: Option<AgentRetry>,
-    /// What the agent runs in the background (shells, subagents, monitors), oldest first.
+    /// Background work (shells, subagents, monitors), including recent outcomes when reported.
     // Boxed so that `AgentEvent::Task` stays within clippy's `large_enum_variant` bound on Windows.
     #[serde(default)]
     pub background: Box<Vec<AgentBackgroundTask>>,
@@ -148,6 +148,14 @@ pub struct AgentBackgroundTask {
     pub description: String,
     /// When the client first saw it (ms since the epoch).
     pub started_ms: f64,
+    /// Optional bounded live output; observing it does not consume the agent's log cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub output: Option<String>,
+    /// Absent for older adapters, whose reported tasks are all active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub status: Option<String>,
 }
 
 /// An API request the agent is about to retry.

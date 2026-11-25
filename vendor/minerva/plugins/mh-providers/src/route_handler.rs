@@ -4,13 +4,12 @@ use mh_sessions::{DispatchAdmission, RouteDispatch};
 use rig_core::{
     effect::{family, EffectKind, HandlerDescriptor},
     error::{ErrorKind, ErrorReport},
-    operation::Completion,
-    serve::{adapters::ModelAdapter, Dispatch, Reply, Serve},
+    serve::{Dispatch, ErasedHandler, Reply, Serve},
 };
 use std::sync::Arc;
 
 pub(crate) struct RouteHandler {
-    pub inner: ModelAdapter<Completion>,
+    pub inner: ErasedHandler,
     pub label: String,
     pub source: ProviderService,
     pub step: StepState,
@@ -80,6 +79,6 @@ impl Serve for RouteHandler {
         if let Err(error) = self.admit(&kind, &dispatch).await {
             return Reply::Outcome(Err(ErrorReport::new(ErrorKind::Denied, error)));
         }
-        self.inner.serve(kind, dispatch).await
+        self.inner.handle(kind, dispatch).await
     }
 }

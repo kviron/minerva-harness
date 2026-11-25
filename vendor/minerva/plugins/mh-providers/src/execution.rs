@@ -17,13 +17,21 @@ impl ProviderService {
                 return Err("Model not found".into());
             }
             self.endpoint_policy.require_safe_transport(&provider.base_url)?;
-            let key = self
-                .credentials
-                .get(&self.scope, id)?
-                .or_else(|| self.env_key(id, &provider.base_url))
-                .or_else(|| (provider.protocol == "ollama").then(|| "ollama".into()))
-                .ok_or("API key not configured")?;
+            let key = if provider.protocol == codex::ID {
+                String::new()
+            } else {
+                self.credentials
+                    .get(&self.scope, id)?
+                    .or_else(|| self.env_key(id, &provider.base_url))
+                    .or_else(|| (provider.protocol == "ollama").then(|| "ollama".into()))
+                    .ok_or("API key not configured")?
+            };
             (provider, key)
+        };
+        let codex_snapshot = if provider.protocol == codex::ID {
+            Some(self.codex.model_snapshot(model).ok_or("Codex model is unavailable; refresh its catalog")?)
+        } else {
+            None
         };
         let (last, prev) = messages.split_last().ok_or("Сообщение пустое.")?;
         if last.role != "user" || (last.text().trim().is_empty() && !last.parts.iter().any(|p| p.kind == "image")) {
@@ -35,12 +43,10 @@ impl ProviderService {
         let mut dynamic_tools = Vec::new();
         let mut step_hook = None;
         let mut identity_hook = crate::tools::AdmittedTools::default().identity_hook();
-        let mut image_generation_admitted = false;
         let streaming = run.is_some();
         let reasoning_effort = run.as_ref().and_then(|r| r.reasoning_effort.clone());
         let cancellation = run.as_ref().map(|r| r.tool_context.cancellation.clone());
         if let Some(mut run) = run {
-            image_generation_admitted = run.tools.definitions().iter().any(|tool| tool.name == "generate_image");
             run.tool_context.sink = Some(Arc::new(hook.clone()));
             dynamic_tools = run.tools.rig_tools(run.tool_context.clone());
             identity_hook = run.tools.identity_hook();
@@ -72,7 +78,12 @@ impl ProviderService {
         let reasoning = if selection_control.is_some() {
             reasoning::Plan::default()
         } else {
-            reasoning::prepare(&provider, model, reasoning_effort.as_deref())?
+            match &codex_snapshot {
+                Some((spec, levels)) => {
+                    reasoning::prepare_codex(&provider, model, reasoning_effort.as_deref(), spec, levels)?
+                }
+                None => reasoning::prepare(&provider, model, reasoning_effort.as_deref())?,
+            }
         };
         let budget_cap = reasoning.output_cap;
         macro_rules! run_agent {
@@ -94,15 +105,21 @@ impl ProviderService {
                     None => builder,
                 };
                 let mut builder = builder;
+                let signed_route = provider.protocol == codex::ID && selection_control.is_none();
+                if signed_route {
+                    builder = builder.model_route_handler(
+                        "minerva-codex",
+                        self.codex.handler_with_spec(
+                            codex_snapshot.as_ref().ok_or("Missing Codex model metadata")?.0.clone(),
+                        )?,
+                    );
+                }
                 if let (Some(routes), Some(control), Some(routing)) = (&routes, &selection_control, &routing_hook) {
                     for route in routes.values() {
                         builder = builder.model_route_handler(
                             route.label.clone(),
                             route_handler::RouteHandler {
-                                inner: rig_core::serve::adapters::ModelAdapter::new(
-                                    route.label.clone(),
-                                    route.driver.clone(),
-                                ),
+                                inner: route.handler.clone(),
                                 label: route.label.clone(),
                                 source: self.clone(),
                                 step: step.clone(),
@@ -116,18 +133,20 @@ impl ProviderService {
                 }
                 let agent = builder.build();
                 let mut request = agent.prompt(prompt).history(history).add_hook(hook.clone());
+                if signed_route {
+                    request = request.using_model("minerva-codex");
+                }
                 if let Some(step_hook) = step_hook {
                     request = request.add_hook(step_hook);
                 }
                 let request =
                     if let Some(routing_hook) = routing_hook { request.add_hook(routing_hook) } else { request };
-                let request = request.add_hook(identity_hook);
+                let timeout = timeout::ModelTimeout::new();
+                let request = request.add_hook(identity_hook).add_hook(timeout.clone());
                 let request = if streaming { request.max_turns(if has_tools { 32 } else { 1 }) } else { request };
                 if !streaming {
-                    let response = tokio::time::timeout(std::time::Duration::from_secs(90), request)
-                        .await
-                        .map_err(|_| "Provider timed out".to_string())?
-                        .map_err(|e| format!("Provider run failed: {e}"))?;
+                    let response =
+                        timeout.run(async { request.await.map_err(|e| format!("Provider run failed: {e}")) }).await?;
                     return hook.finish(response.messages.get(1..).ok_or("Rig returned no response history")?);
                 }
                 let mut stream = request.stream();
@@ -144,19 +163,22 @@ impl ProviderService {
                     }
                     Err("Provider stream ended without a final response".into())
                 };
-                let limit = if image_generation_admitted { 1080 } else { 90 };
-                let bounded = tokio::time::timeout(std::time::Duration::from_secs(limit), drive);
+                let bounded = timeout.run(drive);
                 if let Some(cancellation) = cancellation {
                     tokio::select! {
-                        result = bounded => result.map_err(|_| "Provider timed out".to_string())?,
+                        biased;
                         _ = cancellation.cancelled() => Err("Run cancelled".into()),
+                        result = bounded => result,
                     }
                 } else {
-                    bounded.await.map_err(|_| "Provider timed out".to_string())?
+                    bounded.await
                 }
             }};
         }
         match provider.protocol.as_str() {
+            "openai-codex" => {
+                run_agent!(openai_config(codex::ID, codex::BASE_URL, String::new()).client().responses(model))
+            }
             "openai-chat" | "ollama" => {
                 run_agent!(openai_config(&provider.id, &provider.base_url, key).client().chat(model))
             }

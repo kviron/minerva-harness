@@ -7,6 +7,11 @@ import type { SelectOption } from "@/ui";
 export const ADD_AGENT = "__addAgent__";
 export const ADD_PROVIDER = "__addProvider__";
 
+/** Saved Minerva tasks keep their original ID; discovery now publishes one agent. */
+export function agentProviderId(id: string): string {
+  return id.startsWith("minerva.api.") ? "minerva" : id;
+}
+
 /**
  * Installed agents first; the rest under a "Not installed" title, with the command they
  * need; then More agents…. Registry agents show their version, or the update on offer.

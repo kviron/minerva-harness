@@ -1,4 +1,11 @@
+import { trackMinervaConnectionOperation } from "./minervaConnections";
 import { call, commands } from "./ipc";
+
+export interface MinervaCodexStatus {
+  state: "signed-out" | "signing-in" | "signed-in" | "signing-out" | "error";
+  authorizationUrl?: string;
+  error?: string;
+}
 
 export interface MinervaProvider {
   id: string;
@@ -17,5 +24,9 @@ export interface MinervaKnownProvider {
   envVar: string | null;
 }
 export async function minervaCall<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-  return JSON.parse(await call(commands.minervaCall(method, JSON.stringify(params)))) as T;
+  return trackMinervaConnectionOperation(
+    method,
+    params,
+    async () => JSON.parse(await call(commands.minervaCall(method, JSON.stringify(params)))) as T,
+  );
 }

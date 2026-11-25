@@ -5,8 +5,10 @@ pub use mh_tool_runtime as tools;
 pub use mh_tool_runtime::*;
 use serde_json::json;
 use std::{convert::Infallible, sync::Arc};
+pub mod jobs;
 mod native;
 mod process_tree;
+pub use jobs::{register_native_with_jobs, JobOutput, JobSnapshot, JobStatus, ShellJobs};
 pub use native::{atomic_write, register_native, save_attachment, EDIT_LOCK};
 pub struct WorkspaceTools;
 impl Service for WorkspaceTools {
@@ -39,7 +41,11 @@ impl Plugin for WorkspaceToolsPlugin {
                 owned.revoke_owner("native.skills");
             })
             .map_err(apply_error)?;
-        crate::register_native(&tools).map_err(apply_error)?;
+        let jobs = Arc::new(ShellJobs::default());
+        let owned_jobs = jobs.clone();
+        ctx.effect(move || async move { owned_jobs.shutdown().await.map_err(apply_error) }).map_err(apply_error)?;
+        let _jobs_publication = ctx.provide(jobs.clone()).map_err(apply_error)?;
+        crate::register_native_with_jobs(&tools, jobs).map_err(apply_error)?;
         for (name, description, properties, required, side_effect) in [
             ("read_attachment", "Read a session attachment in bounded byte chunks. UTF-8 text is returned directly; binary or split UTF-8 chunks use base64. Continue at nextOffset until eof.", json!({"id":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1024}}), vec!["id"], false),
             ("save_attachment", "Copy a session attachment byte-for-byte to a new workspace file for processing (PDF, archive, spreadsheet, etc.). Never overwrites existing files.", json!({"id":{"type":"string"},"path":{"type":"string","minLength":1}}), vec!["id","path"], true),

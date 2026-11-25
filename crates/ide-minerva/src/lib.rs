@@ -22,24 +22,8 @@ pub struct Service {
 
 impl Service {
     pub async fn connections(&self) -> Result<Vec<Connection>, String> {
-        let runtime = self.runtime().await?;
-        #[derive(serde::Deserialize)]
-        struct Provider {
-            id: String,
-            name: String,
-        }
-        let providers: Vec<Provider> = serde_json::from_value(
-            serde_json::to_value(runtime.plugins.providers()?.list().await).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(providers
-            .into_iter()
-            .map(|provider| Connection {
-                id: format!("minerva.api.{}", provider.id),
-                name: provider.name,
-                model_prefix: format!("api:{}/", provider.id),
-            })
-            .collect())
+        self.runtime().await?;
+        Ok(vec![Connection { id: "minerva".into(), name: "Minerva".into(), model_prefix: String::new() }])
     }
 
     pub fn new(data_dir: PathBuf, config_dir: PathBuf) -> Self {
@@ -93,7 +77,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn configured_providers_are_connections_without_a_minerva_entry() {
+    async fn configured_providers_share_one_minerva_connection() {
         let dir = tempfile::tempdir().unwrap();
         let service = Service::new(dir.path().join("data"), dir.path().join("config"));
         let runtime = service.runtime().await.unwrap();
@@ -113,10 +97,10 @@ mod tests {
                 .unwrap();
         }
         let connections = service.connections().await.unwrap();
-        assert_eq!(connections.len(), 2);
-        assert!(connections.iter().any(|connection| connection.id == "minerva.api.one"
-            && connection.name == "Provider one"
-            && connection.model_prefix == "api:one/"));
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, "minerva");
+        assert_eq!(connections[0].name, "Minerva");
+        assert!(connections[0].model_prefix.is_empty());
         service.shutdown().await.unwrap();
     }
 

@@ -2,7 +2,7 @@ import type { AgentChange, AgentCommit, AgentConfigOption, AgentEntry, AgentTask
 import { executeAction } from "@/platform/actions";
 import { tx, useTx } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
-import { Icon, IconButton, T, type IconName } from "@/ui";
+import { Icon, IconButton, T } from "@/ui";
 import { notifications, useEditorShown } from "@/workbench/contributions";
 import clsx from "clsx";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
@@ -18,6 +18,7 @@ import { useAgentSettings } from "../agentSettings";
 import { canSend, emptyDraft } from "../composerModel";
 import { useEffortFocus } from "../effortFocus";
 import { isBusy } from "../model";
+import { agentProviderId } from "../providerOptions";
 import { asksInCard, type PermissionEntry } from "../permission";
 import {
   stopTask,
@@ -29,13 +30,11 @@ import {
   setTaskConfig,
   setTaskMcpOverrides,
   setTaskSkillOverrides,
-  stopBackgroundTask,
   useAgentCommands,
   useAgents,
 } from "../store";
 import { PermissionLine } from "./QuestionForm";
 import { SessionStatus } from "./SessionStatus";
-import { Elapsed } from "./WorkingRow";
 import { WorkingSubagents } from "./toolEntries";
 import { SessionProviderPicker } from "./SessionProviderPicker";
 import { useSessionProvider } from "./useSessionProvider";
@@ -161,9 +160,10 @@ export function SessionComposer({
   const { sendWith, whileRunning } = useAgentSettings();
   const project = useProject((s) => s.project);
   const composer = useAgents((s) => s.composers.get(task.id)) ?? emptyDraft();
-  const provider = useAgents((s) => s.providers.find((p) => p.id === task.provider));
-  const catalog = useAgents((s) => s.modelCatalogs.get(task.provider));
-  const requestingModels = useAgents((s) => s.modelRequests.has(task.provider));
+  const providerId = agentProviderId(task.provider);
+  const provider = useAgents((s) => s.providers.find((p) => p.id === providerId));
+  const catalog = useAgents((s) => s.modelCatalogs.get(providerId));
+  const requestingModels = useAgents((s) => s.modelRequests.has(providerId));
   const model = task.config.find((o) => o.category === "model");
   const catalogModel = (catalog?.config ?? provider?.config)?.find((o) => o.category === "model");
   const canRefreshModels =
@@ -206,7 +206,7 @@ export function SessionComposer({
   const [assetFocus, setAssetFocus] = useState(0);
   const agentCommands = useAgentCommands(task.provider, task.id, task.commands);
   const busy = isBusy(task.status);
-  const sessionProvider = useSessionProvider(task.id, task.provider, task.model);
+  const sessionProvider = useSessionProvider(task.id, task.provider, task.model, task.config);
   const shellRunning = useAgents((s) => s.shellRunning.has(task.id));
   // ↑ recalls this conversation's messages, newest first.
   const history = useMemo(
@@ -298,7 +298,6 @@ export function SessionComposer({
       )}
       <Tray task={task} entries={entries}>
         <WorkingSubagents entries={entries} onOpen={onOpenSubagent} />
-        <BackgroundTasks task={task} />
         {task.queue.length > 0 && <Queue task={task} />}
       </Tray>
       <SessionAssets task={task} entries={entries} head={head} onFocusComposer={() => setAssetFocus((n) => n + 1)} />
@@ -426,45 +425,6 @@ export function SessionComposer({
 }
 
 /** Messages waiting for the turn to end: send now, edit, or drop. */
-const BACKGROUND_ICON: Record<string, IconName> = {
-  local_bash: "terminal",
-  monitor: "eye",
-};
-
-/** What the agent runs in the background; its subagents show as chips of their own. */
-function BackgroundTasks({ task }: { task: AgentTask }) {
-  const tx = useTx();
-  const running = (task.background ?? []).filter((background) => background.kind !== "local_agent");
-  if (!running.length) return null;
-  const fail = (e: unknown) =>
-    notifications().notify({
-      level: "error",
-      title: "Couldn't stop the background task",
-      body: String(e),
-    });
-  return (
-    <div className={styles.background} aria-label={tx("Running in the background")}>
-      {running.map((background) => (
-        <div key={background.id} className={styles.backgroundTask}>
-          <Icon name={BACKGROUND_ICON[background.kind] ?? "clock"} size={12} className={styles.muted} />
-          <span className={styles.backgroundText} title={background.description}>
-            {background.description || background.kind}
-          </span>
-          {background.startedMs != null && <Elapsed since={background.startedMs} />}
-          {task.capabilities?.backgroundTasks && (
-            <IconButton
-              icon="stop"
-              title="Stop"
-              size="small"
-              onClick={() => void stopBackgroundTask(task.id, background.id).catch(fail)}
-            />
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function Queue({ task }: { task: AgentTask }) {
   const fail = (e: unknown) =>
     notifications().notify({

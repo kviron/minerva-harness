@@ -5,7 +5,7 @@ import { onIdeEvent } from "@/platform/ipc";
 import { isSameOrInside } from "@/platform/paths";
 import { useProject } from "@/platform/project";
 import { EmptyState, Icon, IconButton, T } from "@/ui";
-import { useEditorShown, useToolWindowShown, type EditorInput } from "@/workbench/contributions";
+import { notifications, useEditorShown, useToolWindowShown, type EditorInput } from "@/workbench/contributions";
 import clsx from "clsx";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
@@ -26,10 +26,19 @@ import {
 import { ChangesPane, useChangesOpen, useLocalHead } from "./session/ChangesPane";
 import { FoldedContent } from "./session/Folds";
 import { QuestionCard } from "./session/QuestionForm";
+import { BackgroundTasks } from "./session/BackgroundTasks";
 import { SessionComposer } from "./session/SessionComposer";
 import { Stream } from "./session/Stream";
 import { focusedSession, registerReachableSession, setFocusedSession, type FocusedSession } from "./sessionFocus";
-import { cancelTask, loadEntries, markVisible, refreshChanges, scheduleChanges, useAgents } from "./store";
+import {
+  cancelTask,
+  stopBackgroundTask,
+  loadEntries,
+  markVisible,
+  refreshChanges,
+  scheduleChanges,
+  useAgents,
+} from "./store";
 
 export function SessionEditor({ input, docked = false }: { input: EditorInput; docked?: boolean }) {
   const id = (input.data as { task: string }).task;
@@ -151,6 +160,21 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
       }}
     >
       <div className={styles.conversation} hidden={docked && changesOpen}>
+        {!view && (
+          <BackgroundTasks
+            tasks={(task.background ?? []).filter((background) => background.kind !== "local_agent")}
+            canStop={task.capabilities?.backgroundTasks ?? false}
+            onStop={(id) =>
+              void stopBackgroundTask(task.id, id).catch((error: unknown) =>
+                notifications().notify({
+                  level: "error",
+                  title: "Couldn't stop the background task",
+                  body: String(error),
+                }),
+              )
+            }
+          />
+        )}
         {view && <SubagentBar task={task} path={path} cards={cards} onNavigate={setPath} />}
         <FoldedContent.Provider value={finding && shown}>
           <Stream

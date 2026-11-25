@@ -4,6 +4,7 @@ pub use mh_runtime_support::{credential_store, network_policy};
 pub use mh_sessions::{sessions, transcript};
 pub use mh_tool_runtime as tools;
 mod budget;
+pub mod codex;
 mod execution;
 mod reasoning;
 mod route_handler;
@@ -12,6 +13,8 @@ mod selection;
 mod selection_hook;
 #[cfg(test)]
 mod selection_tests;
+mod timeout;
+pub mod usage;
 pub use selection::SelectionControl;
 #[cfg(test)]
 mod reasoning_http_tests;
@@ -296,6 +299,9 @@ fn dialect(_id: &str, base_url: &str) -> Option<&'static rig_core::providers::op
     rig_core::providers::openai::wire::by_name(preset.id)
 }
 fn openai_config(id: &str, base_url: &str, key: String) -> OpenAIConfig {
+    if id == codex::ID {
+        return OpenAIConfig::with_key(&rig_core::providers::chatgpt::DIALECT, key);
+    }
     match dialect(id, base_url) {
         Some(dialect) => OpenAIConfig::with_key(dialect, key),
         None => OpenAIConfig::new(key),
@@ -322,6 +328,12 @@ fn route_preset(provider: &Provider) -> Option<&'static Preset> {
 }
 
 fn catalog_spec(provider: &Provider, model: &str) -> Option<&'static rig_core::catalog::ModelSpec> {
+    if provider.protocol == codex::ID {
+        return rig_core::catalog::Catalog::builtin()
+            .resolve(&format!("chatgpt/{model}"))
+            .ok()
+            .map(|resolved| resolved.spec);
+    }
     let preset = route_preset(provider)?;
     let vendor = if preset.id == "zai-coding" { "zai" } else { preset.id };
     rig_core::catalog::Catalog::builtin().resolve(&format!("{vendor}/{model}")).ok().map(|resolved| resolved.spec)
@@ -450,16 +462,25 @@ pub(crate) fn estimate_message(message: &rig_core::message::Message) -> usize {
 
 #[derive(Clone)]
 pub struct ProviderService {
+    pub codex: codex::Service,
     path: PathBuf,
     providers: Arc<Mutex<Vec<Provider>>>,
     scope: CredentialScope,
     credentials: Arc<dyn CredentialStore>,
     endpoint_policy: EndpointPolicy,
+    usage_cache: usage::Cache,
 }
 impl Service for ProviderService {
     const NAME: &'static str = "studio.model-providers";
 }
 impl ProviderService {
+    fn model_spec(&self, provider: &Provider, model: &str) -> Option<rig_core::catalog::ModelSpec> {
+        if provider.protocol == codex::ID {
+            self.codex.model_spec(model)
+        } else {
+            catalog_spec(provider, model).cloned()
+        }
+    }
     pub fn new(path: PathBuf) -> Result<Self, String> {
         Self::new_with_store(path, CredentialScope::new("local")?, Arc::new(LocalKeyring), EndpointPolicy::Local)
     }
@@ -477,7 +498,21 @@ impl ProviderService {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.to_string()),
         };
-        Ok(Self { path, providers: Arc::new(Mutex::new(providers)), scope, credentials, endpoint_policy })
+        let codex = codex::Service::new(
+            path.with_extension("oauth-locks"),
+            scope.clone(),
+            credentials.clone(),
+            endpoint_policy == EndpointPolicy::Local,
+        );
+        Ok(Self {
+            path,
+            providers: Arc::new(Mutex::new(providers)),
+            scope,
+            credentials,
+            endpoint_policy,
+            codex,
+            usage_cache: Default::default(),
+        })
     }
     fn env_key(&self, id: &str, endpoint: &str) -> Option<String> {
         if !self.credentials.local_environment_fallback() || self.endpoint_policy == EndpointPolicy::Hosted {
@@ -490,6 +525,9 @@ impl ProviderService {
         std::env::var(preset.env_var?).ok().filter(|s| !s.trim().is_empty())
     }
     fn has_key(&self, p: &Provider) -> bool {
+        if p.protocol == codex::ID {
+            return self.codex.has_session().unwrap_or(false);
+        }
         self.credentials.get(&self.scope, &p.id).ok().flatten().is_some() || self.env_key(&p.id, &p.base_url).is_some()
     }
     /// The endpoints this build knows, so a provider is configured by name and key alone.
@@ -518,7 +556,14 @@ impl ProviderService {
                     .models
                     .iter()
                     .filter_map(|m| {
-                        let choices = reasoning_choices(&p, m);
+                        let choices = if p.protocol == codex::ID {
+                            self.codex
+                                .model_snapshot(m)
+                                .map(|(spec, levels)| reasoning::codex_choices(&p, m, &spec, &levels))
+                                .unwrap_or_default()
+                        } else {
+                            reasoning_choices(&p, m)
+                        };
                         (!choices.is_empty()).then(|| (m.clone(), choices))
                     })
                     .collect(),
@@ -526,7 +571,34 @@ impl ProviderService {
             })
             .collect()
     }
+    pub async fn codex_configure(&self, models: Vec<String>) -> Result<Vec<ProviderView>, String> {
+        let is_new = !self.providers.lock().await.iter().any(|provider| provider.id == codex::ID);
+        self.save(ProviderInput {
+            id: codex::ID.into(),
+            name: "Codex subscription".into(),
+            base_url: codex::BASE_URL.into(),
+            models,
+            api_key: None,
+            is_new,
+            protocol: codex::ID.into(),
+        })
+        .await
+    }
     pub async fn save(&self, input: ProviderInput) -> Result<Vec<ProviderView>, String> {
+        if input.protocol == codex::ID || input.id == codex::ID {
+            if input.protocol != codex::ID
+                || input.id != codex::ID
+                || input.base_url != codex::BASE_URL
+                || input.api_key.as_ref().is_some_and(|key| !key.is_empty())
+            {
+                return Err("Codex subscription uses its managed connection settings".into());
+            }
+            let catalog = self.codex.models();
+            let mut seen = std::collections::HashSet::new();
+            if input.models.iter().any(|model| !catalog.contains(model) || !seen.insert(model)) {
+                return Err("Invalid Codex model catalog".into());
+            }
+        }
         if input.id.is_empty()
             || input.id.len() > 64
             || !input.id.chars().next().is_some_and(|c| c.is_ascii_lowercase())
@@ -534,7 +606,10 @@ impl ProviderService {
         {
             return Err("ID должен начинаться с латинской буквы и содержать строчные буквы, цифры, - или _.".into());
         }
-        if !matches!(input.protocol.as_str(), "openai-chat" | "openai-responses" | "anthropic-messages" | "ollama") {
+        if !matches!(
+            input.protocol.as_str(),
+            "openai-chat" | "openai-responses" | "anthropic-messages" | "ollama" | "openai-codex"
+        ) {
             return Err("Неизвестный протокол API.".into());
         }
         if input.name.trim().is_empty() || input.models.iter().any(|m| m.trim().is_empty()) {
@@ -619,6 +694,12 @@ impl ProviderService {
         Ok(self.list().await)
     }
     pub async fn discover(&self, input: ProviderInput) -> Result<Vec<String>, String> {
+        if input.protocol == codex::ID {
+            if input.id != codex::ID || input.base_url != codex::BASE_URL {
+                return Err("Invalid Codex subscription route".into());
+            }
+            return self.codex.discover_models().await;
+        }
         self.endpoint_policy.require_safe_transport(&input.base_url)?;
 
         let public_catalog_base = preset(&input.id)

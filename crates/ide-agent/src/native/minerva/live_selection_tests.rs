@@ -38,7 +38,7 @@ async fn response(socket: &mut tokio::net::TcpStream, delta: Value, finish: &str
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_live_selection_changes_the_next_model_call_after_a_tool() {
+async fn native_live_selection_changes_provider_on_the_next_model_call_after_a_tool() {
     let dir = tempfile::tempdir().unwrap();
     let service = Arc::new(Service::new(dir.path().join("data"), dir.path().join("config")));
     let runtime = service.runtime().await.unwrap();
@@ -144,18 +144,14 @@ async fn native_live_selection_changes_the_next_model_call_after_a_tool() {
         }
     });
     tokio::time::timeout(Duration::from_secs(20), entered.notified()).await.expect("tool must start");
-    assert!(
-        peer.request::<_, Value>(
-            "session/set_config_option",
-            json!({
-                "sessionId":session,"configId":"model","value":format!("api:{foreign}/other")
-            }),
-            None
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(runtime.sessions.selection(&session).unwrap().unwrap().model, format!("api:{provider}/model-a"));
+    peer.request::<_, Value>(
+        "session/set_config_option",
+        json!({"sessionId":session,"configId":"model","value":format!("api:{foreign}/other")}),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(runtime.sessions.selection(&session).unwrap().unwrap().model, format!("api:{foreign}/other"));
     let changed: Value = peer
         .request(
             "session/set_config_option",
@@ -176,17 +172,24 @@ async fn native_live_selection_changes_the_next_model_call_after_a_tool() {
         .await
         .unwrap();
     assert_eq!(latest["configOptions"][0]["currentValue"], format!("api:{provider}/model-c"));
+    peer.request::<_, Value>(
+        "session/set_config_option",
+        json!({"sessionId":session,"configId":"model","value":format!("api:{foreign}/other")}),
+        None,
+    )
+    .await
+    .unwrap();
     release.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(20), running).await.unwrap().unwrap().unwrap();
     assert_eq!(result["stopReason"], "end_turn");
     let (initial, replacement) = server.await.unwrap();
     assert_eq!(initial["model"], "model-a");
-    assert_eq!(replacement["model"], "model-c");
+    assert_eq!(replacement["model"], "other");
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     assert!(replacement.to_string().contains("fixture-result"));
     assert_eq!(runtime.sessions.list().unwrap().len(), 1);
     let desired = runtime.sessions.selection(&session).unwrap().unwrap();
-    assert_eq!(desired.model, format!("api:{provider}/model-c"));
+    assert_eq!(desired.model, format!("api:{foreign}/other"));
     let events = runtime.sessions.events_after(&session, 0, 1000).unwrap();
     let dispatches: Vec<_> = events.iter().filter(|event| event.kind == "run.selection_dispatch_intent").collect();
     assert_eq!(dispatches.len(), 2);

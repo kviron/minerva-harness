@@ -1,6 +1,6 @@
 //! One frozen selection binds preparation, Rig selection, and dispatch for a step.
 use super::{
-    catalog_spec, estimate_message, project_message, reasoning,
+    estimate_message, project_message, reasoning,
     routes::{Route, Routes},
     AgentRunContext, ProviderService, PREAMBLE,
 };
@@ -56,8 +56,18 @@ impl AgentHook for SelectionHook {
                 .cloned()
                 .ok_or("This route was not registered at run start; start a new turn")?;
             self.source.validate_route(&route).await?;
-            reasoning::validate_target(&route.provider, &route.model)?;
-            let plan = reasoning::prepare(&route.provider, &route.model, selection.reasoning_effort.as_deref())?;
+            let plan = if route.provider.protocol == super::codex::ID {
+                reasoning::prepare_codex(
+                    &route.provider,
+                    &route.model,
+                    selection.reasoning_effort.as_deref(),
+                    route.spec.as_ref().ok_or("Missing Codex model metadata")?,
+                    &route.reasoning_levels,
+                )?
+            } else {
+                reasoning::validate_target(&route.provider, &route.model)?;
+                reasoning::prepare(&route.provider, &route.model, selection.reasoning_effort.as_deref())?
+            };
             let prepared = self.run.context.prepare_enriched(&self.run.session_id, &self.run.messages).await?;
             let history = event.history.iter().map(|message| Arc::new(project_message(message))).collect::<Vec<_>>();
             let preamble = format!("{}\n{}", PREAMBLE, prepared.system_prompt);
@@ -68,7 +78,7 @@ impl AgentHook for SelectionHook {
                 .saturating_add(estimate_message(&project_message(event.prompt)))
                 .saturating_add(crate::context::estimate_tokens(&preamble))
                 .saturating_add(self.schema_tokens);
-            let spec = catalog_spec(&route.provider, &route.model);
+            let spec = route.spec.as_ref();
             let context_window = spec
                 .as_ref()
                 .and_then(|spec| spec.context_window)
@@ -154,7 +164,7 @@ fn project_request(request: &CompletionRequest, step: &FrozenStep) -> Result<Com
 }
 
 pub(crate) fn validate_request(request: &CompletionRequest, step: &FrozenStep) -> Result<(), String> {
-    if let Some(spec) = catalog_spec(&step.route.provider, &step.route.model) {
+    if let Some(spec) = step.route.spec.as_ref() {
         if !spec.tools && !request.tools.is_empty() {
             return Err("The selected model does not accept tools".into());
         }

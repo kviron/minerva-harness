@@ -1,9 +1,13 @@
 import type { AgentEntry, AgentTask } from "@/bindings";
 import { useEffect, useState } from "react";
 import { useAgents } from "../store";
+import { agentProviderId } from "../providerOptions";
 
 export function providerName(id: string) {
-  return useAgents.getState().providers.find((p) => p.id === id)?.name ?? id;
+  const providerId = agentProviderId(id);
+  return (
+    useAgents.getState().providers.find((p) => p.id === providerId)?.name ?? (providerId === "minerva" ? "Minerva" : id)
+  );
 }
 
 /** `Date.now()`, updated every `interval` ms. */

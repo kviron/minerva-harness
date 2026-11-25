@@ -1,6 +1,26 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unified_minerva_is_listed_once_and_legacy_tasks_keep_their_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager(tmp.path(), Arc::new(FakeAgent::default()));
+    mgr.set_minerva_connections(vec![ide_minerva::Connection {
+        id: "minerva".into(),
+        name: "Minerva".into(),
+        model_prefix: String::new(),
+    }]);
+    let listed = mgr.providers();
+    assert_eq!(listed.iter().filter(|provider| provider.id == "minerva").count(), 1);
+    assert!(!listed.iter().any(|provider| provider.id.starts_with("minerva.api.")));
+    assert!(mgr.shared.spec("minerva").unwrap().args.is_empty());
+    let legacy = mgr.shared.saved_task_spec("minerva.api.old").unwrap();
+    assert_eq!(legacy.id, "minerva.api.old");
+    assert_eq!(legacy.driver, provider::Driver::Minerva);
+    assert_eq!(legacy.args, ["api:old/"]);
+    mgr.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn saved_minerva_tasks_resolve_removed_connections_without_replacing_failed_sessions() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = manager(tmp.path(), Arc::new(FakeAgent::default()));

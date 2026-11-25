@@ -560,6 +560,11 @@ impl PluginManager {
     pub async fn ui_document(&self, id: &str) -> Result<String, String> {
         self.service()?.external.ui_document(id)
     }
+    pub fn jobs(&self) -> Result<Arc<mh_workspace_tools::ShellJobs>, String> {
+        self.context
+            .try_service::<mh_workspace_tools::ShellJobs>()
+            .map_err(|error| format!("Shell jobs unavailable: {error}"))
+    }
     pub fn shell(&self) -> Result<Arc<ShellService>, String> {
         self.context.try_service::<ShellService>().map_err(|error| format!("Оболочка недоступна: {error}"))
     }
@@ -569,6 +574,9 @@ impl PluginManager {
     pub async fn shutdown(&self) {
         if let Ok(service) = self.service() {
             service.shutdown().await;
+        }
+        if let Ok(providers) = self.providers() {
+            providers.codex.shutdown().await;
         }
         for plugin in self.builtins.iter().rev() {
             let _ = plugin.dispose().await;

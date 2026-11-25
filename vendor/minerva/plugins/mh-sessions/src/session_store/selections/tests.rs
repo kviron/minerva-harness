@@ -92,7 +92,15 @@ fn admissions_validate_session_revision_and_never_rewrite_run_input() {
     let mut forged = dispatch("forged", selected);
     forged.selection.model = "api:p/b".into();
     assert!(service.record_selection_dispatch("session", &forged).is_err());
-    assert!(service.request_selection("session", "api:other/b", None).is_err());
+    let other = service.request_selection("session", "api:other/b", None).unwrap();
+    assert_eq!(
+        service.record_selection_dispatch("session", &dispatch("other-provider", other)).unwrap(),
+        DispatchAdmission::Recorded { changed: true }
+    );
+    for model in ["plugin:external/model", "api:/model", "api:other/", "invalid"] {
+        let invalid = service.request_selection("session", model, None).unwrap();
+        assert!(service.record_selection_dispatch("session", &dispatch(model, invalid)).is_err());
+    }
     service.request_selection("session", "api:p/c", Some("max")).unwrap();
     assert!(!service.accept_run(&input, "later").unwrap());
     let db = Connection::open(&path).unwrap();

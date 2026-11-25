@@ -49,13 +49,6 @@ impl Engine {
         if !models.iter().any(|value| value["value"] == model) {
             return Err("Unknown API model".into());
         }
-        let active = self.runs.lock();
-        if active
-            .get(id)
-            .is_some_and(|run| model.split_once('/').map(|(provider, _)| provider) != Some(run.provider.as_str()))
-        {
-            return Err("Wait for the current turn before changing providers".into());
-        }
         runtime.sessions.set_model(id, model)?;
         Ok(())
     }

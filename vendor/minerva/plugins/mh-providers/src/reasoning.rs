@@ -14,6 +14,48 @@ pub(super) struct Plan {
     pub output_cap: Option<u64>,
 }
 
+pub(super) fn prepare_codex(
+    provider: &Provider,
+    model: &str,
+    choice: Option<&str>,
+    spec: &rig_core::catalog::ModelSpec,
+    levels: &[String],
+) -> Result<Plan, String> {
+    validate_protocol(provider, spec)?;
+    let Some(choice) = choice.filter(|choice| *choice != "default") else { return Ok(Plan::default()) };
+    let effort = if choice == "off" { "none" } else { choice };
+    if !levels.iter().any(|level| level == choice || level == effort) {
+        return Err("The Codex model does not support this reasoning effort".into());
+    }
+    let plan = Plan { additional_params: Some(json!({"reasoning":{"effort":effort}})), ..Plan::default() };
+    if encoded(provider, model, &plan)?["reasoning"]["effort"] != effort {
+        return Err("The Codex route did not encode the selected reasoning effort".into());
+    }
+    Ok(plan)
+}
+
+pub(super) fn codex_choices(
+    provider: &Provider,
+    model: &str,
+    spec: &rig_core::catalog::ModelSpec,
+    levels: &[String],
+) -> Vec<String> {
+    let mut choices = vec!["default".into()];
+    for level in levels {
+        let choice = if level == "none" { "off" } else { level.as_str() };
+        if !choices.iter().any(|value| value == choice)
+            && prepare_codex(provider, model, Some(choice), spec, levels).is_ok()
+        {
+            choices.push(choice.to_owned());
+        }
+    }
+    if choices.len() > 1 {
+        choices
+    } else {
+        Vec::new()
+    }
+}
+
 pub(super) fn prepare(provider: &Provider, model: &str, choice: Option<&str>) -> Result<Plan, String> {
     if matches!(choice, None | Some("default")) {
         return Ok(Plan::default());
@@ -114,7 +156,7 @@ pub(super) fn encoded(provider: &Provider, model: &str, plan: &Plan) -> Result<V
     let config = openai_config(&provider.id, &provider.base_url, "capability-check".into());
     match provider.protocol.as_str() {
         "openai-chat" | "ollama" => body(&rig_core::providers::openai::wire::Chat::new(config, model), request),
-        "openai-responses" => {
+        "openai-responses" | "openai-codex" => {
             body(&rig_core::providers::openai::responses_api::wire::Responses::new(config, model), request)
         }
         "anthropic-messages" => body(

@@ -23,6 +23,7 @@ import type {
   RequestId,
 } from "@/bindings";
 import { useChangesOptions } from "./changesOptions";
+import { agentProviderId } from "./providerOptions";
 import { auxiliaryWindow, windowLabel } from "@/platform/auxWindow";
 import { routeToWindow, taskWindowDraft, taskWindowFocused, updateTaskWindowDraft } from "./taskWindowRouting";
 import { clearAgentTaskFontZoom, resetAllAgentFontZoom } from "./fontZoom";
@@ -462,7 +463,7 @@ export async function refreshTaskModels(id: string, force = true, model: string 
   const { tasks, providers } = useAgents.getState();
   const task = tasks.get(id);
   if (!task || task.status === "archived" || (!task.model && !task.config.some((o) => o.category === "model"))) return;
-  const provider = providers.find((p) => p.id === task.provider);
+  const provider = providers.find((p) => p.id === agentProviderId(task.provider));
   if (!provider?.installed || useProject.getState().project?.trusted === false) return;
   await refreshProviderModels(provider, force, model, null);
 }
@@ -1056,6 +1057,11 @@ export async function refreshProviders() {
 export function reconcileDraftProvider() {
   const { providers, draft } = useAgents.getState();
   if (providers.some((provider) => provider.id === draft.provider)) return;
+  const unified = providers.find((provider) => provider.id === agentProviderId(draft.provider));
+  if (unified) {
+    updateDraft({ provider: unified.id });
+    return;
+  }
   const model = draft.config.model;
   const matching =
     draft.provider === "minerva" && model

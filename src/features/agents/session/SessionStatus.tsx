@@ -11,17 +11,27 @@ import { branchLabel, hasTaskTerminal, isBusy, providerIcon, statusLabel } from 
 import { useAgents } from "../store";
 import { taskMenu } from "../taskActions";
 import { providerName, useNow } from "./shared";
+import { agentProviderId } from "../providerOptions";
+import { SubscriptionLimits } from "./SubscriptionLimits";
 
 /** The task's terminal, at the end of its status line. */
-function StatusActions({ task }: { task: AgentTask }) {
+function StatusActions({ task, terminal }: { task: AgentTask; terminal: boolean }) {
+  const showLimits = useProject((s) => s.settings?.agents?.showUsageLimits !== false);
+  const limits = showLimits && agentProviderId(task.provider) === "minerva";
+  if (!limits && !terminal) return null;
   return (
     <span className={styles.statusActions}>
-      <IconButton
-        size="small"
-        icon="terminal"
-        title="Terminal"
-        onClick={() => void executeAction("terminal.openAt", task.cwd)}
-      />
+      {limits && (
+        <SubscriptionLimits model={task.config.find((option) => option.category === "model")?.current ?? task.model} />
+      )}
+      {terminal && (
+        <IconButton
+          size="small"
+          icon="terminal"
+          title="Terminal"
+          onClick={() => void executeAction("terminal.openAt", task.cwd)}
+        />
+      )}
     </span>
   );
 }
@@ -134,8 +144,8 @@ export function SessionStatus({
         )}
         <span className={styles.statusMeters}>
           <Meters task={task} entries={entries} />
-          {hasTaskTerminal(task, projectRoot) && <StatusActions task={task} />}
         </span>
+        <StatusActions task={task} terminal={hasTaskTerminal(task, projectRoot)} />
       </span>
     </div>
   );

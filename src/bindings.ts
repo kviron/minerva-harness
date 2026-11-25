@@ -2170,13 +2170,34 @@ export type AgentAcceptSkipped = {
 export type AgentAttentionReason = "finished" | "input" | "failed";
 
 /**  A task the agent runs in the background while the conversation goes on. */
-export type AgentBackgroundTask = {
+export type AgentBackgroundTask = AgentBackgroundTask_Serialize | AgentBackgroundTask_Deserialize;
+
+/**  A task the agent runs in the background while the conversation goes on. */
+export type AgentBackgroundTask_Deserialize = {
 	id: string,
 	/**  What it is, as the agent names it (`local_bash`, `local_agent`, `monitor`…). */
 	kind: string,
 	description: string,
 	/**  When the client first saw it (ms since the epoch). */
 	startedMs: number | null,
+	/**  Optional bounded live output; observing it does not consume the agent's log cursor. */
+	output?: string | null,
+	/**  Absent for older adapters, whose reported tasks are all active. */
+	status?: string | null,
+};
+
+/**  A task the agent runs in the background while the conversation goes on. */
+export type AgentBackgroundTask_Serialize = {
+	id: string,
+	/**  What it is, as the agent names it (`local_bash`, `local_agent`, `monitor`…). */
+	kind: string,
+	description: string,
+	/**  When the client first saw it (ms since the epoch). */
+	startedMs: number | null,
+	/**  Optional bounded live output; observing it does not consume the agent's log cursor. */
+	output?: string | null,
+	/**  Absent for older adapters, whose reported tasks are all active. */
+	status?: string | null,
 };
 
 /**
@@ -2905,8 +2926,8 @@ export type AgentTask_Deserialize = {
 	 *  by its next output or any status change.
 	 */
 	retry?: AgentRetry | null,
-	/**  What the agent runs in the background (shells, subagents, monitors), oldest first. */
-	background?: AgentBackgroundTask[],
+	/**  Background work (shells, subagents, monitors), including recent outcomes when reported. */
+	background?: AgentBackgroundTask_Deserialize[],
 	/**  Per-session MCP server enable/disable overrides (`server_name` -> `enabled`), including `"openidea"`. */
 	mcpOverrides?: { [key in string]: boolean },
 	/**  Per-session skill modes (`skill name` -> mode), on top of the settings' policies. */
@@ -2957,8 +2978,8 @@ export type AgentTask_Serialize = {
 	 *  by its next output or any status change.
 	 */
 	retry: AgentRetry | null,
-	/**  What the agent runs in the background (shells, subagents, monitors), oldest first. */
-	background: AgentBackgroundTask[],
+	/**  Background work (shells, subagents, monitors), including recent outcomes when reported. */
+	background: AgentBackgroundTask_Serialize[],
 	/**  Per-session MCP server enable/disable overrides (`server_name` -> `enabled`), including `"openidea"`. */
 	mcpOverrides?: { [key in string]: boolean },
 	/**  Per-session skill modes (`skill name` -> mode), on top of the settings' policies. */

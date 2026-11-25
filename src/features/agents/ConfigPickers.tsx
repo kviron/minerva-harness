@@ -22,14 +22,20 @@ export function configPickerOptions(
     return option.values.map((v) => ({ value: v.value, label: v.name, detail: v.description ?? undefined }));
   }
   const pinnedSet = new Set(pinned);
-  const buildItem = (v: AgentConfigOption["values"][number]): { provider: string; opt: SelectOption } => {
+  const buildItem = (v: AgentConfigOption["values"][number]) => {
     const slash = v.value.indexOf("/");
     const namespace = slash >= 0 ? v.value.slice(0, slash) : "";
-    const provider = /^(api|plugin):/.test(namespace) ? "" : namespace;
+    const api = namespace.startsWith("api:");
+    const provider = namespace.startsWith("plugin:") ? "" : namespace;
+    const providerName = api
+      ? namespace === "api:openai-codex"
+        ? "Codex"
+        : v.description || namespace.slice(4)
+      : provider;
     const path = slash >= 0 ? v.value.slice(slash + 1) : "";
     // Prefer the agent-reported display name (e.g. "opencode/Beam Free" → "Beam Free"); agents
-    // that just echo the id keep the compact id tail. The raw id stays in the detail line.
-    const prefix = provider ? `${provider}/` : "";
+    // that just echo the id keep the compact id tail.
+    const prefix = namespace ? `${namespace}/` : "";
     const reported = v.name.startsWith(prefix) ? v.name.slice(prefix.length).trim() : v.name;
     const label = path
       ? reported && reported !== path
@@ -37,32 +43,56 @@ export function configPickerOptions(
         : path.slice(path.lastIndexOf("/") + 1)
       : v.name || v.value;
     const mult = v.usageMultiplier && !v.description?.startsWith(v.usageMultiplier) ? v.usageMultiplier : undefined;
-    const parts = [path || undefined, mult, (descriptions && v.description) || undefined].filter(
-      (p): p is string => !!p,
-    );
+    const parts = [
+      !api && path && path !== label ? path : undefined,
+      mult,
+      (descriptions && !api && v.description) || undefined,
+    ].filter((p): p is string => !!p);
     const detail = parts.length > 0 ? parts.join(" · ") : undefined;
-    return { provider, opt: { value: v.value, label, detail, keywords: provider } };
+    return {
+      provider,
+      providerName,
+      api,
+      opt: {
+        value: v.value,
+        label,
+        detail,
+        keywords: api ? `${providerName} ${namespace.slice(4)} ${path}` : provider,
+      },
+    };
   };
 
   const pinnedItems: SelectOption[] = [];
-  const groups = new Map<string, SelectOption[]>();
+  const groups = new Map<string, { name: string; api: boolean; pinned: SelectOption[]; items: SelectOption[] }>();
   for (const v of option.values) {
-    const { provider, opt } = buildItem(v);
-    if (pinnedSet.has(v.value)) {
+    const { provider, providerName, api, opt } = buildItem(v);
+    if (pinnedSet.has(v.value) && !api) {
       pinnedItems.push(opt);
       continue;
     }
-    const bucket = groups.get(provider) ?? [];
-    bucket.push(opt);
+    const bucket = groups.get(provider) ?? { name: providerName, api, pinned: [], items: [] };
+    (pinnedSet.has(v.value) ? bucket.pinned : bucket.items).push(opt);
     groups.set(provider, bucket);
   }
-  const plain = groups.get("") ?? [];
+  const plain = groups.get("")?.items ?? [];
   groups.delete("");
+  const providerGroups = [...groups];
+  const apiGroups = providerGroups
+    .filter(([, group]) => group.api)
+    .sort(
+      (a, b) =>
+        a[1].name.localeCompare(b[1].name, undefined, { sensitivity: "base", numeric: true }) ||
+        a[0].localeCompare(b[0]),
+    );
   return [
     ...(pinnedItems.length > 0 ? [{ value: "__pinned__", label: "Pinned", section: true }, ...pinnedItems] : []),
     ...(pinnedItems.length > 0 && plain.length > 0 ? [{ value: "__models__", label: "Models", section: true }] : []),
     ...plain,
-    ...[...groups].flatMap(([provider, items]) => [{ value: provider, label: provider, section: true }, ...items]),
+    ...[...apiGroups, ...providerGroups.filter(([, group]) => !group.api)].flatMap(([provider, group]) => [
+      { value: provider, label: group.name, section: true },
+      ...group.pinned,
+      ...group.items,
+    ]),
   ];
 }
 

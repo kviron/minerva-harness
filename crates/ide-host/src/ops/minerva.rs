@@ -25,6 +25,52 @@ pub async fn minerva_call(host: &Host, window: &str, method: String, params: Str
     let params: Value = serde_json::from_str(&params).map_err(error)?;
     let runtime = host.minerva.runtime().await.map_err(error)?;
     let result = match method.as_str() {
+        "usage.list" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Usage {
+                #[serde(default)]
+                refresh: bool,
+            }
+            let input: Usage = serde_json::from_value(params).map_err(error)?;
+            serde_json::to_value(runtime.plugins.providers().map_err(error)?.usage(input.refresh).await).map_err(error)
+        }
+        "codex.status" => {
+            serde_json::to_value(runtime.plugins.providers().map_err(error)?.codex.status().map_err(error)?)
+                .map_err(error)
+        }
+        "codex.signIn" => {
+            serde_json::to_value(runtime.plugins.providers().map_err(error)?.codex.sign_in().map_err(error)?)
+                .map_err(error)
+        }
+        "codex.signOut" => {
+            let status = runtime.plugins.providers().map_err(error)?.codex.sign_out().await.map_err(error)?;
+            for project in host.projects() {
+                project.agents.minerva_models_changed();
+            }
+            serde_json::to_value(status).map_err(error)
+        }
+        "codex.models" => {
+            let models = runtime.plugins.providers().map_err(error)?.codex.discover_models().await.map_err(error)?;
+            for project in host.projects() {
+                project.agents.minerva_models_changed();
+            }
+            serde_json::to_value(models).map_err(error)
+        }
+        "codex.configure" => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Configure {
+                models: Vec<String>,
+            }
+            let input: Configure = serde_json::from_value(params).map_err(error)?;
+            let providers =
+                runtime.plugins.providers().map_err(error)?.codex_configure(input.models).await.map_err(error)?;
+            for project in host.projects() {
+                project.agents.minerva_models_changed();
+            }
+            serde_json::to_value(providers).map_err(error)
+        }
         "providers.list" => {
             serde_json::to_value(runtime.plugins.providers().map_err(error)?.list().await).map_err(error)
         }

@@ -32,3 +32,11 @@ it("moves the old Minerva selection to its configured connection without losing 
   expect(useAgents.getState().draft.provider).toBe("codex");
   expect(useAgents.getState().draft.config).toEqual({});
 });
+
+it("restores a legacy Minerva draft under unified discovery without clearing its route or effort", () => {
+  useAgents.setState({ providers: [{ id: "minerva", installed: true }] as AgentProvider[] });
+  updateDraft({ provider: "minerva.api.one", config: { model: "api:one/model", thought_level: "high" } });
+  reconcileDraftProvider();
+  expect(useAgents.getState().draft.provider).toBe("minerva");
+  expect(useAgents.getState().draft.config).toEqual({ model: "api:one/model", thought_level: "high" });
+});

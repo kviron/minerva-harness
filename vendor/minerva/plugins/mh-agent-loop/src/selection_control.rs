@@ -20,13 +20,20 @@ impl SessionSelection {
         let selection = Self { sessions, session, run };
         let store = selection.sessions.clone();
         let id = selection.session.clone();
-        let provider =
-            model.split_once('/').map(|(provider, _)| provider.to_owned()).ok_or("Invalid API model route")?;
+        let api_route = |model: &str| {
+            model
+                .strip_prefix("api:")
+                .and_then(|route| route.split_once('/'))
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        };
+        if !api_route(&model) {
+            return Err("Invalid API model route".into());
+        }
         let initial = tokio::task::spawn_blocking(move || store.ensure_selection(&id, &model, effort.as_deref()))
             .await
             .map_err(|error| error.to_string())??;
-        if initial.model.split_once('/').map(|(provider, _)| provider) != Some(provider.as_str()) {
-            return Err("Live model selection cannot change providers during a turn".into());
+        if !api_route(&initial.model) {
+            return Err("Live model selection requires an API model route".into());
         }
         Ok((Arc::new(selection), initial))
     }
@@ -66,20 +73,16 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn admission_rejects_a_pending_foreign_provider_before_context_preparation() {
+    async fn admission_keeps_a_pending_cross_provider_selection() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionService::open(&dir.path().join("sessions.sqlite3")).unwrap();
         store.create("session").unwrap();
         store.request_selection("session", "api:foreign/model", None).unwrap();
-        assert!(SessionSelection::admit(
-            store.clone(),
-            "session".into(),
-            "run".into(),
-            "api:original/model".into(),
-            None
-        )
-        .await
-        .is_err());
+        let (_, selected) =
+            SessionSelection::admit(store.clone(), "session".into(), "run".into(), "api:original/model".into(), None)
+                .await
+                .unwrap();
+        assert_eq!(selected.model, "api:foreign/model");
         store.request_selection("session", "api:original/latest", None).unwrap();
         let (_, initial) =
             SessionSelection::admit(store, "session".into(), "run".into(), "api:original/old".into(), None)

@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provider_changes_keep_the_session_and_require_an_explicit_available_model() {
+async fn legacy_provider_connections_share_choices_and_preserve_history() {
     let dir = tempfile::tempdir().unwrap();
     let service = Arc::new(Service::new(dir.path().join("data"), dir.path().join("config")));
     let runtime = service.runtime().await.unwrap();
@@ -45,21 +45,9 @@ async fn provider_changes_keep_the_session_and_require_an_explicit_available_mod
     let history = serde_json::to_value(runtime.sessions.load(id).unwrap()).unwrap();
     let loaded: Value = second.request("session/load", json!({"sessionId":id}), None).await.unwrap();
     assert_eq!(loaded["configOptions"][0]["currentValue"], first_model);
-    assert_eq!(loaded["configOptions"][0]["options"].as_array().unwrap().len(), 1);
+    assert_eq!(loaded["configOptions"][0]["options"].as_array().unwrap().len(), 2);
     assert_eq!(loaded["configOptions"][0]["options"][0]["value"], second_model);
     assert_eq!(runtime.sessions.get(id).unwrap().model.as_deref(), Some(first_model.as_str()));
-    assert!(
-        second
-            .request::<_, Value>(
-                "session/prompt",
-                json!({
-                    "sessionId":id,"prompt":[{"type":"text","text":"must select first"}]
-                }),
-                None
-            )
-            .await
-            .is_err()
-    );
     let selected: Value = second
         .request(
             "session/set_config_option",

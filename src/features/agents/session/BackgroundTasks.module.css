@@ -1,0 +1,113 @@
+.header {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-1) var(--space-2);
+}
+.trigger,
+.fold,
+.clear {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px 4px;
+  border: none;
+  border-radius: var(--radius-row);
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: var(--fs-small);
+  cursor: pointer;
+}
+.trigger:hover,
+.fold:hover,
+.clear:hover {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}
+.trigger:focus-visible,
+.fold:focus-visible,
+.clear:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.popup {
+  display: flex;
+  flex-direction: column;
+  width: 520px;
+  max-width: calc(100vw - 32px);
+  max-height: min(520px, 70vh);
+  padding: var(--space-2);
+  overflow: auto;
+}
+.panelHeading,
+.finishedHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+}
+.panelHeading {
+  margin-bottom: var(--space-1);
+}
+.finishedHeading {
+  margin-top: var(--space-2);
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border-strong);
+}
+.job {
+  flex: none;
+  min-width: 0;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-height: 40px;
+  padding: var(--space-1) 0;
+  color: var(--fg);
+  font-size: var(--fs-small);
+}
+.summary {
+  flex: 1;
+  min-width: 0;
+}
+.description {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.details {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+}
+.kind {
+  border-radius: var(--radius-small);
+  padding: 0 4px;
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+}
+.failure {
+  color: var(--danger);
+}
+.icon {
+  color: var(--fg-subtle);
+}
+.output {
+  min-width: 0;
+  max-height: min(220px, 35vh);
+  margin: var(--space-1) 0 var(--space-2);
+  overflow: auto;
+  user-select: text;
+  font-family: var(--font-mono);
+  font-size: var(--fs-small);
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre;
+}

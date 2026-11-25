@@ -1,0 +1,32 @@
+.trigger {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-1);
+  height: 22px;
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  min-width: 4ch;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.trigger:hover {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}
+.trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.popup {
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  max-height: min(560px, 70vh);
+  padding: var(--space-3);
+  overflow: auto;
+}

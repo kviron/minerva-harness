@@ -99,6 +99,12 @@ pub fn save_attachment(ctx: &ToolContext, path: &str, data: &str) -> Result<Valu
     Ok(json!({"path":path,"bytes":bytes.len()}))
 }
 pub fn register_native(registry: &ToolRegistry) -> Result<(), String> {
+    register(registry, true)
+}
+pub(super) fn register_without_shell(registry: &ToolRegistry) -> Result<(), String> {
+    register(registry, false)
+}
+fn register(registry: &ToolRegistry, include_shell: bool) -> Result<(), String> {
     let defs = [
         ("read_file", "Read a UTF-8 workspace file", schema(json!({"path":{"type":"string"}}), vec!["path"]), false),
         (
@@ -142,6 +148,9 @@ pub fn register_native(registry: &ToolRegistry) -> Result<(), String> {
         ),
     ];
     for (name, description, input_schema, side_effect) in defs {
+        if name == "shell" && !include_shell {
+            continue;
+        }
         registry.register(
             if name == "ask_user" { "native.interaction" } else { "native.workspace" },
             ToolDefinition {

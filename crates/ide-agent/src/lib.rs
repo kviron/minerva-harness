@@ -9,6 +9,7 @@
 
 mod acp;
 mod async_questions;
+mod background;
 mod catalogs;
 mod cli_update;
 mod config;
@@ -33,6 +34,7 @@ pub use cli_update::{AgentCliOffer, AgentCliUpdateResult};
 pub use external::ExternalSession;
 pub use model::*;
 
+use background::shown_background;
 use conversation::{Conversation, SavedSubagent, Session};
 use ide_core::{IdeError, IdeResult, IpcPath};
 use ide_jsonrpc::{Framing, Handler, Peer, RpcError, codes};
@@ -190,7 +192,12 @@ struct Known {
 impl Shared {
     fn load_specs(&self) -> Vec<provider::ProviderSpec> {
         let mut specs = self.minerva_providers.read().clone();
-        specs.extend(provider::load(self.paths.custom_agents_dir.as_deref(), self.env_secrets()));
+        let configured: HashSet<_> = specs.iter().map(|spec| spec.id.clone()).collect();
+        specs.extend(
+            provider::load(self.paths.custom_agents_dir.as_deref(), self.env_secrets())
+                .into_iter()
+                .filter(|spec| !configured.contains(&spec.id)),
+        );
         specs
     }
 
@@ -564,7 +571,7 @@ impl AgentManager {
                 let mut spec = template.clone();
                 spec.id = connection.id;
                 spec.name = connection.name;
-                spec.args = vec![connection.model_prefix];
+                spec.args = if connection.model_prefix.is_empty() { Vec::new() } else { vec![connection.model_prefix] };
                 spec
             })
             .collect();
@@ -686,7 +693,7 @@ impl AgentManager {
             self.tasks.read().values().map(|t| t.state.lock().task.provider.clone()).collect();
         let list = specs
             .iter()
-            .filter(|p| p.id != "minerva" && (!provider::is_unlisted(p) || in_use.contains(&p.id)))
+            .filter(|p| !provider::is_unlisted(p) || in_use.contains(&p.id))
             .map(|p| {
                 let mut info = provider::describe(p);
                 let catalog = self.shared.paths.catalogs.cached(&self.shared, &p.id);
@@ -2362,14 +2369,15 @@ impl Task {
     fn set_background_tasks(&self, tasks: Vec<Value>) -> bool {
         let (emptied, shown) = {
             let mut state = self.state.lock();
-            if state.background_tasks == tasks {
+            let active: Vec<_> = tasks.iter().filter(|task| background::is_active(task)).cloned().collect();
+            let background = shown_background(&tasks, &state.task.background);
+            if state.background_tasks == active && *state.task.background == background {
                 return false;
             }
-            let emptied = !state.background_tasks.is_empty() && tasks.is_empty();
-            let background = shown_background(&tasks, &state.task.background);
+            let emptied = !state.background_tasks.is_empty() && active.is_empty();
             let shown = background != *state.task.background;
             *state.task.background = background;
-            state.background_tasks = tasks;
+            state.background_tasks = active;
             if emptied {
                 // Void a release scheduled while the tasks still ran: it would stop the
                 // agent sooner than the usual delay after this one.
@@ -2761,7 +2769,7 @@ impl Task {
             if let Some(live) = live {
                 tracing::debug!("agent task {}: idle, stopping the agent until the next message", task.id);
                 live.peer.kill();
-                task.clear_shown_background();
+                task.clear_active_background();
             }
         });
     }
@@ -4099,20 +4107,6 @@ fn with_details(message: String, data: Option<&Value>) -> String {
 
 pub(crate) fn client_info() -> Value {
     json!({ "name": "OpenIDEA", "version": env!("CARGO_PKG_VERSION") })
-}
-
-/// What the agent said it can do, and whether it takes embedded files.
-fn shown_background(tasks: &[Value], known: &[AgentBackgroundTask]) -> Vec<AgentBackgroundTask> {
-    let now = now_ms();
-    tasks
-        .iter()
-        .filter_map(|task| {
-            let id = task.get("task_id")?.as_str()?.to_owned();
-            let started_ms = known.iter().find(|seen| seen.id == id).map_or(now, |seen| seen.started_ms);
-            let text = |key: &str| task.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
-            Some(AgentBackgroundTask { id, kind: text("task_type"), description: text("description"), started_ms })
-        })
-        .collect()
 }
 
 /// The method that adds a message to the running turn: OpenIDEA's own, or the

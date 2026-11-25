@@ -20,12 +20,69 @@ const config = (values: AgentConfigOption["values"], category = "model"): AgentC
 const value = (id: string, name = id, description: string | null = null) => ({ value: id, name, description });
 
 describe("configPickerOptions", () => {
-  it("keeps internal engine namespaces out of the model menu headings", () => {
+  it("keeps plugin engine namespaces hidden and groups API routes by provider", () => {
     const options = configPickerOptions(
       config([value("plugin:minerva-home/model", "Home model"), value("api:custom/model", "API model")]),
     );
-    expect(options.filter((option) => option.section)).toEqual([]);
-    expect(options.map((option) => option.label)).toEqual(["Home model", "API model"]);
+    expect(options.filter((option) => option.section)).toEqual([
+      { value: "api:custom", label: "custom", section: true },
+    ]);
+    expect(options.map((option) => option.label)).toEqual(["Home model", "custom", "API model"]);
+  });
+  it("sorts Minerva provider headings by name and preserves configured model order", () => {
+    const models = config([
+      value("api:opencode-go/haiku", "Haiku", "OpenCode Go"),
+      value("api:openai-codex/gpt-6.2-astra", "gpt-6.2-astra", "Codex subscription"),
+      value("api:opencode-go/deepseek", "DeepSeek", "OpenCode Go"),
+      value("api:openai-codex/gpt-6.1-terra", "Terra", "Codex subscription"),
+    ]);
+    const options = configPickerOptions(models, [], false);
+    expect(options.map((option) => option.label)).toEqual([
+      "Codex",
+      "gpt-6.2-astra",
+      "Terra",
+      "OpenCode Go",
+      "Haiku",
+      "DeepSeek",
+    ]);
+    expect(options.filter((option) => !option.section).every((option) => option.detail === undefined)).toBe(true);
+    expect(options.find((option) => option.value === "api:openai-codex/gpt-6.2-astra")).toMatchObject({
+      detail: undefined,
+      keywords: "Codex openai-codex gpt-6.2-astra",
+    });
+    expect(options.filter((option) => !option.section).map((option) => option.value)).toEqual([
+      "api:openai-codex/gpt-6.2-astra",
+      "api:openai-codex/gpt-6.1-terra",
+      "api:opencode-go/haiku",
+      "api:opencode-go/deepseek",
+    ]);
+  });
+  it("keeps pinned API models within their provider group", () => {
+    const options = configPickerOptions(
+      config([
+        value("api:home/one", "One", "Home"),
+        value("api:work/other", "Other", "Work"),
+        value("api:home/two", "Two", "Home"),
+      ]),
+      ["api:home/two"],
+    );
+    expect(options.map((option) => option.value)).toEqual([
+      "api:home",
+      "api:home/two",
+      "api:home/one",
+      "api:work",
+      "api:work/other",
+    ]);
+  });
+  it("keeps identically named providers and model IDs as distinct routes", () => {
+    const options = configPickerOptions(
+      config([value("api:home/shared", "Shared", "Gateway"), value("api:work/shared", "Shared", "Gateway")]),
+    );
+    expect(options.filter((option) => option.section).map((option) => option.value)).toEqual(["api:home", "api:work"]);
+    expect(options.filter((option) => !option.section).map((option) => option.value)).toEqual([
+      "api:home/shared",
+      "api:work/shared",
+    ]);
   });
   it("groups nested paths by their first provider and preserves the full value and description", () => {
     expect(configPickerOptions(config([value("9router/cmc/Beam", "Beam display", "Fast")]))).toEqual([
@@ -73,7 +130,7 @@ describe("configPickerOptions", () => {
       ["b", true],
       ["b/Two", false],
     ]);
-    expect(options[3]?.detail).toBe("One");
+    expect(options[3]?.detail).toBeUndefined();
   });
   it("leaves non-model option labels and descriptions intact", () => {
     expect(configPickerOptions(config([value("a/One", "Custom", "Description")], "mode"))).toEqual([

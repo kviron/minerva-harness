@@ -3,6 +3,7 @@
   flex-direction: column;
   gap: var(--space-3);
 }
+.body h2,
 .body h3,
 .body p {
   margin: 0;
@@ -68,25 +69,6 @@
   color: var(--fg-secondary);
 }
 
-.providers {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-.providerCard {
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-small);
-}
-.providerCard > form {
-  padding: var(--space-3);
-  border-top: 1px solid var(--border-strong);
-}
-.providerRow {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-}
 .providerName {
   flex: 1;
   min-width: 0;
@@ -94,11 +76,75 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.modelCount,
-.providerRow > button {
-  flex: none;
+.split {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-small);
+  overflow: hidden;
+}
+.master {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 220px;
+  min-width: 150px;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+.search {
+  margin: var(--space-2);
+}
+.connectionList {
+  flex: 1;
+  min-height: 0;
+  padding: 0 var(--space-1);
+}
+.connectionRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.listActions {
+  padding: var(--space-2);
+}
+.details {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+}
+.detailHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+.detailHeading h3 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.addProvider {
-  align-self: stretch;
+.detailBody {
+  padding: var(--space-3);
+}
+@media (max-width: 800px) {
+  .master {
+    flex-basis: 170px;
+    min-width: 125px;
+  }
+  .field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .listActions button {
+    white-space: normal;
+  }
+}
+
+.dialogBody {
+  padding: var(--space-3);
 }

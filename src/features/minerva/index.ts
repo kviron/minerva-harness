@@ -5,10 +5,10 @@ export function activateSettingsPages() {
   return registerSettingsPages([
     {
       id: "agents.minerva",
-      title: "Model Providers",
+      title: "Minerva",
       group: "Agents",
       order: 480,
-      keywords: ["api", "models", "minerva"],
+      keywords: ["api", "models", "providers", "minerva", "codex"],
       component: lazyComponent(() => import("./Settings").then((m) => m.MinervaSettings)),
     },
   ]);

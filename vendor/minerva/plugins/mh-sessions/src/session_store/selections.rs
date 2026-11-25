@@ -37,23 +37,6 @@ fn write(
     if !exists {
         return Err("Session not found".into());
     }
-    let active: Option<String> = tx
-        .query_row("SELECT request_json FROM runs WHERE session_id=?1 AND status='running' LIMIT 1", [session], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if let Some(active) = active {
-        let active: Value = serde_json::from_str(&active).map_err(|e| e.to_string())?;
-        if active["options"]["liveSelection"] == true {
-            let initial =
-                active["model"].as_str().and_then(|model| model.split_once('/')).map(|(provider, _)| provider);
-            let selected = model.split_once('/').map(|(provider, _)| provider);
-            if initial.is_none() || initial != selected {
-                return Err("Wait until the active turn finishes before changing providers".into());
-            }
-        }
-    }
     let old = latest(tx, session)?;
     if only_if_absent {
         if let Some(old) = old {
@@ -150,14 +133,17 @@ impl SessionStore {
             .map_err(|e| e.to_string())?;
         let request: Value =
             serde_json::from_str(&request.ok_or("Run is no longer active")?).map_err(|e| e.to_string())?;
-        let initial_provider =
-            request["model"].as_str().and_then(|model| model.split_once('/')).map(|(provider, _)| provider);
-        let selected_provider = dispatch.selection.model.split_once('/').map(|(provider, _)| provider);
+        let api_route = |model: &str| {
+            model
+                .strip_prefix("api:")
+                .and_then(|route| route.split_once('/'))
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+        };
         if request["options"]["liveSelection"] != true
-            || initial_provider.is_none_or(|provider| !provider.starts_with("api:") || provider.len() <= 4)
-            || selected_provider != initial_provider
+            || !request["model"].as_str().is_some_and(api_route)
+            || !api_route(&dispatch.selection.model)
         {
-            return Err("Live selection is not admitted for this run and provider".into());
+            return Err("Live selection is not admitted for this run and route".into());
         }
         let selection: Option<(String, Option<String>)> = tx
             .query_row(

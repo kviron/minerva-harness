@@ -15,7 +15,9 @@ pub mod lsp {
 }
 pub mod tools {
     pub use mh_tool_runtime::*;
-    pub use mh_workspace_tools::{register_native, save_attachment};
+    pub use mh_workspace_tools::{
+        register_native, register_native_with_jobs, save_attachment, JobOutput, JobSnapshot, JobStatus, ShellJobs,
+    };
 }
 pub struct AgentLoopMarker;
 impl cordis::Service for AgentLoopMarker {

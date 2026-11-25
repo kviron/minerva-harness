@@ -3,6 +3,7 @@
 use super::*;
 use tokio::io::duplex;
 
+mod background_jobs;
 mod minerva_routes;
 
 #[test]
