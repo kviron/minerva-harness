@@ -15,6 +15,7 @@ ide-jsonrpc.workspace = true
 ide-vcs.workspace = true
 ide-tools = { path = "../ide-tools" }
 ide-minerva.workspace = true
+minerva-plugin-sdk = { path = "../../vendor/minerva/crates/plugin-sdk" }
 serde.workspace = true
 serde_json.workspace = true
 specta.workspace = true
@@ -23,6 +24,7 @@ toml.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 dunce.workspace = true
+dirs.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
 which = "8"

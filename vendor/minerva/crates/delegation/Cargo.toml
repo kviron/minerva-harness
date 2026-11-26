@@ -1,0 +1,9 @@
+[package]
+name = "minerva-delegation"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minerva-plugin-sdk = { path = "../plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }

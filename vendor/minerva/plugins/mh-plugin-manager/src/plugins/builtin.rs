@@ -153,6 +153,8 @@ mod tests {
         assert!(!without_workspace.iter().any(|t| t.name == "save_attachment"));
         let reference = context.put_attachment("s", "data.bin", "application/octet-stream", "AP+A").unwrap();
         let mut call = crate::tools::ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "s".into(),
             run_id: "r".into(),
             call_id: "c".into(),

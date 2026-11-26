@@ -182,6 +182,23 @@ impl WorkspaceService {
         }
         Ok(projects)
     }
+
+    pub fn session_workspace(&self, session: &str) -> Result<Option<String>, String> {
+        self.live()?;
+        self.sessions.get(session)?;
+        self.context
+            .db()?
+            .query_row(
+                "SELECT project FROM project_sessions
+                 WHERE session=?1 AND project IN (SELECT id FROM projects)
+                 AND project NOT IN (SELECT id FROM hidden_projects)",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn create(&self, path: &str) -> Result<WorkspaceInfo, String> {
         self.live()?;
         if !self.local {
@@ -355,12 +372,14 @@ mod tests {
         let registry = WorkspaceService::open(context.clone(), sessions.clone(), &root, true).unwrap();
         let project = registry.create(dir.path().to_str().unwrap()).unwrap();
         registry.create_session("kept", &project.id).unwrap();
+        assert_eq!(registry.session_workspace("kept").unwrap().as_deref(), Some(project.id.as_str()));
         assert!(registry.rename(&project.id, " \n").is_err());
         assert!(registry.rename("unknown", "Title").is_err());
         registry.rename(&project.id, " Renamed ").unwrap();
         registry.rename("default", "Inbox").unwrap();
         assert!(registry.remove("default").is_err());
         registry.remove(&project.id).unwrap();
+        assert_eq!(registry.session_workspace("kept").unwrap(), None);
         assert_eq!(registry.list().unwrap().len(), 1);
         assert!(sessions.get("kept").is_ok());
         assert_eq!(context.workspace_get("kept").unwrap().cwd, project.path);
@@ -371,6 +390,7 @@ mod tests {
         assert_eq!(restored.id, project.id);
         assert_eq!(restored.title, "Renamed");
         assert_eq!(restored.session_ids, ["kept"]);
+        assert_eq!(registry.session_workspace("kept").unwrap().as_deref(), Some(project.id.as_str()));
         assert!(dir.path().is_dir());
     }
     #[test]

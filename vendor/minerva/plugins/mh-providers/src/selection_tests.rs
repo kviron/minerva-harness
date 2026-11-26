@@ -4,6 +4,7 @@ use crate::{
     selection::SelectionFuture,
     tools::{Cancellation, InteractionBroker, PermissionPolicy, ToolContext, ToolDefinition, ToolRegistry},
 };
+use mh_sessions::delegation::PreferredFollowup;
 use mh_sessions::{DispatchAdmission, RouteDispatch, RouteSelection};
 use serde_json::{json, Value};
 use std::{
@@ -16,6 +17,38 @@ struct Control {
     requested: StdMutex<RouteSelection>,
     dispatched: StdMutex<Vec<RouteDispatch>>,
     duplicate: bool,
+}
+
+#[derive(Default)]
+struct Steering {
+    state: StdMutex<u8>,
+    fail_response: bool,
+    checkpoints: StdMutex<Vec<transcript::Transcript>>,
+}
+
+impl FollowupControl for Steering {
+    fn preferred(&self) -> Result<Option<PreferredFollowup>, String> {
+        Ok((*self.state.lock().unwrap() == 1).then(|| PreferredFollowup {
+            work_item_id: "followup".into(),
+            prompt: "STEERING: inspect the alternate config".into(),
+        }))
+    }
+
+    fn claim(&self, work_item_id: &str) -> Result<bool, String> {
+        assert_eq!(work_item_id, "followup");
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(*state, 1);
+        *state = 2;
+        Ok(true)
+    }
+
+    fn confirm(&self, work_item_id: &str) -> Result<bool, String> {
+        assert_eq!(work_item_id, "followup");
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(*state, 2);
+        *state = 3;
+        Ok(true)
+    }
 }
 impl SelectionControl for Control {
     fn selection(&self) -> SelectionFuture<'_, RouteSelection> {
@@ -33,7 +66,7 @@ impl SelectionControl for Control {
         })
     }
 }
-fn server() -> (String, std::thread::JoinHandle<Vec<Value>>) {
+fn server(fail_second_response: bool) -> (String, std::thread::JoinHandle<Vec<Value>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -77,6 +110,11 @@ fn server() -> (String, std::thread::JoinHandle<Vec<Value>>) {
                 bytes.extend_from_slice(&buf[..n]);
             }
             captured.push(serde_json::from_slice(&bytes[end..end + length]).unwrap());
+            if fail_second_response && captured.len() == 2 {
+                let body = r#"{"error":{"message":"fixture rejection","type":"invalid_request_error"}}"#;
+                write!(socket, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                break;
+            }
             let (delta, finish) = if captured.len() == 1 {
                 (
                     json!({"role":"assistant","tool_calls":[{"index":0,"id":"once","type":"function","function":{"name":"inspect","arguments":"{}"}}]}),
@@ -98,8 +136,9 @@ fn server() -> (String, std::thread::JoinHandle<Vec<Value>>) {
 async fn exercise(
     revoke: bool,
     duplicate: bool,
+    steering: Option<Arc<Steering>>,
 ) -> (Result<transcript::Transcript, String>, Vec<Value>, Arc<Control>, usize) {
-    let (url, worker) = server();
+    let (url, worker) = server(steering.as_ref().is_some_and(|fixture| fixture.fail_response));
     let dir = tempfile::tempdir().unwrap();
     let id = format!(
         "fixture-{}",
@@ -142,6 +181,7 @@ async fn exercise(
     let tool_source = service.clone();
     let tool_id = id.clone();
     let tool_calls = calls.clone();
+    let tool_steering = steering.clone();
     tools
         .register(
             "fixture",
@@ -157,8 +197,12 @@ async fn exercise(
                 let source = tool_source.clone();
                 let id = tool_id.clone();
                 let calls = tool_calls.clone();
+                let steering = tool_steering.clone();
                 Box::pin(async move {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(steering) = steering {
+                        *steering.state.lock().unwrap() = 1;
+                    }
                     *control.requested.lock().unwrap() =
                         RouteSelection { revision: 2, model: format!("api:{id}/b"), reasoning_effort: None };
                     *control.requested.lock().unwrap() =
@@ -178,6 +222,8 @@ async fn exercise(
         run_id: "run".into(),
         tools: tools.snapshot(),
         tool_context: ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "session".into(),
             run_id: "run".into(),
             call_id: String::new(),
@@ -191,14 +237,21 @@ async fn exercise(
         context,
         messages: Vec::new(),
         reasoning_effort: None,
-        selection: Some(control.clone()),
+        selection: steering.is_none().then(|| control.clone() as Arc<dyn SelectionControl>),
+        followups: steering.clone().map(|steering| steering as Arc<dyn FollowupControl>),
     };
-    let result = service.chat_agent(&id, "a", vec![Turn::plain("user", "inspect")], Arc::new(|_| Ok(())), run).await;
+    let sink = Arc::new(move |snapshot: &transcript::Transcript| {
+        if let Some(steering) = &steering {
+            steering.checkpoints.lock().unwrap().push(snapshot.clone());
+        }
+        Ok(())
+    });
+    let result = service.chat_agent(&id, "a", vec![Turn::plain("user", "inspect")], sink, run).await;
     (result, worker.join().unwrap(), control, calls.load(std::sync::atomic::Ordering::SeqCst))
 }
 #[tokio::test]
 async fn provider_entry_switches_latest_model_after_tool_without_replaying_it() {
-    let (result, requests, control, calls) = exercise(false, false).await;
+    let (result, requests, control, calls) = exercise(false, false, None).await;
     assert!(result.is_ok(), "{result:?}");
     let transcript = result.unwrap();
     assert_eq!(transcript.parts.iter().filter(|part| part.data["source"] == "model-selection").count(), 1);
@@ -219,8 +272,42 @@ async fn provider_entry_switches_latest_model_after_tool_without_replaying_it() 
     assert_eq!(issued[1].selection.revision, 3);
 }
 #[tokio::test]
+async fn fixed_provider_delivers_and_persists_the_preferred_followup_in_the_same_run() {
+    let steering = Arc::new(Steering::default());
+    let (result, requests, _, calls) = exercise(false, false, Some(steering.clone())).await;
+    let transcript = result.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], "a");
+    assert_eq!(requests[1]["model"], "a");
+    assert!(!requests[0].to_string().contains("STEERING:"));
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let tool = messages.iter().position(|message| message["role"] == "tool").unwrap();
+    let followup = messages.iter().position(|message| message.to_string().contains("STEERING:")).unwrap();
+    assert!(tool < followup);
+    assert_eq!(requests[1].to_string().matches("STEERING:").count(), 1);
+    assert_eq!(transcript.replay["rig-v1"].to_string().matches("STEERING:").count(), 1);
+    assert_eq!(*steering.state.lock().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn rejected_model_request_keeps_the_followup_checkpoint_without_confirming_delivery() {
+    let steering = Arc::new(Steering { fail_response: true, ..Steering::default() });
+    let (result, requests, _, calls) = exercise(false, false, Some(steering.clone())).await;
+    assert!(result.is_err());
+    assert_eq!(calls, 1);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].to_string().matches("STEERING:").count(), 1);
+    assert_eq!(*steering.state.lock().unwrap(), 2);
+    let checkpoints = steering.checkpoints.lock().unwrap();
+    let latest = checkpoints.last().unwrap();
+    assert_eq!(latest.parts.iter().filter(|part| part.data["workItemId"] == "followup").count(), 1);
+    assert_eq!(latest.replay["rig-v1"].to_string().matches("STEERING:").count(), 1);
+}
+
+#[tokio::test]
 async fn revoked_provider_stops_next_completion_after_recorded_tool() {
-    let (result, requests, control, calls) = exercise(true, false).await;
+    let (result, requests, control, calls) = exercise(true, false, None).await;
     assert!(result.is_err());
     assert_eq!(calls, 1);
     assert_eq!(requests.len(), 1);
@@ -228,7 +315,7 @@ async fn revoked_provider_stops_next_completion_after_recorded_tool() {
 }
 #[tokio::test]
 async fn duplicate_handler_admission_never_reissues_http() {
-    let (result, requests, _, calls) = exercise(false, true).await;
+    let (result, requests, _, calls) = exercise(false, true, None).await;
     assert!(result.is_err());
     assert!(requests.is_empty());
     assert_eq!(calls, 0);

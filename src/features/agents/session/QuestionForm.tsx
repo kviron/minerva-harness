@@ -215,6 +215,7 @@ function QuestionForm({
   // Paging with the buttons lands the keyboard focus on the question itself.
   const focusPanel = useRef(false);
   const multiple = answers.length > 1;
+  const delegated = entry.type === "question" && entry.id.startsWith("minerva-delegation-question:");
   const complete = answers.every(isAnswered);
   const questionId = (part: string, index: number) => `${questionPrefix}-${part}-${index}`;
   useEffect(() => {
@@ -269,7 +270,8 @@ function QuestionForm({
     if (!answer) return;
     const option = answer.question.options[number - 1];
     if (option) choose(answer, option.label, !answer.picked.includes(option.label));
-    else if (number === answer.question.options.length + 1) chooseOther(answer, answer.other === null);
+    else if ((!delegated || !answer.question.options.length) && number === answer.question.options.length + 1)
+      chooseOther(answer, answer.other === null);
   };
   const goTo = (next: number, moveFocus = false) => {
     if (next < 0 || next >= answers.length) return;
@@ -287,7 +289,7 @@ function QuestionForm({
       }}
       onKeyDown={(event) => {
         const typing = event.target instanceof HTMLInputElement && event.target.type === "text";
-        if (event.key === "Escape") send("reject");
+        if (event.key === "Escape" && !delegated) send("reject");
         else if (!typing && !event.ctrlKey && !event.metaKey && !event.altKey && /^[1-9]$/.test(event.key)) {
           event.preventDefault();
           chooseByNumber(Number(event.key));
@@ -347,16 +349,20 @@ function QuestionForm({
                 </span>
               ),
             })),
-            {
-              key: group,
-              checked: item.other !== null,
-              onChange: (checked: boolean) => chooseOther(item, checked),
-              label: (
-                <span className={styles.questionLabel}>
-                  <T>Other</T>
-                </span>
-              ),
-            },
+            ...(!delegated || !item.question.options.length
+              ? [
+                  {
+                    key: group,
+                    checked: item.other !== null,
+                    onChange: (checked: boolean) => chooseOther(item, checked),
+                    label: (
+                      <span className={styles.questionLabel}>
+                        <T>Other</T>
+                      </span>
+                    ),
+                  },
+                ]
+              : []),
           ];
           return (
             <div
@@ -462,9 +468,11 @@ function QuestionForm({
             {error}
           </span>
         )}
-        <Button variant="ghost" disabled={busy} onClick={() => send("reject")}>
-          Skip
-        </Button>
+        {!delegated && (
+          <Button variant="ghost" disabled={busy} onClick={() => send("reject")}>
+            Skip
+          </Button>
+        )}
         {multiple && (
           <div className={styles.questionPager}>
             <Button size="small" disabled={busy || position === 0} onClick={() => goTo(position - 1, true)}>

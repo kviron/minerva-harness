@@ -1,7 +1,8 @@
 //! Integration gate for using Rig's existing route selection inside one run.
 use super::*;
 use rig_agent::agent::hook::{
-    AgentHook, DispatchAction, DispatchEvent, HookContext, ModelSelection, ModelSelectionAction,
+    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, ModelSelection, ModelSelectionAction,
+    RequestPatch,
 };
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -16,18 +17,13 @@ impl AgentHook for PendingSelection {
             ModelSelectionAction::continue_run()
         }
     }
-    async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+    async fn on_completion_call(&self, _: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
         if self.0.load(Ordering::Acquire) {
-            if let rig_core::effect::EffectKind::Completion { request, stream } = event.kind {
-                let mut request = (**request).clone();
-                request.chat_history.push(Arc::new(rig_core::message::Message::user("STEERING: inspect only parser")));
-                return DispatchAction::patch(rig_core::effect::EffectKind::Completion {
-                    request: Arc::new(request),
-                    stream: *stream,
-                });
-            }
+            let mut history = event.history.to_vec();
+            history.push(Arc::new(rig_core::message::Message::user("STEERING: inspect only parser")));
+            return CompletionCallAction::patch(RequestPatch::new().history(history));
         }
-        DispatchAction::proceed()
+        CompletionCallAction::continue_run()
     }
 }
 
@@ -125,6 +121,9 @@ async fn switches_registered_route_and_delivers_steering_after_tool_once() {
     let messages = replacement["messages"].as_array().unwrap();
     assert_eq!(messages.iter().filter(|message| message["role"] == "tool").count(), 1);
     assert_eq!(messages.iter().filter(|message| message.to_string().contains("STEERING:")).count(), 1);
+    let result = messages.iter().position(|message| message["role"] == "tool").unwrap();
+    let steering = messages.iter().position(|message| message.to_string().contains("STEERING:")).unwrap();
+    assert!(result < steering, "tool results must precede the next instruction: {messages:?}");
     assert!(replacement.to_string().contains("TOOL_RESULT"));
     assert!(!initial.to_string().contains("STEERING:"));
 }

@@ -25,17 +25,22 @@ import {
   TASK_DRAG,
   age,
   branchLabel,
+  entriesKey,
   groupStatus,
   groupTasks,
   providerIcon,
   sessionKey,
+  subagentTaskTitle,
+  type SubagentEntry,
   type TaskGroup,
 } from "./model";
 import { groupMembers, pinnedMembers, ungroupedMembers, type OrganizeGroup } from "./organize";
 import {
   externalKey,
   importExternalSession,
+  loadEntries,
   moveTasksToGroup,
+  openHistorySubagent,
   openHome,
   pinTasks,
   refreshExternalSessions,
@@ -50,6 +55,8 @@ import styles from "./Agents.module.css";
 import { basename, useProject } from "@/platform/project";
 import { useTx } from "@/platform/i18n";
 import { executeAction } from "@/platform/actions";
+import { agentProviderId } from "./providerOptions";
+import { SubagentStatusIcon } from "./session/toolEntries";
 
 export function AgentsHeaderActions() {
   return (
@@ -69,7 +76,8 @@ type Node =
   | { kind: "pinned"; tasks: AgentTask[] }
   | { kind: "custom"; group: OrganizeGroup; tasks: AgentTask[] }
   | { kind: "group"; group: TaskGroup }
-  | { kind: "task"; task: AgentTask };
+  | { kind: "task"; task: AgentTask }
+  | { kind: "subagent"; task: AgentTask; path: string[]; card: SubagentEntry };
 
 function nodeKey(n: Node): string {
   switch (n.kind) {
@@ -81,6 +89,8 @@ function nodeKey(n: Node): string {
       return `g:${n.group.status}`;
     case "task":
       return n.task.id;
+    case "subagent":
+      return entriesKey(n.task.id, n.card.id);
   }
 }
 
@@ -168,6 +178,7 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
   const loaded = useAgents((s) => s.loaded);
   const error = useAgents((s) => s.error);
   const tasks = useAgents((s) => s.tasks);
+  const historyEntries = useAgents((s) => (historyOnly ? s.entries : null));
   const unread = useAgents((s) => s.unread);
   const providers = useAgents((s) => s.providers);
   const docked = useAgents((s) => s.docked);
@@ -175,6 +186,7 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
   const inline = !historyOnly && (docked !== null || homeOpen);
   const historyRef = useRef<HTMLButtonElement>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [headerTools, setHeaderTools] = useState<HTMLDivElement | null>(null);
   const external = useAgents((s) => s.external);
   const externalError = useAgents((s) => s.externalError);
   const importing = useAgents((s) => s.importing);
@@ -183,6 +195,7 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
     if (historyOpen) void refreshExternalSessions();
   }, [historyOpen]);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(["g:archived"]));
+  const [expandedChats, setExpandedChats] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<Set<string>>(() => {
     const task = sessionTask(maybeEditorService()?.activeInput?.());
     return new Set(task ? [task] : []);
@@ -195,11 +208,17 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
     const sync = () => {
       const state = useAgents.getState();
       const task = state.homeOpen ? null : state.lastTask;
-      setSelected(new Set(task ? [task] : []));
+      const child = state.historySubagent?.task === task ? state.historySubagent.path.at(-1) : null;
+      setSelected(new Set(task ? [entriesKey(task, child ?? null)] : []));
     };
     sync();
     return useAgents.subscribe((state, previous) => {
-      if (state.lastTask !== previous.lastTask || state.homeOpen !== previous.homeOpen) sync();
+      if (
+        state.lastTask !== previous.lastTask ||
+        state.homeOpen !== previous.homeOpen ||
+        state.historySubagent !== previous.historySubagent
+      )
+        sync();
     });
   }, [historyOnly]);
   // Follow the active session tab.
@@ -242,8 +261,8 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
     ];
   }, [tasks, organize, matches]);
   const expanded = useMemo(
-    () => new Set(roots.map(nodeKey).filter((k) => matches || !collapsed.has(k))),
-    [roots, collapsed, matches],
+    () => new Set([...roots.map(nodeKey).filter((k) => matches || !collapsed.has(k)), ...expandedChats]),
+    [roots, collapsed, matches, expandedChats],
   );
   // Dropping a session editor tab anywhere on the tool window docks it.
   const viewRef = useRef<HTMLDivElement>(null);
@@ -314,36 +333,73 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
         roots={roots}
         getKey={nodeKey}
         getLabel={(n) =>
-          n.kind === "task"
-            ? n.task.title
-            : n.kind === "pinned"
-              ? "Pinned"
-              : n.kind === "custom"
-                ? n.group.name
-                : n.group.label
+          n.kind === "subagent"
+            ? subagentTaskTitle(n.card)
+            : n.kind === "task"
+              ? n.task.title
+              : n.kind === "pinned"
+                ? "Pinned"
+                : n.kind === "custom"
+                  ? n.group.name
+                  : n.group.label
         }
         getChildren={(n) =>
-          n.kind === "task"
-            ? undefined
+          n.kind === "task" || n.kind === "subagent"
+            ? historyEntries?.get(nodeKey(n))?.flatMap((entry): Node[] =>
+                entry.type === "subagent"
+                  ? [
+                      {
+                        kind: "subagent",
+                        task: n.task,
+                        card: entry,
+                        path: [...(n.kind === "subagent" ? n.path : []), entry.id],
+                      },
+                    ]
+                  : [],
+              )
             : (n.kind === "group" ? n.group.tasks : n.tasks).map((task) => ({ kind: "task", task }) as Node)
         }
-        isExpandable={(n) => n.kind !== "task"}
+        isExpandable={(n) => {
+          if (n.kind !== "task" && n.kind !== "subagent") return true;
+          if (!historyOnly || agentProviderId(n.task.provider) !== "minerva") return false;
+          const entries = historyEntries?.get(nodeKey(n));
+          return entries
+            ? entries.some((entry) => entry.type === "subagent")
+            : n.kind === "task" || n.card.title?.startsWith("api:") === true;
+        }}
         expanded={expanded}
-        onExpandedChange={(_next, node, open) =>
+        onExpandedChange={(_next, node, open) => {
+          if (node.kind === "task" || node.kind === "subagent") {
+            const key = nodeKey(node);
+            setExpandedChats((current) => {
+              const next = new Set(current);
+              if (open) next.add(key);
+              else next.delete(key);
+              return next;
+            });
+            if (open && !historyEntries?.has(key))
+              void loadEntries(node.task.id, node.kind === "subagent" ? node.card.id : null);
+            return;
+          }
           setCollapsed((c) => {
             const s = new Set(c);
             if (open) s.delete(nodeKey(node));
             else s.add(nodeKey(node));
             return s;
-          })
-        }
+          });
+        }}
         selected={selected}
         onSelectionChange={(sel, lead, reason) => {
           setSelected(sel);
           if (reason !== "contextMenu" && !inline && sel.size === 1 && lead?.kind === "task" && sel.has(lead.task.id))
             showTask(lead.task.id);
+          if (reason !== "contextMenu" && sel.size === 1 && lead?.kind === "subagent" && sel.has(nodeKey(lead)))
+            openHistorySubagent(lead.task.id, lead.path);
         }}
-        onActivate={(n) => n.kind === "task" && showTask(n.task.id)}
+        onActivate={(n) => {
+          if (n.kind === "task") showTask(n.task.id);
+          if (n.kind === "subagent") openHistorySubagent(n.task.id, n.path);
+        }}
         onContextMenu={(n, sel, e) => {
           if (!n) return;
           if (n.kind === "custom") {
@@ -359,6 +415,15 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
         }}
         renderNode={(n) => {
           switch (n.kind) {
+            case "subagent": {
+              const title = subagentTaskTitle(n.card);
+              return (
+                <span className={styles.row} title={title}>
+                  <SubagentStatusIcon status={n.card.status} />
+                  <span className={styles.title}>{title}</span>
+                </span>
+              );
+            }
             case "pinned":
               return (
                 <GroupRow
@@ -443,7 +508,7 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
       <div className={styles.content}>
         {inline && (
           <div className={styles.docked}>
-            <div className={styles.dockedBar}>
+            <header className={styles.dockedBar}>
               <IconButton
                 ref={historyRef}
                 icon="history"
@@ -462,7 +527,8 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
               >
                 {homeOpen ? <T>New Agent Task</T> : dockedTitle}
               </span>
-            </div>
+              {!homeOpen && docked && <div className={styles.dockedTools} ref={setHeaderTools} />}
+            </header>
             <div className={styles.dockedSession}>
               {homeOpen ? (
                 <HomeEditor docked />
@@ -470,6 +536,7 @@ export function AgentsView({ historyOnly = false }: { historyOnly?: boolean; id?
                 docked && (
                   <SessionEditor
                     docked
+                    headerTools={headerTools}
                     input={{
                       kind: SESSION_KIND,
                       key: sessionKey(docked),

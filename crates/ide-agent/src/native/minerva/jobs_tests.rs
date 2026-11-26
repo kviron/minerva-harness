@@ -13,6 +13,15 @@ async fn until(mut condition: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_handoff_continues_the_model_turn_and_uses_the_native_background_controls() {
+    check_shell_handoff(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_model_turn_reports_the_background_job_for_cleanup() {
+    check_shell_handoff(true).await;
+}
+
+async fn check_shell_handoff(fail_turn: bool) {
     let dir = tempfile::tempdir().unwrap();
     let service = Arc::new(Service::new(dir.path().join("data"), dir.path().join("config")));
     let runtime = service.runtime().await.unwrap();
@@ -48,7 +57,12 @@ async fn shell_handoff_continues_the_model_turn_and_uses_the_native_background_c
             assert!(request["messages"].as_array().unwrap().iter().any(|message| {
                 message["role"] == "tool" && message["content"].as_str().is_some_and(|text| text.contains("jobId"))
             }), "the next model call must receive the job handle, not wait for the server to exit");
-            response(&mut socket,json!({"role":"assistant","content":"The dev server is running in the background."}),"stop").await;
+            if fail_turn {
+                use tokio::io::AsyncWriteExt;
+                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            } else {
+                response(&mut socket,json!({"role":"assistant","content":"The dev server is running in the background."}),"stop").await;
+            }
         }).await.unwrap();
     });
     struct Client(Arc<Mutex<Vec<Value>>>);
@@ -86,7 +100,15 @@ async fn shell_handoff_continues_the_model_turn_and_uses_the_native_background_c
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(answer["stopReason"], "end_turn");
+    if fail_turn {
+        assert!(answer.pointer("/_meta/openidea/turnError").and_then(Value::as_str).is_some());
+        assert!(answer.get("stopReason").is_none());
+    } else {
+        assert_eq!(answer["stopReason"], "end_turn");
+    }
+    let turn_jobs = answer.pointer("/_meta/openidea/backgroundTasks").unwrap().as_array().unwrap();
+    assert!(turn_jobs.iter().any(crate::background::is_active));
+    assert!(answer.pointer("/_meta/openidea/backgroundRevision").unwrap().as_u64().is_some());
     server.await.unwrap();
     let jobs = runtime.plugins.jobs().unwrap();
     until(|| jobs.list(session).iter().any(|job| job.stdout.contains("background-ready"))).await;
@@ -103,6 +125,15 @@ async fn shell_handoff_continues_the_model_turn_and_uses_the_native_background_c
         })
     })
     .await;
+    assert!(!service.shell_session_is_quiescent(session).await);
+    if fail_turn {
+        peer.kill();
+        until(|| jobs.session_is_quiescent(session)).await;
+        assert!(service.shell_session_is_quiescent(session).await);
+        assert!(jobs.list(session).iter().all(|job| !job.status.is_active()));
+        service.shutdown().await.unwrap();
+        return;
+    }
     let other: Value = peer.request("session/new", json!({}), None).await.unwrap();
     assert!(
         peer.request::<_, Value>("_openidea/stop_task", json!({"sessionId":other["sessionId"],"taskId":job.id}), None)
@@ -113,9 +144,9 @@ async fn shell_handoff_continues_the_model_turn_and_uses_the_native_background_c
         .request("session/set_config_option", json!({"sessionId":session,"configId":"mode","value":"read-only"}), None)
         .await
         .unwrap();
+    until(|| jobs.list(session).iter().all(|job| !job.status.is_active())).await;
     let _: Value =
         peer.request("_openidea/stop_task", json!({"sessionId":session,"taskId":job.id}), None).await.unwrap();
-    until(|| jobs.list(session).iter().all(|job| !job.status.is_active())).await;
     until(|| {
         events.lock().iter().any(|event| {
             event["update"]["tasks"]

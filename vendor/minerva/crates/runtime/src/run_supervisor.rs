@@ -5,13 +5,21 @@ impl Runtime {
     pub async fn start_run(self: &Arc<Self>, request: StartRunRequest) -> Result<RunHandle, String> {
         self.agent_loop.start_run(request).await
     }
-    pub async fn start_native_api_run(self: &Arc<Self>, request: StartRunRequest) -> Result<RunHandle, String> {
-        self.agent_loop.start_native_api_run(request).await
+    pub async fn start_native_api_run(
+        self: &Arc<Self>,
+        request: StartRunRequest,
+        checkout_lease: Option<Arc<dyn CheckoutWriteLease>>,
+    ) -> Result<RunHandle, String> {
+        self.agent_loop.start_native_api_run(request, checkout_lease).await
     }
     pub fn get_run(&self, session: &str, run_id: &str) -> Result<RunSnapshot, String> {
         self.agent_loop.get_run(session, run_id)
     }
     pub fn cancel_run(&self, session: &str, run_id: &str) -> Result<bool, String> {
+        self.agent_loop.cancel_run(session, run_id)
+    }
+    pub fn stop_native_run(&self, session: &str, run_id: &str) -> Result<bool, String> {
+        self.sessions.delegation_user_stop(session).map_err(|error| error.to_string())?;
         self.agent_loop.cancel_run(session, run_id)
     }
     pub async fn run_legacy(

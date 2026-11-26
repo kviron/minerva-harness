@@ -5,6 +5,21 @@ use ide_core::{IdeError, IdeResult};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+pub(crate) const DELEGATED_QUESTION_PREFIX: &str = "minerva-delegation-question:";
+
+pub(crate) fn delegated_answer(answers: &str) -> IdeResult<String> {
+    let answers: BTreeMap<String, Vec<String>> =
+        serde_json::from_str(answers).map_err(|_| IdeError::invalid("invalid question answers"))?;
+    if answers.len() == 1
+        && let Some(values) = answers.get("answer")
+        && let [value] = values.as_slice()
+        && !value.trim().is_empty()
+    {
+        return Ok(value.clone());
+    }
+    Err(IdeError::invalid("answer the delegated question"))
+}
+
 /// The wire reply and its readable record. Question ids, not wording, associate each answer.
 pub(crate) fn reply(questions: &[AgentQuestion], answers: &str) -> IdeResult<(String, String)> {
     let answers: BTreeMap<String, Vec<String>> =

@@ -107,9 +107,7 @@ async fn dispatch(jobs: &ShellJobs, name: &str, ctx: ToolContext, args: Value) -
         return Err("Shell launch cancelled".into());
     }
     let command = string(&args, "command")?;
-    let cwd = ctx.cwd.as_deref().ok_or("Select a workspace directory first")?;
-    let job =
-        jobs.start(&ctx.session_id, cwd, command, args["label"].as_str().unwrap_or(command), &ctx.cancellation)?;
+    let job = jobs.start(&ctx, command, args["label"].as_str().unwrap_or(command))?;
     let mut lease = ForegroundLease { job: job.clone(), armed: true };
     let background = args["run_in_background"].as_bool().unwrap_or(false);
     lease.admit(&ctx.cancellation, background)?;
@@ -157,7 +155,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jobs = ShellJobs::default();
         let command = if cfg!(windows) { "Set-Content -LiteralPath 'unwanted' -Value 'bad'" } else { "touch unwanted" };
-        let job = jobs.start("one", dir.path(), command, "provisional", &Cancellation::default()).unwrap();
+        let ctx = super::super::tests::context("one", dir.path());
+        let job = jobs.start(&ctx, command, "provisional").unwrap();
         let caller = Cancellation::default();
         caller.cancel();
         let mut lease = ForegroundLease { job: job.clone(), armed: true };

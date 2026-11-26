@@ -1,5 +1,6 @@
 //! Version one wire contracts. Native local plugins are trusted executable code.
 pub mod context;
+pub mod delegation;
 pub mod engine;
 pub mod experience;
 pub mod history;

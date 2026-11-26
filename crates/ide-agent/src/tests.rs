@@ -7,6 +7,13 @@ mod background_jobs;
 mod minerva_routes;
 
 #[test]
+fn long_chat_titles_end_with_a_single_ellipsis() {
+    let prefix = "я".repeat(60);
+    assert_eq!(title_of(&text(&prefix)), prefix);
+    assert_eq!(title_of(&text(&format!("{prefix} ещё"))), format!("{prefix}…"));
+}
+
+#[test]
 fn permission_uses_its_own_command_payload() {
     let command = "python3 -c 'import pathlib\npathlib.Path(\"a.txt\").touch()'";
     let mut request = json!({"toolCall": {"toolCallId": "write", "kind": "execute",
@@ -1190,8 +1197,8 @@ async fn a_task_runs_asks_for_permission_and_survives_a_restart() {
             "an agent's usage limits are its provider's"
         );
         let last_entry = events.iter().rev().find_map(|e| match e {
-            AgentEvent::Entry { index, entry, .. } if !matches!(entry, AgentEntry::User { .. }) => {
-                Some((*index, entry.clone()))
+            AgentEvent::Entry { index, entry, .. } if !matches!(entry.as_ref(), AgentEntry::User { .. }) => {
+                Some((*index, entry.as_ref().clone()))
             }
             _ => None,
         });
@@ -1199,7 +1206,8 @@ async fn a_task_runs_asks_for_permission_and_survives_a_restart() {
         // The turn's end is recorded on the message that started it.
         assert!(events.iter().any(|e| matches!(
             e,
-            AgentEvent::Entry { index: 0, entry: AgentEntry::User { sent_ms: Some(_), done_ms: Some(_), .. }, .. }
+            AgentEvent::Entry { index: 0, entry, .. }
+                if matches!(entry.as_ref(), AgentEntry::User { sent_ms: Some(_), done_ms: Some(_), .. })
         )));
     }
     let providers = mgr.providers();
@@ -1476,6 +1484,26 @@ async fn shell_commands_show_in_the_conversation_and_go_with_the_next_message() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_conflicting_checkout_operation_leaves_the_turn_queued_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(FakeAgent::default());
+    let mgr = manager(dir.path(), fake.clone());
+    let writer = workspace_writes::WorkspaceWrite::acquire(vec![dir.path().to_path_buf()]).await.unwrap();
+    let task = mgr
+        .create(NewAgentTask { prompt: text("again"), provider: "claude".into(), ..Default::default() })
+        .await
+        .unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Failed).await;
+    assert!(fake.prompts.lock().is_empty());
+    let queue = mgr.task(&task.id).unwrap().state.lock().task.queue.clone();
+    assert_eq!(queue.len(), 1);
+    drop(writer);
+    mgr.send_queued_now(&task.id, &queue[0].id).await.unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Ready).await;
+    assert_eq!(fake.prompts.lock().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_idle_task_starts_no_turn_until_its_first_message() {
     let tmp = tempfile::tempdir().unwrap();
     let agent = Arc::new(FakeAgent::default());
@@ -1492,6 +1520,10 @@ async fn an_idle_task_starts_no_turn_until_its_first_message() {
         .unwrap();
     assert_eq!((task.status, task.title.as_str()), (AgentStatus::Ready, "! echo first"));
 
+    let reservation = workspace_writes::WorkspaceWrite::acquire(vec![tmp.path().to_path_buf()]).await.unwrap();
+    assert!(mgr.run_shell(&task.id, "echo denied", ide_core::CancellationToken::new()).await.is_err());
+    assert!(mgr.entries(&task.id, None).unwrap().is_empty());
+    drop(reservation);
     mgr.run_shell(&task.id, "echo first", ide_core::CancellationToken::new()).await.unwrap();
     assert!(agent.prompts.lock().is_empty(), "an idle task starts no turn");
     mgr.prompt(&task.id, text("again"), false).await.unwrap();
@@ -2804,7 +2836,7 @@ async fn archived_tasks_can_be_restored_and_continue_their_session() {
         .unwrap();
     wait_for(&mgr, &task.id, AgentStatus::Ready).await;
     let entries = mgr.entries(&task.id, None).unwrap();
-    mgr.archive(&task.id).unwrap();
+    mgr.archive(&task.id).await.unwrap();
     assert!(mgr.prompt(&task.id, text("again"), false).await.is_err());
     mgr.unarchive(&task.id).unwrap();
     assert_eq!(mgr.task(&task.id).unwrap().state.lock().task.status, AgentStatus::Ready);
@@ -2842,6 +2874,19 @@ async fn task_project_root_controls_local_and_worktree_repositories() {
     git(&["add", "."]);
     git(&["commit", "-qm", "initial"]);
     let mgr = manager(&root, Arc::new(FakeAgent::default()));
+    let writer = workspace_writes::WorkspaceWrite::acquire(vec![member.clone()]).await.unwrap();
+    let conflicting = mgr
+        .create(NewAgentTask {
+            project_root: Some(IpcPath(member.clone())),
+            prompt: text("member task"),
+            provider: "claude".into(),
+            isolation: Isolation::Worktree,
+            ..Default::default()
+        })
+        .await;
+    assert!(matches!(conflicting, Err(error) if error.to_string().contains("changing this checkout")));
+    assert_eq!(git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+    drop(writer);
     for isolation in [Isolation::Local, Isolation::Worktree] {
         let task = mgr
             .create(NewAgentTask {
@@ -3109,14 +3154,45 @@ async fn an_idle_agent_waits_for_its_background_tasks_before_it_stops() {
     // The task runs long past the idle delay: the agent stays up for it.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(live(&mgr, &task.id));
+    let reserve = || workspace_writes::WorkspaceWrite::acquire(vec![tmp.path().to_path_buf()]);
+    assert!(reserve().await.is_err(), "a reported background task retains the checkout");
+    assert!(mgr.archive(&task.id).await.is_err(), "archive cannot discard the active writer");
+    assert!(mgr.delete(&task.id, true).await.is_err(), "delete cannot discard the active writer");
+    assert!(live(&mgr, &task.id), "the background watcher survives both rejected operations");
+
+    let current = mgr.task(&task.id).unwrap();
+    #[cfg(windows)]
+    let (managed_job, mut managed_child) = {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        ide_core::process::prepare(&mut cmd);
+        let child = cmd.args(["/D", "/C", "ping -n 30 127.0.0.1 >nul"]).spawn().unwrap();
+        let name = format!("Global\\OpenIDEA-BackgroundTest-{}", uuid::Uuid::new_v4());
+        let job = ide_core::process::Job::for_pid_named(child.id(), &name).unwrap();
+        let writer = current.state.lock().background_writer.clone().unwrap();
+        writer.record_windows_job(&name).unwrap();
+        current.state.lock().settled_native_writer = Some((writer, name));
+        (job, child)
+    };
+    let active = current.state.lock().background_tasks.clone();
+    assert!(!current.set_background_tasks(active, Some(2)));
+    assert!(!current.set_background_tasks(Vec::new(), Some(1)), "ignore an older empty roster");
+    assert!(reserve().await.is_err(), "an older empty roster cannot release the checkout");
     // It is done: the delay starts over from this report, then the agent stops.
-    agent.update("s1", json!({"sessionUpdate": BACKGROUND_TASKS_UPDATE, "tasks": []}));
+    agent.update("s1", json!({"sessionUpdate": BACKGROUND_TASKS_UPDATE, "tasks": [], "backgroundRevision":3}));
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(reserve().await.is_ok(), "the terminal background report releases the checkout");
     assert!(live(&mgr, &task.id), "the delay runs from when the last task is done");
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(!live(&mgr, &task.id));
     assert_eq!(mgr.task(&task.id).unwrap().state.lock().task.status, AgentStatus::Ready, "not an error");
+    mgr.archive(&task.id).await.unwrap();
+    mgr.delete(&task.id, false).await.unwrap();
     mgr.shutdown();
+    #[cfg(windows)]
+    {
+        drop(managed_job);
+        managed_child.wait().unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3296,6 +3372,13 @@ async fn delete_running_agent(no_load: bool) {
         );
     }
 
+    if no_load {
+        let writer = workspace_writes::WorkspaceWrite::acquire(vec![task.cwd.0.clone()]).await.unwrap();
+        assert!(mgr.delete(&task.id, true).await.is_err());
+        assert!(mgr.task(&task.id).is_ok());
+        assert!(task.cwd.0.is_dir());
+        drop(writer);
+    }
     mgr.delete(&task.id, true).await.unwrap();
     assert!(!task.cwd.0.exists());
     // Killed and reaped: not even a zombie is left.
@@ -4077,6 +4160,12 @@ async fn a_local_task_in_a_repository_without_commits_lists_and_rolls_back_its_c
             "{eol:?}"
         );
 
+        let sibling = repo.dir.join("nested");
+        std::fs::create_dir(&sibling).unwrap();
+        let reservation = workspace_writes::WorkspaceWrite::acquire(vec![sibling]).await.unwrap();
+        assert!(mgr.rollback_changes(&task.id, None, AgentChangesView::SinceStart).await.is_err());
+        assert_eq!(repo.read("new.txt"), "agent\n", "{eol:?}");
+        drop(reservation);
         mgr.rollback_changes(&task.id, None, AgentChangesView::SinceStart).await.unwrap();
         assert!(!repo.dir.join("new.txt").exists(), "{eol:?}");
         assert_eq!(repo.read("mine.txt"), "mine\n", "{eol:?}");

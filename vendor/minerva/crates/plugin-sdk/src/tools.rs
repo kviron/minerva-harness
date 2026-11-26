@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
+
+pub const INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionPolicy {
@@ -39,4 +41,14 @@ pub struct InteractionAnswer {
     pub id: String,
     pub decision: String,
     pub answer: Option<String>,
+}
+
+impl PermissionPolicy {
+    pub fn restrict(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ReadOnly, _) | (_, Self::ReadOnly) => Self::ReadOnly,
+            (Self::Ask, _) | (_, Self::Ask) => Self::Ask,
+            _ => Self::Allow,
+        }
+    }
 }

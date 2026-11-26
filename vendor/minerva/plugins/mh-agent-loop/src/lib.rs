@@ -5,6 +5,8 @@ mod selection_control;
 use cordis::{Context, Plugin};
 pub use mh_plugin_manager::{context, engine, harness, plugins, providers, tools};
 pub use mh_sessions::{sessions, transcript};
+mod followups;
+mod policy;
 use plugins::PluginManager;
 pub use run_supervisor::AgentLoopService;
 use sessions::SessionService;

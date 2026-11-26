@@ -72,7 +72,7 @@ impl cordis::Service for SessionService {
 
 #[derive(Clone)]
 pub struct SessionService {
-    store: std::sync::Arc<SessionStore>,
+    pub(crate) store: std::sync::Arc<SessionStore>,
     shutdown_result: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
 }
 impl SessionService {
@@ -96,7 +96,7 @@ impl SessionService {
     pub fn server_timestamp(&self) -> Result<String, String> {
         self.store.server_timestamp()
     }
-    pub fn accept_run(&self, request: &crate::StartRunRequest, created_at: &str) -> Result<bool, String> {
+    pub(crate) fn validate_run_request(request: &crate::StartRunRequest) -> Result<(), String> {
         if !valid_id(&request.session_id)
             || !valid_id(&request.request_id)
             || !valid_id(&request.message.id)
@@ -107,6 +107,10 @@ impl SessionService {
         {
             return Err("invalid run request".into());
         }
+        Ok(())
+    }
+    pub fn accept_run(&self, request: &crate::StartRunRequest, created_at: &str) -> Result<bool, String> {
+        Self::validate_run_request(request)?;
         self.store.accept_run(request, created_at)
     }
     pub fn invalidate_integration(&self, session: &str, namespace: &str) -> Result<(), String> {
@@ -161,6 +165,9 @@ impl SessionService {
         self.store.load(id)
     }
     pub fn save(&self, id: &str, message: SessionMessage, state: Option<IntegrationState>) -> Result<(), String> {
+        if message.extensions.contains_key("minerva.delegation") {
+            return Err("Delegation input is assigned by run admission".into());
+        }
         if !valid_id(&message.id)
             || !matches!(message.role.as_str(), "user" | "assistant" | "system")
             || message.created_at.is_empty()
@@ -341,6 +348,7 @@ mod tests {
         assert!(SessionService::open(&path).is_err());
         drop(service);
         let db = rusqlite::Connection::open(&path).unwrap();
+        crate::delegation::schema::remove_from_legacy_fixture(&db);
         db.execute_batch("DROP TABLE run_selection_dispatches; DROP TABLE session_selections; DROP TABLE runs; PRAGMA user_version=2;").unwrap();
         drop(db);
         let service = SessionService::open(&path).unwrap();
@@ -428,7 +436,10 @@ mod tests {
         assert!(service.integration_state("one", "codex").unwrap().is_none());
         drop(service);
         let db = rusqlite::Connection::open(&path).unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            crate::session_store::SCHEMA_VERSION
+        );
     }
     #[test]
     fn migration_failure_does_not_change_v1() {
@@ -451,7 +462,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.sqlite3");
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.pragma_update(None, "user_version", 9).unwrap();
+        db.pragma_update(None, "user_version", crate::session_store::SCHEMA_VERSION + 1).unwrap();
         drop(db);
         assert!(SessionService::open(&path).is_err());
     }
@@ -528,6 +539,7 @@ mod v6_backup_tests {
         }
         {
             let db = rusqlite::Connection::open(&path).unwrap();
+            crate::delegation::schema::remove_from_legacy_fixture(&db);
             db.execute_batch("DROP TABLE run_selection_dispatches; DROP TABLE session_selections; DROP TABLE internal_sessions; PRAGMA user_version=5;").unwrap();
         }
         {
@@ -547,6 +559,6 @@ mod v6_backup_tests {
         assert!(content.contains("preserved history"));
         let upgraded = rusqlite::Connection::open(&path).unwrap();
         let version: i64 = upgraded.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, crate::session_store::SCHEMA_VERSION);
     }
 }

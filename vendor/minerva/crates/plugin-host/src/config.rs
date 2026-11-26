@@ -23,6 +23,21 @@ pub struct ServicesConfig {
     pub shell: ShellConfig,
     #[serde(rename = "agent-loop")]
     pub agent_loop: AgentLoopConfig,
+    pub delegation: DelegationConfig,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DelegationConfig {
+    pub enabled: bool,
+    #[serde(rename = "executionDeadlineSeconds")]
+    pub execution_deadline_seconds: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<minerva_plugin_sdk::delegation::FallbackRule>,
+}
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self { enabled: false, execution_deadline_seconds: 900, fallbacks: Vec::new() }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -84,6 +99,14 @@ impl CompositionConfig {
         }
         if !(100..=60_000).contains(&self.services.agent_loop.shutdown_timeout_ms) {
             return Err("services.agent-loop.shutdownTimeoutMs must be between 100 and 60000".into());
+        }
+        let rules = &self.services.delegation.fallbacks;
+        if rules.len() > 32
+            || rules.iter().enumerate().any(|(index, rule)| {
+                rule.primary == rule.alternative || rules[..index].iter().any(|prior| prior.primary == rule.primary)
+            })
+        {
+            return Err("services.delegation.fallbacks requires at most 32 distinct primary targets, each with a different alternative".into());
         }
         Ok(())
     }

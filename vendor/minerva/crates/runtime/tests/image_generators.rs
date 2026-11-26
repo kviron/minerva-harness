@@ -43,6 +43,8 @@ fn package(root: &Path, id: &str, available: bool, fail: bool) {
 }
 fn context(manager: &PluginManager, call: &str) -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "s".into(),
         run_id: "r".into(),
         call_id: call.into(),

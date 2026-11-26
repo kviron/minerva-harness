@@ -379,7 +379,7 @@ export const registerWorkbenchBanner = (c: WorkbenchBannerContribution) => regis
 
 /** A feature can replace IDE navigation without replacing the editor or its tool-window state. */
 export const useWorkbenchChrome = create<{
-  navigation: ComponentType | null;
+  navigation: ComponentType<{ children?: ReactNode }> | null;
   sidebar: ComponentType | null;
   primary?: ComponentType | null;
   workspaceOpen?: boolean;

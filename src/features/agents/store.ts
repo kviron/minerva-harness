@@ -146,6 +146,7 @@ interface AgentsState {
   sessionLocation: SessionLocation;
   mainAgent: boolean;
   lastTask: string | null;
+  historySubagent: { task: string; path: string[] } | null;
   homeOpen: boolean;
   pinnedModels: string[];
   /** Whether messages carry the editor's current file and selection. */
@@ -222,6 +223,7 @@ export const useAgents = create<AgentsState>(() => ({
   docked: null,
   sessionLocation: load<unknown>("minerva.workspaceMode.v1", null) === "toolWindow" ? "toolWindow" : "editor",
   lastTask: null,
+  historySubagent: null,
   mainAgent: false,
   homeOpen: false,
   pinnedModels: load<string[]>(PINNED_MODELS_KEY, []),
@@ -634,6 +636,23 @@ function onEntryEvent(s: AgentsState, e: EntryEvent) {
   else if (next !== current) useAgents.setState({ entries: new Map(s.entries).set(key, next) });
 }
 
+const staleDelegationLoads = new WeakSet<object>();
+
+function refreshDelegationHistory(s: AgentsState, e: Extract<AgentEvent, { type: "entry" }>) {
+  const entry = e.entry;
+  if (s.tasks.get(e.task)?.provider !== "minerva" || entry.type !== "subagent" || !entry.id.startsWith("del_")) {
+    return;
+  }
+  const previous = s.entries.get(entriesKey(e.task, e.subagent))?.[e.index];
+  if (previous?.type === "subagent" && previous.status === entry.status && previous.description === entry.description) {
+    return;
+  }
+  const key = entriesKey(e.task, entry.id);
+  const load = s.entryLoads.get(key);
+  if (load?.error === null) staleDelegationLoads.add(load);
+  else if (s.entries.has(key)) void loadEntries(e.task, entry.id);
+}
+
 const CACHED_CLOSED_TASKS = 5;
 
 /** Recent closed-task ids kept in memory so reopening a just-closed tab avoids refetching. */
@@ -770,6 +789,7 @@ export function disconnect() {
     organizeRoot: null,
     docked: null,
     lastTask: null,
+    historySubagent: null,
     homeOpen: false,
     external: [],
     externalError: null,
@@ -856,12 +876,13 @@ function onEvent(e: AgentEvent) {
         !e.subagent &&
         ((e.entry.type === "agent" && e.entry.text.trim()) ||
           e.entry.type === "error" ||
-          (e.entry.type === "permission" && e.entry.chosen === null))
+          ((e.entry.type === "permission" || e.entry.type === "question") && e.entry.chosen === null))
       ) {
         markUnread(e.task);
       }
       if (!e.subagent) streamingReply.set(e.task, { index: e.index, reply: e.entry.type === "agent" });
       onEntryEvent(s, e);
+      refreshDelegationHistory(s, e);
       if (e.entry.type === "tool" && e.entry.status === "completed" && e.entry.diffs.length) {
         scheduleChanges(e.task);
       }
@@ -917,6 +938,7 @@ export async function loadEntries(task: string, subagent: string | null = null):
     entryLoads: new Map(s.entryLoads).set(key, load),
   }));
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let refresh = false;
   try {
     const entries = await Promise.race([
       call(commands.agentEntries(task, subagent)),
@@ -925,6 +947,7 @@ export async function loadEntries(task: string, subagent: string | null = null):
       }),
     ]);
     if (useAgents.getState().entryLoads.get(key) !== load) return;
+    refresh = staleDelegationLoads.has(load);
     let loaded = entries;
     for (const event of arrivedWhileLoading.get(key) ?? []) loaded = applyEntryEvent(loaded, event) ?? loaded;
     arrivedWhileLoading.delete(key);
@@ -935,6 +958,7 @@ export async function loadEntries(task: string, subagent: string | null = null):
     });
   } catch (e) {
     if (useAgents.getState().entryLoads.get(key) !== load) return;
+    refresh = staleDelegationLoads.has(load);
     arrivedWhileLoading.delete(key);
     const error = (e instanceof Error ? e.message : String(e)).trim() || tx("Unknown error");
     useAgents.setState((s) => ({
@@ -942,6 +966,7 @@ export async function loadEntries(task: string, subagent: string | null = null):
     }));
   } finally {
     clearTimeout(timer);
+    if (refresh) void loadEntries(task, subagent);
   }
 }
 
@@ -1110,9 +1135,20 @@ export function openTask(task: string) {
     return;
   }
   const previous = useAgents.getState().lastTask;
-  useAgents.setState({ lastTask: task, homeOpen: false, lastComposer: task });
+  useAgents.setState({ lastTask: task, homeOpen: false, lastComposer: task, historySubagent: null });
   if (previous && previous !== task && useAgents.getState().mainAgent) releaseClosedTaskCache(previous);
   if (!useAgents.getState().mainAgent) openTaskInEditor(task);
+}
+
+export function openHistorySubagent(task: string, path: string[]) {
+  openTask(task);
+  setHistorySubagent(task, path);
+}
+
+export function setHistorySubagent(task: string, path: string[]) {
+  if (useAgents.getState().lastTask === task) {
+    useAgents.setState({ historySubagent: path.length ? { task, path } : null });
+  }
 }
 
 function openTaskInEditor(task: string) {
@@ -1750,6 +1786,7 @@ export function appendToComposer(
 
 /** Stops the task's turn, or with `subagent` only that subagent's work. */
 export const cancelTask = (task: string, subagent: string | null = null) => call(commands.agentCancel(task, subagent));
+export const stopDelegationTree = (task: string) => call(commands.agentStopDelegationTree(task));
 export const stopBackgroundTask = (task: string, background: string) =>
   call(commands.agentStopBackground(task, background));
 export const respond = (task: string, permission: number, option: string | null) =>

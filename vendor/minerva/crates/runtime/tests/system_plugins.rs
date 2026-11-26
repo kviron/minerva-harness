@@ -33,6 +33,8 @@ async fn system_plugins_are_listed_and_cannot_be_disabled_or_paused() {
 
 fn call(manager: &PluginManager, root: PathBuf) -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "session".into(),
         run_id: "run".into(),
         call_id: "call".into(),

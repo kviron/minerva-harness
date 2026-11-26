@@ -3,7 +3,10 @@ use crate::sessions::{ContentPart, IntegrationState, SessionInfo, SessionMessage
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::{path::Path, sync::Mutex};
+mod run_admission;
 mod selections;
+
+pub(crate) const SCHEMA_VERSION: i64 = 16;
 
 // Keep a live connection guard for existing transaction code, while permitting
 // explicit shutdown even when hosts retain service handles.
@@ -35,6 +38,18 @@ pub struct SessionStore {
     _lock: std::fs::File,
 }
 impl SessionStore {
+    pub(crate) fn with_delegation_db<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> minerva_plugin_sdk::delegation::DelegationResult<T>,
+    ) -> minerva_plugin_sdk::delegation::DelegationResult<T> {
+        let mut db = self.connection.lock().map_err(|e| {
+            minerva_plugin_sdk::delegation::DelegationError::new(
+                minerva_plugin_sdk::delegation::ErrorCode::StorageFailed,
+                e,
+            )
+        })?;
+        f(&mut db)
+    }
     pub fn baseline(&self, session: &str) -> Result<crate::sessions::SessionBaseline, String> {
         let mut db = self.connection.lock()?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
@@ -80,10 +95,10 @@ impl SessionStore {
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
         db.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0)).map_err(|e| e.to_string())?;
-        if version > 7 {
+        if version > SCHEMA_VERSION {
             return Err("База диалогов создана более новой версией приложения".into());
         }
-        if (1..7).contains(&version) {
+        if (1..SCHEMA_VERSION).contains(&version) {
             // SQLite's backup API includes committed WAL data and leaves the source untouched.
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -94,8 +109,20 @@ impl SessionStore {
                 5
             } else if version < 6 {
                 6
-            } else {
+            } else if version < 7 {
                 7
+            } else if version < 8 {
+                8
+            } else if version < 9 {
+                9
+            } else if version < 10 {
+                10
+            } else if version < 11 {
+                11
+            } else if version < 12 {
+                12
+            } else {
+                SCHEMA_VERSION
             };
             let backup = path.with_file_name(format!("{name}.pre-v{target_version}-{stamp}.sqlite3"));
             std::fs::OpenOptions::new().write(true).create_new(true).open(&backup).map_err(|e| e.to_string())?;
@@ -125,6 +152,41 @@ impl SessionStore {
         if version < 7 {
             selections::migrate(&mut db)?;
         }
+        if version < 8 {
+            crate::delegation::schema::migrate(&mut db)?;
+        }
+        if version < 9 {
+            crate::delegation::schema::migrate_terminal_snapshots(&mut db)?;
+        }
+        if version < 10 {
+            crate::delegation::schema::migrate_operation_activations(&mut db)?;
+        }
+        if version < 11 {
+            crate::delegation::schema::migrate_tree_stop(&mut db)?;
+        }
+        if version < 12 {
+            crate::delegation::schema::migrate_followup_queue(&mut db)?;
+        }
+        if version < 13 {
+            crate::delegation::schema::migrate_followup_promotion(&mut db)?;
+        }
+        if version < 14 {
+            crate::delegation::schema::migrate_questions(&mut db)?;
+        }
+        if version < 15 {
+            crate::delegation::schema::migrate_followup_delivery(&mut db)?;
+        }
+        if version < 16 {
+            crate::delegation::schema::migrate_activation_deadlines(&mut db)?;
+        }
+        db.execute("UPDATE delegation_followup_queue SET delivery_state='unknown' WHERE delivery_state='claimed'", [])
+            .map_err(|e| e.to_string())?;
+        db.execute(
+            "UPDATE delegation_questions SET state=CASE state WHEN 'pending' THEN 'expired' ELSE 'unknown' END
+             WHERE state IN ('pending','delivering')",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         db.execute("UPDATE runs SET status='interrupted',error='Приложение завершилось до сохранения результата' WHERE status='running'", []).map_err(|e| e.to_string())?;
         Ok(Self { connection: Database(Mutex::new(Some(db))), _lock: lock })
     }
@@ -368,73 +430,19 @@ impl SessionStore {
         Ok(())
     }
     pub fn accept_run(&self, request: &crate::StartRunRequest, created_at: &str) -> Result<bool, String> {
-        let mut db = self.connection.lock().map_err(|e| e.to_string())?;
+        self.accept_run_origin(request, created_at, &crate::delegation::wake::AdmissionOrigin::Existing)
+    }
+    pub(crate) fn accept_run_origin(
+        &self,
+        request: &crate::StartRunRequest,
+        created_at: &str,
+        origin: &crate::delegation::wake::AdmissionOrigin,
+    ) -> Result<bool, String> {
+        let mut db = self.connection.lock()?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
-        let payload = serde_json::to_value(request).map_err(|e| e.to_string())?;
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT request_json FROM runs WHERE session_id=?1 AND id=?2",
-                params![request.session_id, request.request_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if let Some(old) = old {
-            if serde_json::from_str::<Value>(&old).map_err(|e| e.to_string())? == payload {
-                return Ok(false);
-            }
-            return Err("conflict: requestId already has a different payload".into());
-        }
-        let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status='running') OR EXISTS(SELECT 1 FROM messages WHERE session_id=?1 AND message_id IN (?2,?3))",params![request.session_id,request.request_id,request.message.id],|r|r.get(0)).map_err(|e|e.to_string())?;
-        if busy {
-            return Err("conflict: session busy or message ID already exists".into());
-        }
-        if let Some(parent) = &request.parent_id {
-            let exists: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id=?1 AND message_id=?2)",
-                    params![request.session_id, parent],
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            if !exists {
-                return Err("parent is not in this session".into());
-            }
-        }
-        let mut input = Vec::new();
-        if !request.message.text.is_empty() {
-            input.push(ContentPart::text("text", &request.message.text));
-        }
-        if let Some(images) = request.options["attachments"].as_array() {
-            input.extend(images.iter().cloned().map(|data| {
-                ContentPart {
-                    kind: if matches!(
-                        data["mimeType"].as_str(),
-                        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
-                    ) {
-                        "image"
-                    } else {
-                        "file"
-                    }
-                    .into(),
-                    data,
-                }
-            }));
-        }
-        crate::transcript::Transcript { parts: input.clone(), replay: Default::default() }.validate()?;
-        tx.execute("INSERT INTO messages(session_id,message_id,parent_id,role,created_at,content_json,extras_json,seq) VALUES(?1,?2,?3,'user',?4,?5,'{}',(SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?1))",params![request.session_id,request.message.id,request.parent_id,created_at,serde_json::to_string(&input).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
-        tx.execute(
-            "INSERT INTO runs VALUES(?1,?2,?3,?4,'running',NULL,unixepoch())",
-            params![request.session_id, request.request_id, request.message.id, payload.to_string()],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.execute(
-            "UPDATE sessions SET title=CASE WHEN title='Новый диалог' THEN ?3 ELSE title END,updated_at=unixepoch(),model=CASE WHEN EXISTS(SELECT 1 FROM session_selections WHERE session_id=?1) THEN model ELSE ?2 END WHERE id=?1",
-            params![request.session_id, request.model,request.message.text.chars().take(80).collect::<String>()],
-        )
-        .map_err(|e| e.to_string())?;
+        let accepted = run_admission::accept(&tx, request, created_at, origin)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(accepted)
     }
     pub fn run_snapshot(&self, session: &str, id: &str) -> Result<crate::RunSnapshot, String> {
         let db = self.connection.lock().map_err(|e| e.to_string())?;

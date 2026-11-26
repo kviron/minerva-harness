@@ -564,6 +564,13 @@ pub enum AgentEntry {
         description: Option<String>,
         status: AgentSubagentStatus,
         error: Option<String>,
+        #[serde(default)]
+        fallback: Option<AgentSubagentFallback>,
+        /// Exact internal run accepting explicit next-step input; absent for unsupported or idle children.
+        #[serde(default)]
+        delivery_run_id: Option<String>,
+        #[serde(default)]
+        queued_followups: Vec<AgentQueuedFollowup>,
         /// What it was asked to do, last.
         prompt: Option<String>,
         /// Its answer.
@@ -605,6 +612,34 @@ pub enum AgentEntry {
     Error {
         message: String,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDelegationReceipt {
+    pub queued: bool,
+    pub work_item_id: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentQueuedFollowup {
+    pub id: String,
+    pub prompt: String,
+    pub state: AgentFollowupState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentFollowupState {
+    Queued,
+    Requested,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSubagentFallback {
+    pub requested: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -795,7 +830,7 @@ pub enum AgentEvent {
         task: String,
         subagent: Option<String>,
         index: u32,
-        entry: AgentEntry,
+        entry: Box<AgentEntry>,
     },
     /// Text was appended to entry `index` (an agent message or a thought): it read the first
     /// `from` UTF-16 units of its text when the previous event for it was sent.

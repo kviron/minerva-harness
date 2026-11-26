@@ -154,6 +154,7 @@ fn v6_migration_preserves_legacy_model_without_inventing_an_effort() {
     }
     {
         let db = Connection::open(&path).unwrap();
+        crate::delegation::schema::remove_from_legacy_fixture(&db);
         db.execute_batch("DROP TABLE run_selection_dispatches; DROP TABLE session_selections; PRAGMA user_version=6;")
             .unwrap();
     }

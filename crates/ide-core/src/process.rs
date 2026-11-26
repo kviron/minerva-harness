@@ -12,6 +12,15 @@ use std::time::Duration;
 /// with other flags (and then call [`host_env`] themselves). Prefer [`prepare`] otherwise.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(windows)]
+pub fn suspend_on_spawn(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW | windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+}
+
+#[cfg(windows)]
+mod suspended;
+
 /// Readies `cmd` for spawning any child (java, node, curl, git, a language server, ...).
 /// For a `tokio::process::Command`, pass `cmd.as_std_mut()`.
 ///
@@ -396,12 +405,12 @@ mod windows_tree {
 mod windows_job {
     use std::mem::size_of;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        OpenJobObjectW, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{IO_COUNTERS, OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
@@ -424,6 +433,36 @@ mod windows_job {
         /// caller that holds the child cannot have had it reaped, so this is a dead or
         /// already-gone launch.
         pub fn for_pid(pid: u32) -> Option<Job> {
+            Self::for_pid_in(pid, None)
+        }
+
+        pub fn for_pid_named(pid: u32, name: &str) -> Option<Job> {
+            Self::for_pid_in(pid, Some(name))
+        }
+
+        /// Starts the sole initial thread of a child spawned with `suspend_on_spawn`.
+        pub fn resume_suspended(&self, pid: u32) -> std::io::Result<()> {
+            use windows_sys::Win32::System::{
+                JobObjects::IsProcessInJob, Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            // SAFETY: the returned handle is owned here if non-null.
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let mut contained = 0;
+            // SAFETY: both handles and the output pointer remain valid.
+            if unsafe { IsProcessInJob(handle.as_raw_handle(), self.0.as_raw_handle(), &mut contained) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if contained == 0 {
+                return Err(std::io::Error::other("Suspended process is outside its expected job"));
+            }
+            super::suspended::resume_primary(pid)
+        }
+
+        fn for_pid_in(pid: u32, name: Option<&str>) -> Option<Job> {
             // SAFETY: plain call; a non-null result is a process handle owned by the caller.
             // Assignment needs `SET_QUOTA | TERMINATE` on the process.
             let handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
@@ -432,17 +471,28 @@ mod windows_job {
             }
             // SAFETY: the handle was just opened and is owned here.
             let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-            Self::from_handle(handle.as_raw_handle())
+            Self::from_handle_named(handle.as_raw_handle(), name)
         }
 
         fn from_handle(handle: RawHandle) -> Option<Job> {
+            Self::from_handle_named(handle, None)
+        }
+
+        fn from_handle_named(handle: RawHandle, name: Option<&str>) -> Option<Job> {
+            let name = name.map(|name| name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>());
             // SAFETY: plain calls; a non-null result is a job handle owned by the caller.
-            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            let job =
+                unsafe { CreateJobObjectW(std::ptr::null(), name.as_ref().map_or(std::ptr::null(), Vec::as_ptr)) };
+            let already_exists =
+                name.is_some() && std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32);
             if job.is_null() || job == INVALID_HANDLE_VALUE {
                 return None;
             }
             // SAFETY: the job handle is owned here and `limits` is sized as the API requires.
             let job = unsafe { OwnedHandle::from_raw_handle(job) };
+            if already_exists {
+                return None;
+            }
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
                 BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
                     PerProcessUserTimeLimit: 0,
@@ -519,29 +569,39 @@ mod windows_job {
         /// cannot be read, reports gone: waits on this must not wedge, and a kill via
         /// [`Job::terminate`] does not depend on the answer.
         pub fn is_running(&self) -> bool {
-            // A list of one is the common case; `ERROR_MORE_DATA` says the real list is
-            // longer, which means there are processes.
-            let mut list = JOBOBJECT_BASIC_PROCESS_ID_LIST {
-                NumberOfAssignedProcesses: 0,
-                NumberOfProcessIdsInList: 0,
-                ProcessIdList: [0],
-            };
-            let mut returned = 0u32;
-            // SAFETY: the job handle is owned here and `list` is sized as the API requires.
+            self.try_is_running().unwrap_or(false)
+        }
+
+        /// Whether the job still contains active processes, preserving failures to query it.
+        pub fn try_is_running(&self) -> std::io::Result<bool> {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the owned handle and accounting buffer are valid throughout the call.
             let ok = unsafe {
                 QueryInformationJobObject(
                     self.0.as_raw_handle(),
-                    JobObjectBasicProcessIdList,
-                    &mut list as *mut _ as *mut _,
-                    size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() as u32,
-                    &mut returned,
+                    JobObjectBasicAccountingInformation,
+                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
                 )
             };
-            if ok != 0 {
-                list.NumberOfProcessIdsInList > 0
-            } else {
-                std::io::Error::last_os_error().raw_os_error() == Some(ERROR_MORE_DATA as i32)
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(accounting.ActiveProcesses > 0)
+        }
+
+        pub fn named_is_running(name: &str) -> std::io::Result<bool> {
+            use windows_sys::Win32::System::SystemServices::JOB_OBJECT_QUERY;
+            let name = name.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+            // SAFETY: the name is terminated UTF-16; a non-null result is an owned handle.
+            let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, 0, name.as_ptr()) };
+            if job.is_null() {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) { Ok(false) } else { Err(error) };
+            }
+            let job = Job(unsafe { OwnedHandle::from_raw_handle(job) });
+            job.try_is_running()
         }
     }
 }
@@ -1469,13 +1529,72 @@ mod job_tests {
     #[test]
     fn job_terminates_the_tree_the_root_started() {
         let (mut child, job, tree) = launch_tree();
-        assert!(job.is_running());
+        assert!(job.try_is_running().unwrap());
         assert!(job.terminate(), "TerminateJobObject succeeds");
         // The captured tree's handles survive the root's death, so the wait below is the
         // grandchild's, not a reused pid's.
         assert_gone(&tree);
-        assert!(!job.is_running());
+        assert!(!job.try_is_running().unwrap());
         let _ = child.wait();
+    }
+
+    #[test]
+    fn named_job_ends_the_suspended_launch_when_its_owner_is_killed() {
+        const JOB_NAME_ENV: &str = "OPENIDEA_TEST_CRASH_JOB_NAME";
+        if let Some(name) = std::env::var_os(JOB_NAME_ENV) {
+            let mut command = Command::new("ping.exe");
+            command.args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null());
+            suspend_on_spawn(&mut command);
+            let mut child = command.spawn().unwrap();
+            let job = Job::for_pid_named(child.id(), name.to_str().unwrap()).unwrap();
+            job.resume_suspended(child.id()).unwrap();
+            println!("job-child={}", child.id());
+            child.wait().unwrap();
+            return;
+        }
+
+        use std::io::BufRead;
+        let name = format!("openidea-test-crash-{}", std::process::id());
+        let mut owner = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::job_tests::named_job_ends_the_suspended_launch_when_its_owner_is_killed",
+                "--nocapture",
+            ])
+            .env(JOB_NAME_ENV, &name)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let capture = std::io::BufReader::new(owner.stdout.take().unwrap())
+            .lines()
+            .map_while(Result::ok)
+            .find_map(|line| line.strip_prefix("job-child=")?.parse::<u32>().ok())
+            .map(ProcessTree::capture);
+        let running_before = Job::named_is_running(&name);
+        let child_running_before = capture.as_ref().is_some_and(ProcessTree::is_running);
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+
+        let tree = capture.expect("owner reported the child before being killed");
+        assert!(running_before.unwrap());
+        assert!(child_running_before);
+        assert_gone(&tree);
+        assert!(!Job::named_is_running(&name).unwrap());
+    }
+
+    #[test]
+    fn suspended_command_runs_only_after_job_assignment_and_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "echo yes>started"]).current_dir(dir.path());
+        suspend_on_spawn(&mut command);
+        let mut child = command.spawn().unwrap();
+        let job = Job::for_child(&child).unwrap();
+        assert!(!marker.exists());
+        job.resume_suspended(child.id()).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(marker.is_file());
     }
 
     #[test]

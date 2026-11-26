@@ -3,6 +3,8 @@ use mh_runtime_support::credential_store::MemoryCredentialStore;
 use mh_tool_runtime::{InteractionBroker, PermissionPolicy, ToolContext};
 fn context() -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "session".into(),
         run_id: "run".into(),
         call_id: "call".into(),

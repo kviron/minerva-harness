@@ -2,8 +2,10 @@ use super::*;
 use crate::tools::{Cancellation, InteractionBroker, PermissionPolicy, ToolContext, ToolRegistry};
 use serde_json::json;
 use std::{path::Path, sync::Arc, time::Duration};
-fn context(session: &str, cwd: &Path) -> ToolContext {
+pub(super) fn context(session: &str, cwd: &Path) -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: session.into(),
         run_id: "run".into(),
         call_id: "call".into(),
@@ -42,6 +44,88 @@ fn setup() -> (Arc<ShellJobs>, ToolRegistry) {
     register_native_with_jobs(&registry, jobs.clone()).unwrap();
     (jobs, registry)
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn process_journal_is_written_before_the_command_can_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (jobs, registry) = setup();
+    let marker = dir.path().join("recorded");
+    let confirmed = dir.path().join("confirmed");
+    let journal = jobs.bind_process_journal(
+        "one",
+        move |name| std::fs::write(&marker, name).map_err(|error| error.to_string()),
+        move |name| std::fs::write(&confirmed, name).unwrap(),
+    );
+    let answer = registry
+        .snapshot()
+        .execute(
+            "shell",
+            json!({"command":"if (!(Test-Path -LiteralPath 'recorded')) { exit 7 }","run_in_background":true}),
+            context("one", dir.path()),
+        )
+        .await
+        .unwrap();
+    let result = settled(&jobs, "one", answer["jobId"].as_str().unwrap()).await;
+    assert_eq!(result.status, JobStatus::Completed);
+    assert_eq!(
+        std::fs::read(dir.path().join("recorded")).unwrap(),
+        std::fs::read(dir.path().join("confirmed")).unwrap()
+    );
+    drop(journal);
+    let _failing = jobs.bind_process_journal("one", |_| Err("Cannot write recovery record".into()), |_| {});
+    let answer = registry
+        .snapshot()
+        .execute(
+            "shell",
+            json!({"command":"Set-Content -LiteralPath 'must-not-exist' -Value 'launched'","run_in_background":true}),
+            context("one", dir.path()),
+        )
+        .await
+        .unwrap();
+    let result = settled(&jobs, "one", answer["jobId"].as_str().unwrap()).await;
+    assert_eq!(result.status, JobStatus::Failed);
+    assert!(!dir.path().join("must-not-exist").exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn tightened_policy_during_journaling_prevents_shell_execution() {
+    use crate::tools::LivePermissionPolicy;
+    struct Policy(std::sync::Mutex<PermissionPolicy>);
+    impl LivePermissionPolicy for Policy {
+        fn read_policy(&self, _: &str) -> Result<PermissionPolicy, String> {
+            Ok(*self.0.lock().unwrap())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (jobs, registry) = setup();
+    let policy = Arc::new(Policy(std::sync::Mutex::new(PermissionPolicy::Allow)));
+    let mut ctx = context("one", dir.path());
+    ctx.live_policy = Some(policy.clone());
+    let _journal = jobs.bind_process_journal(
+        "one",
+        move |_| {
+            *policy.0.lock().unwrap() = PermissionPolicy::Ask;
+            Ok(())
+        },
+        |_| {},
+    );
+    let answer = registry
+        .snapshot()
+        .execute(
+            "shell",
+            json!({"command":"Set-Content -LiteralPath 'must-not-exist' -Value 'launched'","run_in_background":true}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    let result = settled(&jobs, "one", answer["jobId"].as_str().unwrap()).await;
+    assert_eq!(result.status, JobStatus::Failed);
+    assert!(result.stderr.contains("approval required"));
+    assert!(!dir.path().join("must-not-exist").exists());
+}
+
 #[tokio::test]
 async fn background_survives_turn_cancel_and_read_cursors_are_not_consumed_by_ui() {
     let dir = tempfile::tempdir().unwrap();
@@ -127,6 +211,7 @@ async fn dropping_foreground_call_kills_instead_of_detaching() {
 async fn last_peer_detach_does_not_stop_jobs_admitted_after_its_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let (jobs, registry) = setup();
+    assert!(!jobs.session_is_quiescent("one"));
     let a = jobs.attach_session("one").unwrap();
     let b = jobs.attach_session("one").unwrap();
     let old = registry
@@ -136,6 +221,7 @@ async fn last_peer_detach_does_not_stop_jobs_admitted_after_its_snapshot() {
         .unwrap();
     let old = old["jobId"].as_str().unwrap().to_owned();
     jobs.detach_session("one", a).await.unwrap();
+    assert!(!jobs.session_is_quiescent("one"));
     assert!(jobs.get("one", &old).unwrap().snapshot().status.is_active());
     let detach = tokio::spawn({
         let jobs = jobs.clone();
@@ -158,7 +244,9 @@ async fn last_peer_detach_does_not_stop_jobs_admitted_after_its_snapshot() {
     detach.await.unwrap().unwrap();
     jobs.detach_session("one", b).await.unwrap();
     assert_ne!(jobs.get("one", new["jobId"].as_str().unwrap()).unwrap().snapshot().status, JobStatus::Stopped);
+    assert!(!jobs.session_is_quiescent("one"));
     jobs.detach_session("one", c).await.unwrap();
+    assert!(jobs.session_is_quiescent("one"));
     jobs.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -186,13 +274,13 @@ async fn admission_is_bounded_before_launch_and_shutdown_rejects_retained_caller
     let jobs = Arc::new(ShellJobs::default());
     let mut reserved = Vec::new();
     for _ in 0..10 {
-        reserved.push(jobs.start("one", dir.path(), "echo never", "reserved", &Cancellation::default()).unwrap());
+        reserved.push(jobs.start(&context("one", dir.path()), "echo never", "reserved").unwrap());
     }
-    assert!(jobs.start("one", dir.path(), "echo unwanted", "overflow", &Cancellation::default()).is_err());
+    assert!(jobs.start(&context("one", dir.path()), "echo unwanted", "overflow").is_err());
     assert!(jobs.list("one").is_empty());
     jobs.shutdown().await.unwrap();
     assert!(reserved.iter().all(|job| job.status() == JobStatus::Stopped));
-    assert!(jobs.start("one", dir.path(), "echo unwanted", "after shutdown", &Cancellation::default()).is_err());
+    assert!(jobs.start(&context("one", dir.path()), "echo unwanted", "after shutdown").is_err());
     assert!(jobs.attach_session("one").is_err());
 }
 #[tokio::test]
@@ -204,12 +292,12 @@ async fn plugin_disposal_shuts_down_even_with_service_arc_retained() {
         ctx.provide(Arc::new(mh_context::ContextService::open(&dir.path().join("context.sqlite")).unwrap())).unwrap();
     let fiber = ctx.spawn(cordis::PreparedPlugin::from_input(crate::WorkspaceToolsPlugin(true), ())).await.unwrap();
     let jobs = ctx.try_service::<ShellJobs>().unwrap();
-    let gated = jobs.start("one", dir.path(), "echo gated", "gated", &Cancellation::default()).unwrap();
+    let gated = jobs.start(&context("one", dir.path()), "echo gated", "gated").unwrap();
     tokio::time::timeout(Duration::from_secs(10), fiber.dispose()).await.unwrap().unwrap();
     assert!(ctx.try_service::<ShellJobs>().is_err());
     assert_eq!(gated.status(), JobStatus::Stopped);
     assert!(jobs.list("one").iter().all(|j| !j.status.is_active()));
-    assert!(jobs.start("one", dir.path(), "echo unwanted", "after dispose", &Cancellation::default()).is_err());
+    assert!(jobs.start(&context("one", dir.path()), "echo unwanted", "after dispose").is_err());
 }
 
 #[tokio::test]
@@ -218,9 +306,9 @@ async fn closed_native_owner_rejects_late_launch_until_a_new_attach() {
     let jobs = ShellJobs::default();
     let token = jobs.attach_session("one").unwrap();
     jobs.detach_session("one", token).await.unwrap();
-    assert!(jobs.start("one", dir.path(), "echo unwanted", "late", &Cancellation::default()).is_err());
+    assert!(jobs.start(&context("one", dir.path()), "echo unwanted", "late").is_err());
     let token = jobs.attach_session("one").unwrap();
-    jobs.start("one", dir.path(), "echo gated", "new", &Cancellation::default()).unwrap();
+    jobs.start(&context("one", dir.path()), "echo gated", "new").unwrap();
     jobs.detach_session("one", token).await.unwrap();
     jobs.shutdown().await.unwrap();
 }
@@ -336,5 +424,32 @@ async fn foreground_progress_uses_bounded_metadata_and_one_final_result() {
             .all(|v| v["stdout"].as_str().is_none_or(|s| s.len() <= 8192)));
     }
     assert!(jobs.list("one").is_empty());
+    jobs.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shell_handoff_pause_excludes_active_jobs_and_new_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (jobs, registry) = setup();
+    jobs.attach_session("parent").unwrap();
+    let shared_tools = registry.snapshot();
+    let start = |session| {
+        shared_tools.execute(
+            "shell",
+            json!({"command":command(),"run_in_background":true}),
+            context(session, dir.path()),
+        )
+    };
+    let running = start("parent").await.unwrap();
+    assert!(jobs.try_pause_launches("parent").is_err());
+    settled(&jobs, "parent", running["jobId"].as_str().unwrap()).await;
+    let pause = jobs.try_pause_launches("parent").unwrap();
+    assert!(jobs.try_pause_launches("parent").is_err());
+    assert!(start("parent").await.unwrap_err().contains("Shell launches are paused"));
+    let other = start("other").await.unwrap();
+    drop(pause);
+    let resumed = start("parent").await.unwrap();
+    settled(&jobs, "parent", resumed["jobId"].as_str().unwrap()).await;
+    settled(&jobs, "other", other["jobId"].as_str().unwrap()).await;
     jobs.shutdown().await.unwrap();
 }

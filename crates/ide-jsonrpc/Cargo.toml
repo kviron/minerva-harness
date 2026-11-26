@@ -17,5 +17,8 @@ thiserror.workspace = true
 tracing.workspace = true
 encoding_rs.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+uuid.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

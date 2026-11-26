@@ -7,6 +7,46 @@
 
 use super::translate::*;
 use super::*;
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the installed Codex app-server; does not call the model"]
+async fn installed_codex_initializes_inside_a_named_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = crate::provider::load(None, None).into_iter().find(|spec| spec.id == "codex").unwrap();
+    let peer = connect(&spec, dir.path(), Arc::new(ide_jsonrpc::NoopHandler), Box::new(|_| {})).unwrap();
+    let init: Value = tokio::time::timeout(Duration::from_secs(15), peer.request("initialize", json!({}), None))
+        .await
+        .unwrap()
+        .unwrap();
+    let job = init.pointer("/agentCapabilities/_meta/openidea/processJob").and_then(Value::as_str).unwrap();
+    assert!(ide_core::process::Job::named_is_running(job).unwrap());
+    let reserve = || crate::workspace_writes::WorkspaceWrite::acquire(vec![dir.path().to_path_buf()]);
+    let writer = reserve().await.unwrap();
+    writer.record_windows_job(job).unwrap();
+    drop(writer);
+    assert!(reserve().await.is_err());
+    peer.kill();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ide_core::process::Job::named_is_running(job).unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(reserve().await.is_ok());
+}
+#[test]
+fn scoped_workspace_sandbox_does_not_add_network_or_temporary_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = scoped_workspace_sandbox(dir.path());
+    assert_eq!(config["type"], "workspaceWrite");
+    assert_eq!(config["writableRoots"], json!([dir.path()]));
+    assert_eq!(config["networkAccess"], false);
+    assert_eq!(config["excludeTmpdirEnvVar"], true);
+    assert_eq!(config["excludeSlashTmp"], true);
+}
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -50,6 +90,7 @@ async fn model_pagination_failure_does_not_cache_an_incomplete_catalog() {
     });
     let (peer, server) = model_peer(pages.clone());
     let shim = CodexShim {
+        weak: Weak::new(),
         runtime: tokio::runtime::Handle::current(),
         codex: OnceLock::from(peer.clone()),
         client: OnceLock::new(),
@@ -493,7 +534,8 @@ fn history_preserves_async_questions_with_stable_answer_ids() {
 
 #[tokio::test]
 async fn completing_a_streamed_message_still_delivers_its_async_questions() {
-    let shim = Arc::new(CodexShim {
+    let shim = Arc::new_cyclic(|weak| CodexShim {
+        weak: weak.clone(),
         runtime: tokio::runtime::Handle::current(),
         codex: OnceLock::new(),
         client: OnceLock::new(),
@@ -613,9 +655,12 @@ enum Scenario {
     PlanThenPrompt,
     PlanToggleThenPrompt,
     Interrupt,
+    DelegatedReadOnly,
+    DelegatedResume,
     Resume,
     Steer,
     Simple,
+    Journaled,
     MultiTurn,
     Approvals,
     UsageLimit,
@@ -631,9 +676,10 @@ impl Scenario {
             Scenario::PlanThenPrompt => "simple",
             Scenario::PlanToggleThenPrompt => "simple",
             Scenario::Interrupt => "interrupt",
-            Scenario::Resume => "resume",
+            Scenario::DelegatedReadOnly => "simple",
+            Scenario::Resume | Scenario::DelegatedResume => "resume",
             Scenario::Steer => "steer",
-            Scenario::Simple => "simple",
+            Scenario::Simple | Scenario::Journaled => "simple",
             Scenario::MultiTurn => "multi_turn",
             Scenario::Approvals => "approvals",
             Scenario::UsageLimit => "usage_limit",
@@ -664,12 +710,16 @@ async fn drive(scenario: Scenario, acp: &Peer, client: &Client, cwd: &str, threa
         "initialize",
         request(acp, "initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} })).await,
     ));
-    if scenario == Scenario::Resume {
+    if matches!(scenario, Scenario::Resume | Scenario::DelegatedResume) {
         let thread = thread.expect("a thread to resume");
-        out.push((
-            "load",
-            request(acp, "session/load", json!({ "sessionId": thread, "cwd": cwd, "mcpServers": [] })).await,
-        ));
+        let mut params = json!({ "sessionId": thread, "cwd": cwd, "mcpServers": [] });
+        if scenario == Scenario::DelegatedResume {
+            params["_meta"] = json!({"openidea":{"delegatedReadOnly":true}});
+        }
+        out.push(("load", request(acp, "session/load", params).await));
+        if scenario == Scenario::DelegatedResume {
+            return out;
+        }
         out.push((
             "fork",
             request(acp, "session/fork", json!({ "sessionId": thread, "cwd": cwd, "mcpServers": [] })).await,
@@ -687,8 +737,20 @@ async fn drive(scenario: Scenario, acp: &Peer, client: &Client, cwd: &str, threa
         Scenario::AuthFailure | Scenario::Simple | Scenario::UsageLimit | Scenario::Subagent => {
             out.push(("prompt", request(acp, "session/prompt", prompt("Reply with the single word: hi")).await));
         }
+        Scenario::Journaled => {
+            let mut params = prompt("Reply with the single word: hi");
+            params["_meta"]["openidea"]["processJournal"] = json!(true);
+            out.push(("prompt", request(acp, "session/prompt", params).await));
+        }
+        Scenario::DelegatedReadOnly => {
+            let mut params = prompt("Reply with the single word: hi");
+            params["_meta"] = json!({"openidea":{"delegatedReadOnly":true,"processJournal":true}});
+            out.push(("prompt", request(acp, "session/prompt", params).await));
+        }
         Scenario::Compact => {
-            out.push(("prompt", request(acp, "session/prompt", prompt("/compact")).await));
+            let mut params = prompt("/compact");
+            params["_meta"]["openidea"]["processJournal"] = json!(true);
+            out.push(("prompt", request(acp, "session/prompt", params).await));
         }
         Scenario::Command(command) => {
             out.push(("prompt", request(acp, "session/prompt", prompt(command)).await));
@@ -745,7 +807,7 @@ async fn drive(scenario: Scenario, acp: &Peer, client: &Client, cwd: &str, threa
             client.answers.lock().extend([Some("accept"), None]);
             out.push(("prompt", request(acp, "session/prompt", prompt("Run `touch b.txt`, then write a.txt.")).await));
         }
-        Scenario::Resume => unreachable!(),
+        Scenario::Resume | Scenario::DelegatedResume => unreachable!(),
     }
     out
 }
@@ -1085,6 +1147,139 @@ fn request_errors_classify_authentication_without_matching_author_or_protocol_er
     }
 }
 
+fn delegated_inventory_transcript(inventory: Value, allow_turn: bool) -> Transcript {
+    let mut transcript = load("simple");
+    let start = transcript.frames.iter().position(|(out, frame)| *out && frame["method"] == "turn/start").unwrap();
+    if !allow_turn {
+        transcript.frames.truncate(start);
+    }
+    transcript.frames.splice(
+        start..start,
+        [(true, json!({"id":99,"method":"mcpServerStatus/list"})), (false, json!({"id":99,"result":inventory}))],
+    );
+    transcript
+}
+
+#[test]
+fn delegated_codex_refuses_completion_for_another_turn() {
+    let started = json!({"turn":{"id":"expected"}});
+    assert!(delegated_completion_id(Some(&started), &json!({"id":"other"})).is_err());
+    assert!(delegated_completion_id(None, &json!({"id":"expected"})).is_err());
+    assert_eq!(delegated_completion_id(Some(&started), &json!({"id":"expected"})).unwrap(), "expected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_resume_rechecks_config_and_never_replays_another_thread() {
+    for matching in [true, false] {
+        let mut transcript = load("resume");
+        let resume =
+            transcript.frames.iter().position(|(out, frame)| *out && frame["method"] == "thread/resume").unwrap();
+        let resumed = transcript
+            .frames
+            .iter()
+            .enumerate()
+            .skip(resume + 1)
+            .find(|(_, (out, frame))| !*out && frame.get("result").is_some())
+            .map(|(i, _)| i)
+            .unwrap();
+        transcript.frames.truncate(resumed + 1);
+        if !matching {
+            transcript.frames[resumed].1["result"]["thread"]["id"] = json!("other");
+        }
+        transcript.frames.splice(
+            resume..resume,
+            [
+                (true, json!({"id":99,"method":"config/read"})),
+                (false, json!({"id":99,"result":{"config":{"mcp_servers":{"fixture":{"command":"fixture"}}}}})),
+            ],
+        );
+        let (results, client, frames, meta, _) = replay_transcript(Scenario::DelegatedResume, transcript).await;
+        let expected = meta["thread"].as_str().unwrap();
+        let params = &sent(&frames, "thread/resume")[0]["params"];
+        assert_eq!(params["config"]["mcp_servers"], json!({"fixture":{"enabled":false}}));
+        assert_eq!(params["config"]["approval_policy"], "never");
+        assert!(sent(&frames, "thread/start").is_empty());
+        if matching {
+            assert_eq!(result(&results, "load").as_ref().unwrap()["sessionId"], expected);
+        } else {
+            assert!(result(&results, "load").is_err());
+            assert!(client.text(expected, "user_message_chunk").is_empty());
+        }
+    }
+}
+
+#[test]
+fn delegated_thread_disables_every_effective_server_without_copying_credentials() {
+    let effective = json!({"config":{"mcp_servers":{
+        "one":{"command":"fixture"},
+        "two":{"url":"https://example.invalid","headers":{"secret":"fixture"}}
+    }}});
+    let config = delegated_thread_config(&effective).unwrap();
+    assert_eq!(config["mcp_servers"], json!({"one":{"enabled":false},"two":{"enabled":false}}));
+    assert_eq!(config["features"], json!({"apps":false,"plugins":false}));
+    assert_eq!(config["approval_policy"], "never");
+    assert!(delegated_thread_config(&json!({"config":{}})).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_codex_rejects_nonempty_or_incomplete_mcp_inventory() {
+    for inventory in [
+        json!({"data":[{"name":"external"}]}),
+        json!({"data":[{"name":"external","runtimeStatus":"disabled","tools":{"unexpected":{}}}]}),
+        json!({"data":[],"nextCursor":"more"}),
+        json!({}),
+    ] {
+        let (results, _, frames, _, _) =
+            replay_transcript(Scenario::DelegatedReadOnly, delegated_inventory_transcript(inventory, false)).await;
+        assert!(result(&results, "prompt").is_err());
+        assert!(sent(&frames, "turn/start").is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_codex_turn_forces_read_only_and_returns_native_identity() {
+    assert_delegated_turn_identity(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_codex_replays_only_confirmed_events_that_arrived_before_ack() {
+    assert_delegated_turn_identity(true).await;
+}
+
+async fn assert_delegated_turn_identity(early: bool) {
+    let mut transcript = delegated_inventory_transcript(
+        json!({"data":[{"name":"fixture","runtimeStatus":"disabled","tools":{}}],"nextCursor":null}),
+        true,
+    );
+    let index = transcript.frames.iter().position(|(_, frame)| frame["method"] == "item/agentMessage/delta").unwrap();
+    let thread = transcript.frames[index].1["params"]["threadId"].clone();
+    transcript.frames.splice(index..index, [
+        (false, json!({"method":"turn/started","params":{"threadId":thread,"turn":{"id":"older"}}})),
+        (false, json!({"method":"item/agentMessage/delta","params":{
+            "threadId":thread,"turnId":"older","itemId":"older-msg","delta":"STALE"
+        }})),
+        (false, json!({"method":"item/completed","params":{
+            "threadId":thread,"turnId":"older","item":{"id":"older-msg","type":"agentMessage","text":"STALE"}
+        }})),
+        (false, json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":"older","status":"completed"}}})),
+    ]);
+    if early {
+        let start = transcript.frames.iter().position(|(out, frame)| *out && frame["method"] == "turn/start").unwrap();
+        let ack = transcript.frames.remove(start + 1);
+        let completion = transcript.frames.iter().rposition(|(_, frame)| frame["method"] == "turn/completed").unwrap();
+        transcript.frames.insert(completion + 1, ack);
+    }
+    let (results, client, frames, _, _) = replay_transcript(Scenario::DelegatedReadOnly, transcript).await;
+    let start = &sent(&frames, "turn/start")[0]["params"];
+    assert_eq!(start["approvalPolicy"], "never");
+    assert_eq!(start["sandboxPolicy"]["type"], "readOnly");
+    let reply = result(&results, "prompt").as_ref().unwrap();
+    assert!(reply.pointer("/_meta/openidea/nativeTurnId").and_then(Value::as_str).is_some_and(|id| !id.is_empty()));
+    assert_eq!(reply.pointer("/_meta/openidea/nativeThreadId"), start.get("threadId"));
+    assert_eq!(reply.pointer("/_meta/openidea/processTurnSettled"), Some(&json!(true)));
+    assert_eq!(client.text(thread.as_str().unwrap(), "agent_message_chunk"), "hi");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_sent_right_after_the_prompt_interrupts_the_turn() {
     let (results, _client, frames, _) = replay(Scenario::Interrupt).await;
@@ -1238,6 +1433,23 @@ async fn a_simple_turn_streams_reasoning_text_and_usage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn journaled_codex_waits_for_start_identity_before_settling() {
+    let mut transcript = load(Scenario::Simple.file());
+    let start = transcript.frames.iter().position(|(out, frame)| *out && frame["method"] == "turn/start").unwrap();
+    let ack = transcript.frames.remove(start + 1);
+    let completion = transcript.frames.iter().rposition(|(_, frame)| frame["method"] == "turn/completed").unwrap();
+    let mut stale = transcript.frames[completion].clone();
+    stale.1["params"]["turn"]["id"] = json!("earlier-turn");
+    transcript.frames.insert(completion, stale);
+    transcript.frames.insert(completion + 2, ack);
+    let (results, client, _, _, _) = replay_transcript(Scenario::Journaled, transcript).await;
+    let reply = result(&results, "prompt").as_ref().unwrap();
+    assert_eq!(reply.pointer("/_meta/openidea/processTurnSettled"), Some(&json!(true)));
+    assert_ne!(reply.pointer("/_meta/openidea/nativeTurnId"), Some(&json!("earlier-turn")));
+    assert_eq!(client.text(&session_of(&results, "new"), "agent_message_chunk"), "hi");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unnamed_thread_is_named_after_its_first_turn() {
     let mut t = load(Scenario::Simple.file());
     t.frames.retain(|(_, f)| f["method"] != "thread/name/updated");
@@ -1305,13 +1517,16 @@ async fn compact_is_started_through_its_app_server_method() {
     let mut transcript = load(Scenario::Simple.file());
     let start = transcript
         .frames
-        .iter_mut()
-        .find(|(out, frame)| *out && frame["method"] == "turn/start")
+        .iter()
+        .position(|(out, frame)| *out && frame["method"] == "turn/start")
         .expect("the scenario starts a turn");
-    start.1["method"] = json!("thread/compact/start");
+    transcript.frames[start].1["method"] = json!("thread/compact/start");
+    transcript.frames[start + 1].1["result"] = json!({});
     let (results, _client, frames, _meta, _codex) = replay_transcript(Scenario::Compact, transcript).await;
 
-    assert_eq!(result(&results, "prompt").as_ref().unwrap(), &json!({"stopReason": "end_turn"}));
+    let reply = result(&results, "prompt").as_ref().unwrap();
+    assert_eq!(reply["stopReason"], "end_turn");
+    assert_eq!(reply.pointer("/_meta/openidea/processTurnSettled"), Some(&json!(true)));
     assert!(sent(&frames, "turn/start").is_empty());
     assert_eq!(sent(&frames, "thread/compact/start").len(), 1);
 }

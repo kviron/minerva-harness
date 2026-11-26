@@ -34,6 +34,8 @@ export const subagentWorking = (s: AgentSubagentStatus) => s === "running" || s 
 /** "Explore", else what it was started for. */
 export const subagentTitle = (e: SubagentEntry) => e.title ?? e.description ?? "Subagent";
 
+export const subagentTaskTitle = (e: SubagentEntry) => e.prompt || e.description || subagentTitle(e);
+
 export function subagentStatusLabel(s: AgentSubagentStatus): string {
   switch (s) {
     case "running":

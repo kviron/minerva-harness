@@ -33,6 +33,8 @@ async fn installed(root: &Path) -> Arc<PluginManager> {
 }
 fn context(manager: &PluginManager, call: &str) -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "session".into(),
         run_id: "run-exact".into(),
         call_id: call.into(),

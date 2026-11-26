@@ -61,6 +61,8 @@ async fn installed_language_plugin_follows_enable_and_pause_lifecycle() {
     assert_eq!(runtime.harness_call("mh-lsp.query", query).await.unwrap()["contents"], "unsaved");
     let tools = runtime.plugins.tools_for("test-session").await.unwrap();
     let ctx = ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "test-session".into(),
         run_id: "run".into(),
         call_id: "call".into(),

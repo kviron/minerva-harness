@@ -9,6 +9,7 @@ import { setContext } from "@/platform/context";
 import { useProject } from "@/platform/project";
 import {
   useContributions,
+  useWorkbenchChrome,
   type ToolWindowAnchor,
   type ToolWindowContribution,
   type ToolWindowService,
@@ -529,6 +530,8 @@ export function jumpToLastToolWindow() {
 export function showToolWindow(id: string, focus = false) {
   const slot = slotOfId(id);
   if (!slot) return;
+  const chrome = useWorkbenchChrome.getState();
+  if (focus && chrome.primary && !chrome.workspaceOpen) useWorkbenchChrome.setState({ workspaceOpen: true });
   const a = slotAnchor(slot);
   lastUsed = id;
   const s = useToolWindowLayout.getState();
@@ -578,7 +581,8 @@ export function removeFromStripe(id: string) {
 }
 
 export function toggleToolWindow(id: string) {
-  if (isToolWindowVisible(id)) hideToolWindow(id);
+  const chrome = useWorkbenchChrome.getState();
+  if (isToolWindowVisible(id) && (!chrome.primary || chrome.workspaceOpen)) hideToolWindow(id);
   else showToolWindow(id, true);
 }
 
@@ -587,7 +591,8 @@ export function toggleToolWindow(id: string) {
  * → focus; visible and focused → hide (IDEA behaviour).
  */
 export function activateToolWindow(id: string) {
-  if (!isToolWindowVisible(id)) showToolWindow(id, true);
+  const chrome = useWorkbenchChrome.getState();
+  if (!isToolWindowVisible(id) || (chrome.primary && !chrome.workspaceOpen)) showToolWindow(id, true);
   else if (useToolWindowLayout.getState().focused !== id && !isFocusWithinToolWindow(id)) focusToolWindow(id);
   else hideToolWindow(id);
 }

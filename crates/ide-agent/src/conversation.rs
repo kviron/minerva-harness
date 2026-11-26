@@ -35,6 +35,8 @@ pub(crate) struct SavedSubagent {
     pub id: String,
     pub parent: Option<String>,
     pub entries: Vec<AgentEntry>,
+    #[serde(default)]
+    pub message_ids: std::collections::HashMap<String, usize>,
 }
 
 impl Conversation {
@@ -43,7 +45,11 @@ impl Conversation {
             main: Timeline::from_entries(main),
             subagents: subagents
                 .into_iter()
-                .map(|s| Subagent { id: s.id, parent: s.parent, timeline: Timeline::from_entries(s.entries) })
+                .map(|s| {
+                    let mut timeline = Timeline::from_entries(s.entries);
+                    timeline.restore_message_ids(s.message_ids);
+                    Subagent { id: s.id, parent: s.parent, timeline }
+                })
                 .collect(),
         }
     }
@@ -51,7 +57,12 @@ impl Conversation {
     pub fn saved_subagents(&self) -> Vec<SavedSubagent> {
         self.subagents
             .iter()
-            .map(|s| SavedSubagent { id: s.id.clone(), parent: s.parent.clone(), entries: s.timeline.entries.clone() })
+            .map(|s| SavedSubagent {
+                id: s.id.clone(),
+                parent: s.parent.clone(),
+                entries: s.timeline.entries.clone(),
+                message_ids: s.timeline.message_ids(),
+            })
             .collect()
     }
 
@@ -69,7 +80,7 @@ impl Conversation {
         }
     }
 
-    fn parent_of(&self, id: &str) -> Option<&Session> {
+    pub(crate) fn parent_of(&self, id: &str) -> Option<&Session> {
         self.subagents.iter().find(|s| s.id == id).map(|s| &s.parent)
     }
 
@@ -108,6 +119,15 @@ impl Conversation {
                 if stopped && let Some(child) = self.timeline_mut(&Some(id.to_owned())) {
                     let id = Some(id.to_owned());
                     out.extend(child.end_turn(None).into_iter().map(|i| (id.clone(), i)));
+                }
+            }
+            "minerva_user_followup" => {
+                if owner.is_some()
+                    && let Some(timeline) = self.timeline_mut(&owner)
+                    && let (Some(id), Some(text)) = (update["messageId"].as_str(), update["text"].as_str())
+                {
+                    let index = timeline.user_followup(id, text, update["steered"].as_bool().unwrap_or(false));
+                    out.push((owner, index));
                 }
             }
             "session_message" | "session_message_chunk" => {
@@ -246,6 +266,7 @@ mod tests {
                 description: Some("Find the parser".into()),
                 status: AgentSubagentStatus::Done,
                 error: None,
+                fallback: None,
                 prompt: Some("Look for it".into()),
                 reply: Some("In \nparser.rs".into()),
                 tools: 1,
@@ -253,6 +274,8 @@ mod tests {
                 started_ms: 10.0,
                 ended_ms: Some(20.0),
                 cancellable: true,
+                delivery_run_id: None,
+                queued_followups: Vec::new(),
             }
         );
         assert_eq!(c.label("child").as_deref(), Some("Explore"));

@@ -200,7 +200,7 @@ export const ToolEntry = memo(function ToolEntry({
   );
 });
 
-function SubagentStatusIcon({ status }: { status: SubagentEntry["status"] }) {
+export function SubagentStatusIcon({ status }: { status: SubagentEntry["status"] }) {
   switch (status) {
     case "running":
       return <Spinner size={11} />;
@@ -266,6 +266,11 @@ export function SubagentCard({
           />
         )}
       </div>
+      {entry.fallback && (
+        <div className={styles.subagentFallback}>
+          <T>Replaced executor</T> {entry.fallback.requested} · {entry.fallback.reason}
+        </div>
+      )}
       {working && entry.activity && (
         <div className={styles.subagentActivity} title={entry.activity}>
           {shortTitle(task, entry.activity)}
@@ -303,29 +308,6 @@ export function SubagentCard({
           </div>
         </Fold>
       )}
-    </div>
-  );
-}
-
-/** The subagents of the conversation still at work, to look in on. */
-export function WorkingSubagents({ entries, onOpen }: { entries: AgentEntry[] | null; onOpen: (id: string) => void }) {
-  const tx = useTx();
-  const working = (entries ?? []).filter((e): e is SubagentEntry => e.type === "subagent" && subagentWorking(e.status));
-  if (!working.length) return null;
-  return (
-    <div className={styles.subagentStrip} aria-label={tx("Subagents at work")}>
-      {working.map((e) => (
-        <button
-          key={e.id}
-          type="button"
-          className={styles.subagentChip}
-          onClick={() => onOpen(e.id)}
-          title={e.activity ?? undefined}
-        >
-          <SubagentStatusIcon status={e.status} />
-          <span className={styles.subagentChipTitle}>{subagentTitle(e)}</span>
-        </button>
-      ))}
     </div>
   );
 }

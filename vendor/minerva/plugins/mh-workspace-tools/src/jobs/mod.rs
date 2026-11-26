@@ -6,7 +6,7 @@ mod registry;
 mod tests;
 mod tools;
 
-pub use registry::ShellJobs;
+pub use registry::{ShellJobs, ShellLaunchPause};
 use serde::Serialize;
 pub use tools::register_native_with_jobs;
 

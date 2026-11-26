@@ -12,6 +12,14 @@
   width: var(--stripe-icon-button);
   height: var(--stripe-icon-button);
 }
+.embeddedRail {
+  display: contents;
+}
+.embeddedRail > button {
+  width: var(--stripe-icon-button);
+  height: var(--stripe-icon-button);
+  align-self: center;
+}
 .spacer {
   flex: 1;
 }

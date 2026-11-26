@@ -1,11 +1,19 @@
 //! `!` commands from the composer: run in the task's folder with the user's shell, outside
 //! any turn, and handed to the agent with the next message as Claude Code's bash mode does.
 
+#[cfg(not(windows))]
 use ide_core::CancellationToken;
-use std::path::Path;
-use std::process::Stdio;
+#[cfg(not(windows))]
+use std::{path::Path, process::Stdio};
+#[cfg(not(windows))]
 use tokio::io::AsyncReadExt;
+#[cfg(not(windows))]
 use tokio::process::Command;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::run;
 
 /// Output kept from each stream; longer output keeps its tail.
 const MAX_STREAM: usize = 32 * 1024;
@@ -65,9 +73,14 @@ impl Ran {
 }
 
 /// Runs `command` with the user's shell in `cwd` until it ends or `cancel` stops it.
+#[cfg(not(windows))]
 pub(crate) async fn run(command: &str, cwd: &Path, cancel: &CancellationToken) -> Ran {
+    if cancel.is_cancelled() {
+        return Ran { error: Some("Stopped".into()), ..Ran::default() };
+    }
     let mut cmd = shell(command);
     ide_core::process::prepare(cmd.as_std_mut());
+    ide_core::process::own_group(cmd.as_std_mut());
     cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -79,13 +92,21 @@ pub(crate) async fn run(command: &str, cwd: &Path, cancel: &CancellationToken) -
     let finished = async move {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let _ = tokio::join!(out.read_to_end(&mut stdout), err.read_to_end(&mut stderr));
-        let code = child.wait().await.ok().and_then(|s| s.code());
-        Ran { code, stdout: tail(&stdout), stderr: tail(&stderr), error: None }
+        (stdout, stderr)
     };
     tokio::select! {
-        ran = finished => ran,
-        // Dropping the child kills it.
-        () = cancel.cancelled() => Ran { error: Some("Stopped".into()), ..Ran::default() },
+        ran = async {
+            let (stdout, stderr) = finished.await;
+            let code = child.wait().await.ok().and_then(|s| s.code());
+            Ran { code, stdout: tail(&stdout), stderr: tail(&stderr), error: None }
+        } => ran,
+        () = cancel.cancelled() => {
+            if let Some(pid) = child.id() {
+                let _ = tokio::task::spawn_blocking(move || ide_core::process::kill_tree_of(pid)).await;
+            }
+            let _ = child.kill().await;
+            Ran { error: Some("Stopped".into()), ..Ran::default() }
+        },
     }
 }
 
@@ -94,14 +115,6 @@ fn shell(command: &str) -> Command {
     let shell = std::env::var("SHELL").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "/bin/sh".into());
     let mut cmd = Command::new(shell);
     cmd.arg("-c").arg(command);
-    cmd
-}
-
-#[cfg(windows)]
-fn shell(command: &str) -> Command {
-    let mut cmd = Command::new(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()));
-    // `/S /C "…"` runs the line as typed: cmd strips only the outer quotes.
-    cmd.raw_arg("/D /S /C \"").raw_arg(command).raw_arg("\"");
     cmd
 }
 

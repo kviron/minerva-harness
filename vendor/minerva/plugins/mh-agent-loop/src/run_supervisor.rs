@@ -53,29 +53,83 @@ impl AgentLoopService {
         }
     }
 }
+enum RunOrigin<'a> {
+    Existing,
+    User,
+    DelegatedChild,
+    Wake(&'a minerva_plugin_sdk::delegation::Caller, i64, Option<&'a mh_sessions::delegation::WakeQuestion>),
+}
+
+pub use crate::policy::CheckoutWriteLease;
 pub use mh_sessions::{RunHandle, RunMessage, RunSnapshot, StartRunRequest};
 impl AgentLoopService {
     pub async fn start_run(&self, request: StartRunRequest) -> Result<RunHandle, String> {
-        self.start(request, PolicyAdmission::Snapshot).await
+        self.start(request, PolicyAdmission::Snapshot, RunOrigin::Existing).await
     }
 
     /// Trusted IDE entry, after the native adapter checks workspace membership.
-    pub async fn start_native_api_run(&self, request: StartRunRequest) -> Result<RunHandle, String> {
+    pub async fn start_native_api_run(
+        &self,
+        request: StartRunRequest,
+        checkout_lease: Option<Arc<dyn CheckoutWriteLease>>,
+    ) -> Result<RunHandle, String> {
         let plugins = self.plugins.upgrade().ok_or("plugin services are stopped")?;
         let api = request.model.strip_prefix("api:").and_then(|model| model.split_once('/'));
         if !plugins.harness.local || !api.is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()) {
             return Err("Native policy admission requires a local API conversation".into());
         }
-        self.start(request, PolicyAdmission::NativeUserMutable).await
+        self.start(request, PolicyAdmission::NativeUserMutable(checkout_lease), RunOrigin::User).await
     }
 
-    async fn start(&self, mut request: StartRunRequest, admission: PolicyAdmission) -> Result<RunHandle, String> {
+    pub async fn start_delegation_wake(
+        &self,
+        caller: &minerva_plugin_sdk::delegation::Caller,
+        generation: i64,
+        request: StartRunRequest,
+    ) -> Result<RunHandle, String> {
+        self.start(request, PolicyAdmission::DelegationReadOnly, RunOrigin::Wake(caller, generation, None)).await
+    }
+
+    pub async fn start_question_wake(
+        &self,
+        caller: &minerva_plugin_sdk::delegation::Caller,
+        generation: i64,
+        question: &mh_sessions::delegation::WakeQuestion,
+        request: StartRunRequest,
+    ) -> Result<RunHandle, String> {
+        self.start(request, PolicyAdmission::DelegationReadOnly, RunOrigin::Wake(caller, generation, Some(question)))
+            .await
+    }
+
+    pub async fn start_delegated_child(&self, request: StartRunRequest) -> Result<RunHandle, String> {
+        self.start(request, PolicyAdmission::DelegationReadOnly, RunOrigin::DelegatedChild).await
+    }
+
+    pub async fn start_delegated_child_with_checkout(
+        &self,
+        request: StartRunRequest,
+        ceiling: crate::tools::PermissionPolicy,
+        lease: Arc<dyn CheckoutWriteLease>,
+    ) -> Result<RunHandle, String> {
+        if !lease.authorizes_child(&request.session_id, &request.request_id) || !lease.may_write() {
+            return Err("Checkout lease does not authorize this child activation".into());
+        }
+        self.start(request, PolicyAdmission::DelegationWritable(ceiling, lease), RunOrigin::DelegatedChild).await
+    }
+
+    async fn start(
+        &self,
+        mut request: StartRunRequest,
+        admission: PolicyAdmission,
+        origin: RunOrigin<'_>,
+    ) -> Result<RunHandle, String> {
         let stopped = self.stopped.lock().await;
         if *stopped {
             return Err("runtime is stopped".into());
         }
         let plugins = self.plugins.upgrade().ok_or("plugin services are stopped")?;
         self.sessions.get(&request.session_id)?;
+        admission.check(&self.sessions, &request.session_id)?;
         if let Some(value) = request.options.get("attachments") {
             let supplied: Vec<minerva_plugin_sdk::context::AttachmentRef> =
                 serde_json::from_value(value.clone()).map_err(|_| "Invalid attachment references")?;
@@ -102,7 +156,17 @@ impl AgentLoopService {
         let mut tasks = self.tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         let created_at = self.sessions.server_timestamp()?;
-        let accepted = self.sessions.accept_run(&request, &created_at)?;
+        let accepted = match origin {
+            RunOrigin::Existing => self.sessions.accept_run(&request, &created_at),
+            RunOrigin::User => self.sessions.accept_user_run(&request, &created_at),
+            RunOrigin::DelegatedChild => self.sessions.accept_delegated_child_run(&request, &created_at),
+            RunOrigin::Wake(caller, generation, Some(question)) => {
+                self.sessions.accept_question_wake_run(caller, generation, question, &request, &created_at)
+            }
+            RunOrigin::Wake(caller, generation, None) => {
+                self.sessions.accept_wake_run(caller, generation, &request, &created_at)
+            }
+        }?;
         let handle = RunHandle { session_id: request.session_id.clone(), run_id: request.request_id.clone() };
         if !accepted {
             return Ok(handle);
@@ -131,7 +195,7 @@ impl AgentLoopService {
                 created_at,
                 options: request.options,
             };
-            let result = run_inner(&sessions, &plugins, &session, execution, &mut guard, true, admission).await;
+            let result = run_inner(&sessions, &plugins, &session, execution, &mut guard, true, &admission).await;
             if let Err(error) = result {
                 let _ = sessions.fail_run(&session, &run_id, *guard.cancel.borrow(), &error);
             }
@@ -155,13 +219,14 @@ impl AgentLoopService {
         }
         let plugins = self.plugins.upgrade().ok_or("plugin services are stopped")?;
         let sessions = self.sessions.clone();
+        PolicyAdmission::Snapshot.check(&sessions, &session)?;
         let mut guard = self.runs.acquire(&session, &request.response_id)?;
         let (send, receive) = tokio::sync::oneshot::channel();
         let mut tasks = self.tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         tasks.push(tokio::spawn(async move {
             let result =
-                run_inner(&sessions, &plugins, &session, request, &mut guard, false, PolicyAdmission::Snapshot).await;
+                run_inner(&sessions, &plugins, &session, request, &mut guard, false, &PolicyAdmission::Snapshot).await;
             let _ = send.send(result);
         }));
         drop(tasks);

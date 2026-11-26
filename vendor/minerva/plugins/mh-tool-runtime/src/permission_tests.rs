@@ -3,6 +3,8 @@ use std::sync::atomic::AtomicUsize;
 
 fn context(policy: PermissionPolicy) -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "session".into(),
         run_id: "run".into(),
         call_id: "call".into(),
@@ -175,6 +177,36 @@ impl LivePermissionPolicy for MutablePolicy {
 }
 
 #[tokio::test]
+async fn policy_tightening_while_notifying_running_blocks_the_tool() {
+    struct TighteningSink(Arc<MutablePolicy>);
+    impl ToolEventSink for TighteningSink {
+        fn emit(
+            &self,
+            _: &ToolContext,
+            _: &str,
+            _: &Value,
+            status: &str,
+            _: Option<&Result<Value, String>>,
+        ) -> Result<(), String> {
+            if status == "running" {
+                *self.0 .0.lock().unwrap() = PermissionPolicy::ReadOnly;
+            }
+            Ok(())
+        }
+    }
+    let executions = Arc::new(AtomicUsize::new(0));
+    let policy = Arc::new(MutablePolicy(Mutex::new(PermissionPolicy::Allow)));
+    let mut context = context(PermissionPolicy::Allow);
+    context.live_policy = Some(policy.clone());
+    context.sink = Some(Arc::new(TighteningSink(policy)));
+    assert_eq!(
+        tools(true, executions.clone()).execute("operation", json!({}), context).await.unwrap_err(),
+        "tool writes are forbidden in read-only mode"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn read_only_change_invalidates_pending_approval() {
     let executions = Arc::new(AtomicUsize::new(0));
     let tools = tools(true, executions.clone());
@@ -233,4 +265,18 @@ async fn unavailable_live_policy_does_not_execute_writes() {
     context.live_policy = Some(Arc::new(FailedPolicy));
     assert_eq!(tools.execute("operation", json!({}), context).await.unwrap_err(), "policy unavailable");
     assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn write_barrier_is_shared_between_tool_snapshots_cloned_for_a_run() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let admitted = tools(true, executions.clone());
+    let dispatch = admitted.clone();
+    let barrier = admitted.try_quiesce_writes().unwrap();
+    let denied = dispatch.execute("operation", json!({}), context(PermissionPolicy::Allow)).await;
+    assert_eq!(denied.unwrap_err(), "Tool writes are paused");
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    drop(barrier);
+    dispatch.execute("operation", json!({}), context(PermissionPolicy::Allow)).await.unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
 }

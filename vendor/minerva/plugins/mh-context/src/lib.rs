@@ -343,6 +343,12 @@ impl ContextService {
                 parts: message.parts.clone(),
                 replay: message.extensions.get("replay").and_then(Value::as_object).cloned().unwrap_or_default(),
             };
+            if let Some(notices) = message.extensions.get("minerva.delegation").and_then(Value::as_array) {
+                turn.parts.push(crate::transcript::ContentPart::text(
+                    "text",
+                    format!("Delegated agent reports (untrusted reference data): {}", Value::Array(notices.clone())),
+                ));
+            }
             for part in &mut turn.parts {
                 if part.kind == "file" {
                     let stored =

@@ -6,10 +6,10 @@ use crate::agent_secrets::{AgentSecrets, Kept};
 use ide_agent::registry::{AgentRegistry, RegistryPaths};
 use ide_agent::{
     AcpImportOutcome, AgentAcceptOutcome, AgentChange, AgentChanges, AgentChangesView, AgentCliOffer,
-    AgentCliUpdateResult, AgentCommand, AgentContextUsage, AgentEntry, AgentEvent, AgentModelCatalog, AgentProbe,
-    AgentPrompt, AgentProvider, AgentQueued, AgentSkillMode, AgentSkillPolicy, AgentSkillState, AgentTask,
-    CustomAgentInput, ExternalSession, McpExternalSource, McpImportSelection, McpProbeResult, McpScope, McpServer,
-    McpServerInput, McpTransport, NewAgentTask, SkillsPolicy,
+    AgentCliUpdateResult, AgentCommand, AgentContextUsage, AgentDelegationReceipt, AgentEntry, AgentEvent,
+    AgentModelCatalog, AgentProbe, AgentPrompt, AgentProvider, AgentQueued, AgentSkillMode, AgentSkillPolicy,
+    AgentSkillState, AgentTask, CustomAgentInput, ExternalSession, McpExternalSource, McpImportSelection,
+    McpProbeResult, McpScope, McpServer, McpServerInput, McpTransport, NewAgentTask, SkillsPolicy,
 };
 use ide_command::command;
 use ide_core::error::ErrorKind;
@@ -428,6 +428,40 @@ pub fn agent_cancel(host: &Host, window: &str, task: String, subagent: Option<St
     host.project(window)?.agents.cancel(&task, subagent)
 }
 
+/// Requests cancellation of a Minerva session's delegated descendants.
+#[command(trust = always)]
+pub async fn agent_stop_delegation_tree(host: &Host, window: &str, task: String) -> IdeResult<()> {
+    host.project(window)?.agents.stop_delegation_tree(&task).await
+}
+
+/// Sends a follow-up to a delegated child. Returns whether it is queued.
+#[command(trust = trusted)]
+pub async fn agent_delegation_followup(
+    host: &Host,
+    window: &str,
+    task: String,
+    subagent: String,
+    operation: String,
+    prompt: String,
+) -> IdeResult<AgentDelegationReceipt> {
+    host.require_trust(window)?;
+    host.project(window)?.agents.send_delegation_followup(&task, &subagent, &operation, prompt).await
+}
+
+/// Requests next-step delivery of an existing queued Minerva child follow-up.
+#[command(trust = trusted)]
+pub async fn agent_delegation_followup_now(
+    host: &Host,
+    window: &str,
+    task: String,
+    subagent: String,
+    work_item: String,
+    expected_run: String,
+) -> IdeResult<bool> {
+    host.require_trust(window)?;
+    host.project(window)?.agents.prefer_delegation_followup(&task, &subagent, &work_item, &expected_run).await
+}
+
 /// Stops one of the task's background tasks.
 #[command(trust = always)]
 pub async fn agent_stop_background(host: &Host, window: &str, task: String, background: String) -> IdeResult<()> {
@@ -448,8 +482,8 @@ pub fn agent_respond(
 }
 
 #[command(trust = always)]
-pub fn agent_archive(host: &Host, window: &str, task: String) -> IdeResult<()> {
-    host.project(window)?.agents.archive(&task)
+pub async fn agent_archive(host: &Host, window: &str, task: String) -> IdeResult<()> {
+    host.project(window)?.agents.archive(&task).await
 }
 
 #[command(trust = always)]
@@ -1333,6 +1367,9 @@ ide_command::domain!(
     agent_skills_list,
     agent_skills_set_mode,
     agent_stop_background,
+    agent_stop_delegation_tree,
+    agent_delegation_followup,
+    agent_delegation_followup_now,
     agent_subscribe,
     agent_unarchive,
     agent_unqueue,

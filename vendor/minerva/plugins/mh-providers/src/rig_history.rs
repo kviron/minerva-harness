@@ -12,10 +12,16 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 pub fn capture(messages: &[Message]) -> Result<Transcript, String> {
+    capture_with_followups(messages, &[])
+}
+
+fn capture_with_followups(messages: &[Message], notices: &[FollowupNotice]) -> Result<Transcript, String> {
     let mut transcript = Transcript::default();
-    for message in messages {
+    let mut assistant_index = 0;
+    for (index, message) in messages.iter().enumerate() {
         match message {
             Message::Assistant(m) => {
+                assistant_index += 1;
                 for part in &m.content {
                     match part {
                         AssistantContent::Text(t) => transcript.parts.push(ContentPart::text("text", &t.text)),
@@ -35,6 +41,10 @@ pub fn capture(messages: &[Message]) -> Result<Transcript, String> {
                 }
             }
             Message::User { content } => {
+                let notice = (index + 1 == messages.len()
+                    || matches!(messages.get(index + 1), Some(Message::Assistant(_))))
+                .then(|| notices.iter().find(|notice| notice.assistant_index == assistant_index))
+                .flatten();
                 for part in content {
                     match part {
                         UserContent::ToolResult(r) => transcript.parts.push(ContentPart::result(ToolResult {
@@ -43,6 +53,13 @@ pub fn capture(messages: &[Message]) -> Result<Transcript, String> {
                             is_error: r.is_error,
                         })),
                         // Corrective feedback belongs to the provider transcript, not user-authored text.
+                        UserContent::Text(text) if notice.is_some() => {
+                            let notice = notice.expect("matched follow-up");
+                            transcript.parts.push(ContentPart {
+                                kind: "extension".into(),
+                                data: json!({"source":"delegation-followup","workItemId":notice.work_item_id,"text":text.text}),
+                            });
+                        }
                         other => transcript.parts.push(ContentPart {
                             kind: "extension".into(),
                             data: json!({"provider":"rig","content":other}),
@@ -197,12 +214,19 @@ fn push_message(out: &mut Vec<Message>, message: Message) {
 #[derive(Default)]
 struct HistoryState {
     messages: Vec<Message>,
+    followups: Vec<FollowupNotice>,
     model_message: Option<AssistantMessage>,
     active: Vec<ContentPart>,
     reasoning_parts: std::collections::HashMap<usize, usize>,
     tool_states: std::collections::HashMap<String, serde_json::Value>,
     usage: Vec<serde_json::Value>,
     notices: Vec<(usize, ContentPart)>,
+}
+
+struct FollowupNotice {
+    assistant_index: usize,
+    work_item_id: String,
+    prompt: String,
 }
 
 #[derive(Clone)]
@@ -212,6 +236,18 @@ pub struct HistoryHook {
 }
 
 impl HistoryHook {
+    pub(crate) fn stage_followup(&self, work_item_id: &str, prompt: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let assistant_index = state.messages.iter().filter(|message| matches!(message, Message::Assistant(_))).count();
+        state.messages.push(Message::user(prompt));
+        state.followups.push(FollowupNotice {
+            assistant_index,
+            work_item_id: work_item_id.into(),
+            prompt: prompt.into(),
+        });
+        self.publish(&state)
+    }
+
     pub fn new(sink: TranscriptSink) -> Self {
         Self { state: Arc::new(Mutex::new(HistoryState::default())), sink }
     }
@@ -242,14 +278,25 @@ impl HistoryHook {
     }
     pub fn finish(&self, messages: &[Message]) -> Result<Transcript, String> {
         let mut state = self.state.lock().map_err(|e| e.to_string())?;
-        state.messages = messages.to_vec();
+        let mut canonical = messages.to_vec();
+        for notice in &state.followups {
+            let position = canonical
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| matches!(message, Message::Assistant(_)))
+                .nth(notice.assistant_index)
+                .map(|(position, _)| position)
+                .ok_or("Subagent follow-up has no final model response")?;
+            canonical.insert(position, Message::user(&notice.prompt));
+        }
+        state.messages = canonical;
         state.active.clear();
         state.reasoning_parts.clear();
         self.publish(&state)?;
         self.snapshot(&state)
     }
     fn snapshot(&self, state: &HistoryState) -> Result<Transcript, String> {
-        let mut transcript = capture(&state.messages)?;
+        let mut transcript = capture_with_followups(&state.messages, &state.followups)?;
         if !state.usage.is_empty() {
             transcript.replay.insert("usage".into(), json!(state.usage));
         }
@@ -444,6 +491,28 @@ impl crate::tools::ToolEventSink for HistoryHook {
 #[cfg(test)]
 mod stream_tests {
     #[test]
+    fn delivered_followup_survives_final_history_replacement() {
+        use super::{AssistantContent, AssistantMessage, HistoryHook, Message};
+        use std::sync::Arc;
+
+        let hook = HistoryHook::new(Arc::new(|_| Ok(())));
+        let native = vec![
+            Message::Assistant(AssistantMessage::new(vec![AssistantContent::text("first")])),
+            Message::Assistant(AssistantMessage::new(vec![AssistantContent::text("second")])),
+        ];
+        hook.state.lock().unwrap().messages = vec![native[0].clone()];
+        hook.stage_followup("work-one", "narrow the search").unwrap();
+        let transcript = hook.finish(&native).unwrap();
+        let notices: Vec<_> =
+            transcript.parts.iter().filter(|part| part.data["source"] == "delegation-followup").collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].data["workItemId"], "work-one");
+        assert_eq!(notices[0].data["text"], "narrow the search");
+        let canonical: Vec<Message> = serde_json::from_value(transcript.replay["rig-v1"].clone()).unwrap();
+        assert_eq!(canonical, vec![native[0].clone(), Message::user("narrow the search"), native[1].clone()]);
+    }
+
+    #[test]
     fn selection_notice_rejects_unfinished_fragments_without_reordering_them() {
         let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let snapshots = saved.clone();
@@ -474,6 +543,8 @@ mod stream_tests {
         use crate::tools::{ToolContext, ToolEventSink};
         let hook = HistoryHook::new(Arc::new(|_| Ok(())));
         let context = ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "s".into(),
             run_id: "r".into(),
             call_id: "c".into(),
@@ -517,6 +588,8 @@ mod stream_tests {
             .messages
             .push(Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(call)])));
         let context = ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "session".into(),
             run_id: "run".into(),
             call_id: "shell-call".into(),

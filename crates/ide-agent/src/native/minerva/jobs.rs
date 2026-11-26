@@ -8,6 +8,7 @@ use std::{
 };
 
 const SNAPSHOT_OUTPUT_BYTES: usize = 64 * 1024;
+static SNAPSHOT_SEQUENCE: parking_lot::Mutex<u64> = parking_lot::Mutex::new(0);
 
 impl Engine {
     pub(super) fn watch_jobs(&self, runtime: &Arc<Runtime>, session: &str) -> Result<(), String> {
@@ -41,42 +42,19 @@ impl Engine {
                     _ = client.closed() => break,
                     _ = interval.tick() => {},
                 }
-                if !changes.has_changed().unwrap_or(true) && previous.as_array().is_some_and(Vec::is_empty) {
+                let dirty = changes.has_changed().unwrap_or(true);
+                if !dirty && previous.as_array().is_some_and(Vec::is_empty) {
                     continue;
                 }
+                // Mark the observed changes before sampling so a concurrent job update stays pending.
+                changes.borrow_and_update();
                 // Sampling also recovers a roster received during session/load replay.
-                let mut tasks = Vec::new();
-                let mut active = false;
-                let listed = jobs.list(&session);
-                let output_limit = (SNAPSHOT_OUTPUT_BYTES / listed.len().max(1)).min(8 * 1024);
-                for job in listed {
-                    active |= job.status.is_active();
-                    let mut label = job.command.lines().next().unwrap_or_default().to_owned();
-                    if label.len() > 512 {
-                        let mut end = 512;
-                        while !label.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        label.truncate(end);
-                    }
-                    let mut output = job.stdout;
-                    if !job.stderr.is_empty() {
-                        output.push_str("\n[stderr]\n");
-                        output.push_str(&job.stderr);
-                    }
-                    if job.truncated {
-                        output.insert_str(0, "[earlier output omitted]\n");
-                    }
-                    tasks.push(json!({
-                        "task_id":job.id,"task_type":"local_bash","description":label,
-                        "started_ms":job.started_at,"output":crate::background::output_tail_with_limit(&output,output_limit),
-                        "status":job.status,
-                    }));
-                }
+                let Ok((revision, tasks, active)) = snapshot(&runtime, &session) else { break };
                 let snapshot = json!(tasks);
-                if snapshot != previous || active || last_sent.elapsed() >= Duration::from_secs(5) {
+                if dirty || snapshot != previous || active || last_sent.elapsed() >= Duration::from_secs(5) {
                     let update = json!({"sessionId":session,"update":{
                         "sessionUpdate":crate::BACKGROUND_TASKS_UPDATE,"tasks":snapshot,
+                        "backgroundRevision":revision,
                     }});
                     if client.notify("session/update", update).is_err() {
                         break;
@@ -84,8 +62,6 @@ impl Engine {
                     previous = snapshot;
                     last_sent = Instant::now();
                 }
-                // A watch receiver does not consume the model's output cursor.
-                changes.borrow_and_update();
             }
             if let Some(run) = runs.lock().get(&session).cloned() {
                 run.cancelled.store(true, super::Ordering::Release);
@@ -98,4 +74,40 @@ impl Engine {
         });
         Ok(())
     }
+}
+
+pub(super) fn snapshot(runtime: &Runtime, session: &str) -> Result<(u64, Vec<Value>, bool), String> {
+    let jobs = runtime.plugins.jobs()?;
+    let (revision, listed) = {
+        let mut sequence = SNAPSHOT_SEQUENCE.lock();
+        *sequence += 1;
+        (*sequence, jobs.list(session))
+    };
+    let mut tasks = Vec::new();
+    let active = listed.iter().any(|job| job.status.is_active());
+    let output_limit = (SNAPSHOT_OUTPUT_BYTES / listed.len().max(1)).min(8 * 1024);
+    for job in listed {
+        let mut label = job.command.lines().next().unwrap_or_default().to_owned();
+        if label.len() > 512 {
+            let mut end = 512;
+            while !label.is_char_boundary(end) {
+                end -= 1;
+            }
+            label.truncate(end);
+        }
+        let mut output = job.stdout;
+        if !job.stderr.is_empty() {
+            output.push_str("\n[stderr]\n");
+            output.push_str(&job.stderr);
+        }
+        if job.truncated {
+            output.insert_str(0, "[earlier output omitted]\n");
+        }
+        tasks.push(json!({
+            "task_id":job.id,"task_type":"local_bash","description":label,
+            "started_ms":job.started_at,"output":crate::background::output_tail_with_limit(&output,output_limit),
+            "status":job.status,
+        }));
+    }
+    Ok((revision, tasks, active))
 }

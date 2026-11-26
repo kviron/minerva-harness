@@ -112,6 +112,8 @@ fn definition(name: &str, side_effect: bool) -> ToolDefinition {
 }
 fn context(cwd: Option<std::path::PathBuf>) -> ToolContext {
     ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "session".into(),
         run_id: "run".into(),
         call_id: "call".into(),

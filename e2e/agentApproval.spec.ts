@@ -64,7 +64,7 @@ for (const choice of ["codex-trust-project", "codex-keep-untrusted"]) {
   test(`project trust has explicit choices and submits ${choice}`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width: 1050, height: 800 });
     await page.goto("/");
-    await page.getByRole("tree", { name: "Project" }).waitFor();
+    await page.getByRole("button", { name: "Workspace mode" }).waitFor();
     await page.evaluate(
       async ({ task }) => {
         const path = "/src/features/agents/store.ts";
@@ -129,7 +129,7 @@ for (const theme of ["dark", "light"] as const) {
     test(`approval is asked above the composer at ${width}px in ${theme}`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
       await page.goto("/");
-      await page.getByRole("tree", { name: "Project" }).waitFor();
+      await page.getByRole("button", { name: "Workspace mode" }).waitFor();
       await page.evaluate(
         async ({ task, entries, theme }) => {
           const path = "/src/features/agents/store.ts";
@@ -217,3 +217,52 @@ for (const theme of ["dark", "light"] as const) {
     });
   }
 }
+
+test("a subagent file approval keeps attribution and one-call decisions in the parent chat", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 850, height: 720 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Workspace mode" }).waitFor();
+  const parent = { ...task, title: "Review workspace", provider: "minerva" };
+  const approval: AgentEntry = {
+    type: "permission",
+    id: 42,
+    title: 'Subagent (Codex): Allow write_file on "src/config.ts" for this call?',
+    command: null,
+    options: [
+      { id: "allow", name: "Allow once", kind: "allow_once" },
+      { id: "deny", name: "Deny", kind: "reject_once" },
+    ],
+    chosen: null,
+  };
+  await page.evaluate(
+    async ({ parent, approval }) => {
+      const storePath = "/src/features/agents/store.ts";
+      const store = await import(storePath);
+      const themePath = "/src/workbench/theme.ts";
+      (await import(themePath)).previewTheme("dark");
+      store.useAgents.setState({
+        loaded: true,
+        tasks: new Map([[parent.id, parent]]),
+        entries: new Map([[parent.id, [approval]]]),
+      });
+      store.openTaskInEditorLocation(parent.id);
+      const ipcPath = "/src/platform/ipc.ts";
+      (await import(ipcPath)).commands.agentRespond = async (task: string, permission: number, option: string) => {
+        (window as unknown as { fileApprovalAnswer: unknown }).fileApprovalAnswer = { task, permission, option };
+        return { status: "ok", data: null };
+      };
+    },
+    { parent, approval },
+  );
+  const card = page.getByRole("region", { name: "Allow tool call?" });
+  await expect(card).toBeVisible();
+  await expect(card).toContainText('Subagent (Codex): Allow write_file on "src/config.ts"');
+  await expect(card.getByRole("button")).toHaveText(["Allow Once", "Deny"]);
+  await page.screenshot({ path: testInfo.outputPath("subagent-file-approval.png"), animations: "disabled" });
+  await card.getByRole("button", { name: "Deny", exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { fileApprovalAnswer?: unknown }).fileApprovalAnswer))
+    .toEqual({ task: parent.id, permission: 42, option: "deny" });
+});

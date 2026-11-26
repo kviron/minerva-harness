@@ -6,17 +6,29 @@ use crate::{
 };
 use serde_json::{json, Map};
 
-#[derive(Clone, Copy)]
 pub(crate) enum PolicyAdmission {
     Snapshot,
-    NativeUserMutable,
+    DelegationReadOnly,
+    DelegationWritable(crate::tools::PermissionPolicy, std::sync::Arc<dyn crate::policy::CheckoutWriteLease>),
+    NativeUserMutable(Option<std::sync::Arc<dyn crate::policy::CheckoutWriteLease>>),
 }
 
 impl PolicyAdmission {
-    fn ceiling(self, initial: crate::tools::PermissionPolicy) -> crate::tools::PermissionPolicy {
+    pub(crate) fn check(&self, store: &SessionService, session: &str) -> Result<(), String> {
+        if !matches!(self, Self::DelegationReadOnly | Self::DelegationWritable(..))
+            && store.is_internal_delegation_session(session).map_err(|error| error.to_string())?
+        {
+            return Err("Delegated child sessions require a delegation activation".into());
+        }
+        Ok(())
+    }
+
+    fn ceiling(&self, initial: crate::tools::PermissionPolicy) -> crate::tools::PermissionPolicy {
         match self {
             Self::Snapshot => initial,
-            Self::NativeUserMutable => crate::tools::PermissionPolicy::Allow,
+            Self::DelegationReadOnly => crate::tools::PermissionPolicy::ReadOnly,
+            Self::DelegationWritable(ceiling, _) => initial.restrict(*ceiling),
+            Self::NativeUserMutable(_) => crate::tools::PermissionPolicy::Allow,
         }
     }
 }
@@ -50,7 +62,12 @@ struct Settlement<'a> {
 impl Drop for Settlement<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            let _ = self.store.fail_run(self.session, &self.id, false, "Запуск прерван до сохранения результата.");
+            let _ = self.store.fail_run(
+                self.session,
+                &self.id,
+                false,
+                "Р—Р°РїСѓСЃРє РїСЂРµСЂРІР°РЅ РґРѕ СЃРѕС…СЂР°РЅРµРЅРёСЏ СЂРµР·СѓР»СЊС‚Р°С‚Р°.",
+            );
         }
     }
 }
@@ -62,8 +79,9 @@ pub async fn run(
     id: &str,
     request: RunRequest,
 ) -> Result<SessionRunResult, String> {
+    PolicyAdmission::Snapshot.check(store, id)?;
     let mut guard = runs.acquire(id, &request.response_id)?;
-    run_inner(store, manager, id, request, &mut guard, false, PolicyAdmission::Snapshot).await
+    run_inner(store, manager, id, request, &mut guard, false, &PolicyAdmission::Snapshot).await
 }
 
 pub(crate) async fn run_inner(
@@ -73,7 +91,7 @@ pub(crate) async fn run_inner(
     request: RunRequest,
     guard: &mut crate::runs::RunGuard,
     accepted: bool,
-    admission: PolicyAdmission,
+    admission: &PolicyAdmission,
 ) -> Result<SessionRunResult, String> {
     let messages = store.branch(id, &request.last_message_id)?;
     let parent = messages.last().and_then(|m| m.parent_id.clone());
@@ -85,7 +103,10 @@ pub(crate) async fn run_inner(
             })
     }) || request.created_at.is_empty()
     {
-        return Err("Нужно непустое сообщение пользователя и время ответа.".into());
+        return Err(
+            "РќСѓР¶РЅРѕ РЅРµРїСѓСЃС‚РѕРµ СЃРѕРѕР±С‰РµРЅРёРµ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ Рё РІСЂРµРјСЏ РѕС‚РІРµС‚Р°."
+                .into(),
+        );
     }
     let namespace = crate::engine::model_ref(&request.model).map(|(id, _)| format!("plugin:{id}"));
     if namespace.is_some() && request.options.get("toolAllowlist").is_some() {
@@ -171,6 +192,9 @@ pub(crate) async fn run_inner(
             run: request.response_id.clone(),
         };
         let settings = manager.harness.context.workspace_get(id)?;
+        let registrations = request.options.get("delegationToolRegistrations")
+            .map(|value| serde_json::from_value::<std::collections::BTreeMap<String, u64>>(value.clone()))
+            .transpose().map_err(|_| "Invalid delegation registration scope")?;
         let allowlist = match request.options.get("toolAllowlist") {
             None => None,
             Some(value) => {
@@ -179,25 +203,42 @@ pub(crate) async fn run_inner(
                 Some(names.iter().map(|v| v.as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_owned).ok_or("invalid toolAllowlist entry")).collect::<Result<Vec<_>,_>>()?)
             }
         };
+        let tools = tokio::select! {
+                biased;
+                _ = async { if !*guard.cancel.borrow() { let _ = guard.cancel.changed().await; } } => return Err("Run cancelled".into()),
+                tools = manager.tools_for(id) => { let tools = tools?; let tools = match &allowlist { Some(names) => tools.restrict_to(names), None => tools }; match &registrations { Some(scope) => tools.restrict_delegation(scope, matches!(admission, PolicyAdmission::DelegationWritable(..))), None => tools } },
+            };
         let run_context = crate::harness::AgentRunContext {
             session_id: id.into(),
             run_id: request.response_id.clone(),
-            tools: tokio::select! {
-                biased;
-                _ = async { if !*guard.cancel.borrow() { let _ = guard.cancel.changed().await; } } => return Err("Run cancelled".into()),
-                tools = manager.tools_for(id) => { let tools = tools?; match &allowlist { Some(names) => tools.restrict_to(names), None => tools } },
-            },
+            tools: tools.clone(),
             context: manager.harness.context.clone(),
             messages,
             reasoning_effort,
             selection,
+            followups: (registrations.is_some() && request.model.starts_with("api:")).then(|| {
+                std::sync::Arc::new(crate::followups::RunFollowups::new(store.clone(), id, &request.response_id))
+                    as std::sync::Arc<dyn crate::providers::FollowupControl>
+            }),
             tool_context: crate::tools::ToolContext {
+                delegation_reads: Default::default(),
+                write_approved: false,
                 session_id: id.into(),
                 run_id: request.response_id.clone(),
                 call_id: String::new(),
                 cwd: settings.cwd.map(std::path::PathBuf::from),
                 policy: admission.ceiling(settings.permission_policy),
-                live_policy: Some(manager.harness.context.clone()),
+                live_policy: Some(crate::policy::for_session(
+                    store,
+                    id,
+                    manager.harness.context.clone(),
+                    match admission {
+                        PolicyAdmission::NativeUserMutable(lease) => lease.clone(),
+                        PolicyAdmission::DelegationWritable(_, lease) => Some(lease.clone()),
+                        _ => None,
+                    },
+                    tools,
+                )?),
                 cancellation,
                 interactions: manager.harness.interactions.clone(),
                 sink: None,
@@ -213,7 +254,7 @@ pub(crate) async fn run_inner(
         } else {
             tokio::select! {
                 biased;
-                _ = async { if !*guard.cancel.borrow() { let _ = guard.cancel.changed().await; } } => Err("Запрос отменён.".to_string()),
+                _ = async { if !*guard.cancel.borrow() { let _ = guard.cancel.changed().await; } } => Err("Р—Р°РїСЂРѕСЃ РѕС‚РјРµРЅС‘РЅ.".to_string()),
                 result = execute(manager,&effective_model,turns,sink,run_context) => result,
             }
         }
@@ -223,7 +264,7 @@ pub(crate) async fn run_inner(
             return Err("Run cancelled".into());
         }
         if result.parts.is_empty() {
-            return Err("Модель не вернула содержимое ответа.".into());
+            return Err("РњРѕРґРµР»СЊ РЅРµ РІРµСЂРЅСѓР»Р° СЃРѕРґРµСЂР¶РёРјРѕРµ РѕС‚РІРµС‚Р°.".into());
         }
         let mut extensions = Map::new();
         extensions.insert("replay".into(), json!(result.replay));
@@ -252,8 +293,8 @@ async fn execute(
     sink: crate::transcript::TranscriptSink,
     context: crate::harness::AgentRunContext,
 ) -> Result<SessionRunResult, String> {
-    let value = model.strip_prefix("api:").ok_or("Выберите модель в настройках.")?;
-    let (provider, model) = value.split_once('/').ok_or("Некорректный ID модели")?;
+    let value = model.strip_prefix("api:").ok_or("Р’С‹Р±РµСЂРёС‚Рµ РјРѕРґРµР»СЊ РІ РЅР°СЃС‚СЂРѕР№РєР°С….")?;
+    let (provider, model) = value.split_once('/').ok_or("РќРµРєРѕСЂСЂРµРєС‚РЅС‹Р№ ID РјРѕРґРµР»Рё")?;
     let transcript = manager.providers()?.chat_agent(provider, model, turns, sink, context).await?;
     Ok(SessionRunResult { parts: transcript.parts, replay: transcript.replay, integration: None })
 }
@@ -267,6 +308,15 @@ mod tests {
     };
     use serde_json::{json, Map};
     use std::io::{Read, Write};
+
+    #[test]
+    fn delegated_run_cannot_inherit_a_writable_policy_ceiling() {
+        use crate::tools::PermissionPolicy;
+        for policy in [PermissionPolicy::ReadOnly, PermissionPolicy::Ask, PermissionPolicy::Allow] {
+            assert_eq!(PolicyAdmission::DelegationReadOnly.ceiling(policy), PermissionPolicy::ReadOnly);
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_during_automatic_compaction_settles_without_summary() {
         let dir = tempfile::tempdir().unwrap();
@@ -476,7 +526,7 @@ mod tests {
             assert!(runs.cancel("one", "cancelled").unwrap());
         };
         let (result, ()) = tokio::join!(task, cancel);
-        assert!(result.unwrap_err().contains("отменён"));
+        assert!(result.unwrap_err().contains("РѕС‚РјРµРЅС‘РЅ"));
         let mut dropped =
             Box::pin(run(&store, &manager, &runs, "one", request(format!("api:{provider}/model"), "dropped")));
         tokio::select! { result=&mut dropped => panic!("request unexpectedly finished: {result:?}"), _=tokio::time::sleep(std::time::Duration::from_millis(20)) => {} }

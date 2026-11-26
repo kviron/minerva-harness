@@ -5,6 +5,10 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
+mod delegation;
+mod run_leases;
+mod writable_delegation;
+pub use run_leases::{ChildCheckoutLease, NativeRunLease};
 
 pub use minerva_runtime;
 
@@ -16,18 +20,73 @@ pub struct Connection {
 
 pub struct Service {
     config: RuntimeConfig,
+    executors: Arc<delegation::ProjectExecutors>,
     runtime: Mutex<Option<Arc<Runtime>>>,
+    run_leases: run_leases::NativeRunLeases,
     stopped: Mutex<bool>,
 }
 
 impl Service {
+    pub fn bind_native_run_lease<T: Send + Sync + 'static>(
+        self: &Arc<Self>,
+        session: &str,
+        run: &str,
+        owner: Arc<T>,
+    ) -> Result<NativeRunLease, String> {
+        self.run_leases.bind(session, run, owner, Arc::downgrade(self), None)
+    }
+
+    pub fn bind_journaled_native_run_lease<T: minerva_runtime::delegation_contract::NativeProcessJournal + 'static>(
+        self: &Arc<Self>,
+        session: &str,
+        run: &str,
+        owner: Arc<T>,
+    ) -> Result<NativeRunLease, String> {
+        self.run_leases.bind(session, run, owner.clone(), Arc::downgrade(self), Some(owner))
+    }
+
+    pub fn native_run_lease(&self, session: &str, run: &str) -> Option<NativeRunLease> {
+        self.run_leases.get(session, run)
+    }
+
+    /// Invoked with the parent tool dispatch barrier held. The launch pause and
+    /// checkout reservation survive until the confirmed activation settles.
+    pub async fn begin_native_run_handoff(
+        &self,
+        session: &str,
+        run: &str,
+        child_session: &str,
+        activation: &str,
+    ) -> Result<NativeRunLease, String> {
+        if activation.is_empty() || !child_session.starts_with("del_") {
+            return Err("Missing child activation".into());
+        }
+        let lease = self.native_run_lease(session, run).ok_or("Native run has no active checkout lease")?;
+        let runtime = self.runtime().await?;
+        if runtime.get_run(session, run)?.status != "running" {
+            return Err("Parent run is no longer running".into());
+        }
+        let pause = runtime.plugins.jobs()?.try_pause_launches(session)?;
+        lease.begin_handoff(child_session, activation, Box::new(pause))?;
+        Ok(lease)
+    }
+
     pub async fn connections(&self) -> Result<Vec<Connection>, String> {
         self.runtime().await?;
         Ok(vec![Connection { id: "minerva".into(), name: "Minerva".into(), model_prefix: String::new() }])
     }
 
+    pub async fn shell_session_is_quiescent(&self, session: &str) -> bool {
+        let runtime = self.runtime.lock().await;
+        runtime
+            .as_ref()
+            .and_then(|runtime| runtime.plugins.jobs().ok())
+            .is_some_and(|jobs| jobs.session_is_quiescent(session))
+    }
+
     pub fn new(data_dir: PathBuf, config_dir: PathBuf) -> Self {
         Self {
+            executors: Arc::default(),
             config: RuntimeConfig {
                 tenant_id: "local".into(),
                 workspace_id: "minerva-ide".into(),
@@ -36,6 +95,7 @@ impl Service {
                 config_dir,
             },
             runtime: Mutex::new(None),
+            run_leases: Default::default(),
             stopped: Mutex::new(false),
         }
     }
@@ -49,9 +109,21 @@ impl Service {
         if let Some(runtime) = slot.as_ref() {
             return Ok(runtime.clone());
         }
-        let runtime = Arc::new(Runtime::start_without_packages(self.config.clone()).await.map_err(|e| e.to_string())?);
+        let runtime = Arc::new(
+            Runtime::start_with_host_executor(self.config.clone(), self.executors.clone())
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         *slot = Some(runtime.clone());
         Ok(runtime)
+    }
+
+    pub fn register_project_executor(
+        &self,
+        root: &Path,
+        executor: Arc<dyn minerva_runtime::delegation_contract::ExecutionPort>,
+    ) -> std::io::Result<()> {
+        self.executors.insert(root, executor)
     }
 
     /// WorkspaceService canonicalizes paths and deduplicates Windows casing.

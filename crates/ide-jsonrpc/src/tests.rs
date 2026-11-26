@@ -515,6 +515,52 @@ async fn exited_waits_for_a_windows_descendant_to_release_its_file() {
     drop(open().expect("exited must wait for the descendant's file handle to close"));
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_exit_terminates_a_windows_descendant() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hold.ps1"),
+        "$f=[IO.File]::Open('locked.txt','Create','ReadWrite','None'); Set-Content ready.txt yes; Start-Sleep 30",
+    )
+    .unwrap();
+    let peer = Peer::spawn_framed_contained(
+        "powershell.exe",
+        &[
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "$s=[Diagnostics.ProcessStartInfo]::new('powershell.exe','-NoProfile -ExecutionPolicy Bypass -File hold.ps1'); $s.UseShellExecute=$false; $s.CreateNoWindow=$true; [void][Diagnostics.Process]::Start($s); while (!(Test-Path exit.txt)) { Start-Sleep -Milliseconds 20 }".into(),
+        ],
+        dir.path(),
+        &[],
+        Arc::new(NoopHandler),
+        Box::new(|_| {}),
+        Framing::ContentLength,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !dir.path().join("ready.txt").is_file() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let job = peer.job_name().expect("the peer owns a named Job Object");
+    assert!(ide_core::process::Job::named_is_running(job).unwrap());
+    std::fs::write(dir.path().join("exit.txt"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), peer.exited()).await.unwrap();
+    use std::os::windows::fs::OpenOptionsExt;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::fs::OpenOptions::new().read(true).share_mode(0).open(dir.path().join("locked.txt")).is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!ide_core::process::Job::named_is_running(job).unwrap());
+}
+
 /// A launcher that prints in the system code page and exits before speaking the
 /// protocol: `jdtls.bat` on a Chinese Windows when its Python step fails, then
 /// `pause` prints `请按任意键继续. . .` in GBK on stdout.

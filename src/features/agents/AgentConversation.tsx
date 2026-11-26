@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useProject } from "@/platform/project";
 import { T } from "@/ui";
 import { useWorkbenchChrome } from "@/workbench/contributions";
@@ -18,15 +18,21 @@ export function AgentConversation() {
   const home = useAgents((s) => s.homeOpen);
   const task = useAgents((s) => s.lastTask);
   const title = useAgents((s) => (s.lastTask ? s.tasks.get(s.lastTask)?.title : null));
+  const [headerTools, setHeaderTools] = useState<HTMLDivElement | null>(null);
   return (
     <section className={styles.conversation} aria-label="Agent conversation">
       <header className={styles.header}>
         <strong>{!home && title ? title : <T>New chat</T>}</strong>
+        {!home && task && <div className={styles.tools} ref={setHeaderTools} />}
       </header>
       {home || !task ? (
         <HomeEditor input={{ kind: HOME_KIND, key: HOME_KEY, data: {} }} />
       ) : (
-        <SessionEditor docked input={{ kind: SESSION_KIND, key: sessionKey(task), data: { task } }} />
+        <SessionEditor
+          docked
+          headerTools={headerTools}
+          input={{ kind: SESSION_KIND, key: sessionKey(task), data: { task } }}
+        />
       )}
     </section>
   );

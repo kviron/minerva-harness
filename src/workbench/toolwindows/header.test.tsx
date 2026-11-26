@@ -12,7 +12,7 @@ const closeContentTab = vi.fn();
 let disposers: Array<() => void> = [];
 
 beforeEach(() => {
-  useWorkbenchChrome.setState({ navigation: null, sidebar: null });
+  useWorkbenchChrome.setState({ navigation: null, sidebar: null, primary: null, workspaceOpen: false });
   resetToolWindowLayout();
   closeContentTab.mockClear();
   disposers = [
@@ -45,18 +45,25 @@ afterEach(() => disposers.forEach((d) => d()));
 
 const header = (id: string) => document.querySelector<HTMLElement>(`[data-toolwindow="${id}"] header`)!;
 
-it("hides IDE tools under custom navigation without remounting the editor or losing panel state", () => {
+it("keeps the native stripe in Agent mode and opens the folded workspace from it", () => {
   showToolWindow("run");
   render(<ToolWindowLayout editor={<input aria-label="Editor draft" defaultValue="Keep me" />} />);
   const editor = screen.getByRole("textbox", { name: "Editor draft" });
   expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
-  act(() => useWorkbenchChrome.setState({ navigation: () => <nav aria-label="Agent navigation" />, sidebar: Empty }));
+  act(() =>
+    useWorkbenchChrome.setState({
+      navigation: ({ children }) => <nav aria-label="Agent navigation">{children}</nav>,
+      sidebar: Empty,
+      primary: Empty,
+    }),
+  );
   expect(screen.getByRole("navigation", { name: "Agent navigation" })).toBeVisible();
   expect(document.querySelector('[data-toolwindow="run"]')).not.toBeVisible();
-  expect(screen.getByRole("textbox", { name: "Editor draft" })).toBe(editor);
   expect(isToolWindowVisible("run")).toBe(true);
-  act(() => useWorkbenchChrome.setState({ navigation: null, sidebar: null }));
+  fireEvent.click(screen.getByRole("button", { name: "Run" }));
+  expect(useWorkbenchChrome.getState().workspaceOpen).toBe(true);
   expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Editor draft" })).toBe(editor);
   expect(screen.getByRole("textbox", { name: "Editor draft" })).toHaveValue("Keep me");
 });
 

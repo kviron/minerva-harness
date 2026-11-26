@@ -3,9 +3,11 @@ pub use mh_context as context;
 pub use mh_runtime_support::{credential_store, network_policy};
 pub use mh_sessions::{sessions, transcript};
 pub use mh_tool_runtime as tools;
+mod anymodel;
 mod budget;
 pub mod codex;
 mod execution;
+mod followups;
 mod reasoning;
 mod route_handler;
 mod routes;
@@ -104,6 +106,24 @@ const PRESETS: &[Preset] = &[
         protocol: "openai-chat",
         models: &[],
         env_var: Some("OPENROUTER_API_KEY"),
+    },
+    Preset {
+        id: "tokenharbor",
+        name: "Token Harbor",
+        base_url: "https://tokenharbor.ai/v1",
+        public_catalog_base: None,
+        protocol: "openai-chat",
+        models: &["qwen3.7-max"],
+        env_var: Some("TH_API_KEY"),
+    },
+    Preset {
+        id: "anymodel",
+        name: "AnyModel",
+        base_url: anymodel::BASE_URL,
+        public_catalog_base: None,
+        protocol: "openai-chat",
+        models: &["am/gpt-5.6-terra"],
+        env_var: Some("ANYMODEL_API_KEY"),
     },
     Preset {
         id: "groq",
@@ -319,6 +339,15 @@ pub struct ProviderView {
     /// as DeepSeek Harness exposes `reasoning.efforts`; absent for models without controls.
     reasoning: std::collections::BTreeMap<String, Vec<String>>,
 }
+impl ProviderView {
+    pub fn provider(&self) -> &Provider {
+        &self.provider
+    }
+
+    pub fn reasoning(&self, model: &str) -> &[String] {
+        self.reasoning.get(model).map(Vec::as_slice).unwrap_or_default()
+    }
+}
 fn route_preset(provider: &Provider) -> Option<&'static Preset> {
     PRESETS.iter().find(|preset| {
         preset.base_url == provider.base_url.trim_end_matches('/')
@@ -357,7 +386,7 @@ pub struct ProviderInput {
 use crate::credential_store::{CredentialScope, CredentialStore, LocalKeyring};
 use crate::network_policy::EndpointPolicy;
 use crate::sessions::Turn;
-pub const PREAMBLE: &str = "Ты помощник разработчика. Отвечай на русском, если пользователь не просит иначе.";
+pub const PREAMBLE: &str = "РўС‹ РїРѕРјРѕС‰РЅРёРє СЂР°Р·СЂР°Р±РѕС‚С‡РёРєР°. РћС‚РІРµС‡Р°Р№ РЅР° СЂСѓСЃСЃРєРѕРј, РµСЃР»Рё РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РїСЂРѕСЃРёС‚ РёРЅР°С‡Рµ.";
 
 pub struct AgentRunContext {
     pub session_id: String,
@@ -369,12 +398,21 @@ pub struct AgentRunContext {
     /// A choice name from `ProviderView::reasoning`; `None` keeps the provider default.
     pub reasoning_effort: Option<String>,
     pub selection: Option<Arc<dyn SelectionControl>>,
+    pub followups: Option<Arc<dyn FollowupControl>>,
+}
+
+pub trait FollowupControl: Send + Sync {
+    fn preferred(&self) -> Result<Option<mh_sessions::delegation::PreferredFollowup>, String>;
+    fn claim(&self, work_item_id: &str) -> Result<bool, String>;
+    fn confirm(&self, work_item_id: &str) -> Result<bool, String>;
 }
 
 pub type ProviderRunContext = AgentRunContext;
 struct ProviderStepHook {
     run: ProviderRunContext,
     schema_tokens: usize,
+    followups: followups::StepFollowups,
+    history: rig_history::HistoryHook,
 }
 impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
     async fn on_completion_call(
@@ -386,22 +424,26 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
         if self.run.tool_context.cancellation.is_cancelled() {
             return CompletionCallAction::Stop("Run cancelled".into());
         }
+        let _write_barrier = match self.run.tools.try_quiesce_writes() {
+            Ok(barrier) => barrier,
+            Err(error) => return CompletionCallAction::Stop(error),
+        };
         let prepared = match self.run.context.prepare_enriched(&self.run.session_id, &self.run.messages).await {
             Ok(value) => value,
             Err(error) => return CompletionCallAction::Stop(error),
         };
-        let history = event.history.iter().map(|message| Arc::new(project_message(message))).collect::<Vec<_>>();
         let preamble = format!("{}\n{}", PREAMBLE, prepared.system_prompt);
-        let estimated = history
-            .iter()
-            .map(|m| estimate_message(m))
-            .sum::<usize>()
-            .saturating_add(estimate_message(&project_message(event.prompt)))
-            .saturating_add(crate::context::estimate_tokens(&preamble))
-            .saturating_add(self.schema_tokens);
+        let (history, pending) = match self.followups.prepare(event.history) {
+            Ok(value) => value,
+            Err(error) => return CompletionCallAction::Stop(error),
+        };
+        let (history, estimated) = prepare_step_history(&history, event.prompt, &preamble, self.schema_tokens);
         let available = prepared.budget.context_window.saturating_sub(estimated);
         if available < 256 {
             return CompletionCallAction::Stop("Context budget exhausted; compact the conversation".into());
+        }
+        if let Err(error) = self.followups.claim(event.history.len(), pending, &self.history) {
+            return CompletionCallAction::Stop(error);
         }
         CompletionCallAction::Patch(
             RequestPatch::new()
@@ -409,6 +451,17 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
                 .history(history)
                 .max_tokens(available.min(budget::DEFAULT_OUTPUT_CAP as usize) as u64),
         )
+    }
+    async fn on_model_turn_finished(
+        &self,
+        _: &rig_agent::agent::hook::HookContext,
+        _: rig_agent::agent::hook::ModelTurnFinished<'_>,
+    ) -> rig_agent::agent::hook::ModelTurnAction {
+        use rig_agent::agent::hook::ModelTurnAction;
+        match self.followups.confirm() {
+            Ok(()) => ModelTurnAction::Continue,
+            Err(error) => ModelTurnAction::Stop(error),
+        }
     }
     async fn on_dispatch(
         &self,
@@ -429,6 +482,23 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
             DispatchAction::proceed()
         }
     }
+}
+
+fn prepare_step_history(
+    history: &[Arc<rig_core::message::Message>],
+    prompt: &rig_core::message::Message,
+    preamble: &str,
+    schema_tokens: usize,
+) -> (Vec<Arc<rig_core::message::Message>>, usize) {
+    let history: Vec<_> = history.iter().map(|message| Arc::new(project_message(message))).collect();
+    let estimated = history
+        .iter()
+        .map(|message| estimate_message(message))
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(estimate_message(&project_message(prompt)))
+        .saturating_add(crate::context::estimate_tokens(preamble))
+        .saturating_add(schema_tokens);
+    (history, estimated)
 }
 
 pub(crate) fn project_message(message: &rig_core::message::Message) -> rig_core::message::Message {
@@ -494,7 +564,8 @@ impl ProviderService {
             return Err("Hosted runtime requires scoped credential broker".into());
         }
         let providers = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("Не удалось прочитать провайдеры: {e}"))?,
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРѕС‡РёС‚Р°С‚СЊ РїСЂРѕРІР°Р№РґРµСЂС‹: {e}"))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.to_string()),
         };
@@ -604,25 +675,27 @@ impl ProviderService {
             || !input.id.chars().next().is_some_and(|c| c.is_ascii_lowercase())
             || !input.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
         {
-            return Err("ID должен начинаться с латинской буквы и содержать строчные буквы, цифры, - или _.".into());
+            return Err("ID РґРѕР»Р¶РµРЅ РЅР°С‡РёРЅР°С‚СЊСЃСЏ СЃ Р»Р°С‚РёРЅСЃРєРѕР№ Р±СѓРєРІС‹ Рё СЃРѕРґРµСЂР¶Р°С‚СЊ СЃС‚СЂРѕС‡РЅС‹Рµ Р±СѓРєРІС‹, С†РёС„СЂС‹, - РёР»Рё _.".into());
         }
         if !matches!(
             input.protocol.as_str(),
             "openai-chat" | "openai-responses" | "anthropic-messages" | "ollama" | "openai-codex"
         ) {
-            return Err("Неизвестный протокол API.".into());
+            return Err("РќРµРёР·РІРµСЃС‚РЅС‹Р№ РїСЂРѕС‚РѕРєРѕР» API.".into());
         }
         if input.name.trim().is_empty() || input.models.iter().any(|m| m.trim().is_empty()) {
-            return Err("Укажите название провайдера и непустые ID моделей.".into());
+            return Err(
+                "РЈРєР°Р¶РёС‚Рµ РЅР°Р·РІР°РЅРёРµ РїСЂРѕРІР°Р№РґРµСЂР° Рё РЅРµРїСѓСЃС‚С‹Рµ ID РјРѕРґРµР»РµР№.".into()
+            );
         }
         self.endpoint_policy.validate(&input.base_url)?;
 
         let mut providers = self.providers.lock().await;
         if input.is_new && providers.iter().any(|p| p.id == input.id) {
-            return Err("Провайдер с таким ID уже существует.".into());
+            return Err("РџСЂРѕРІР°Р№РґРµСЂ СЃ С‚Р°РєРёРј ID СѓР¶Рµ СЃСѓС‰РµСЃС‚РІСѓРµС‚.".into());
         }
         if !input.is_new && !providers.iter().any(|p| p.id == input.id) {
-            return Err("Провайдер не найден; обновите список.".into());
+            return Err("РџСЂРѕРІР°Р№РґРµСЂ РЅРµ РЅР°Р№РґРµРЅ; РѕР±РЅРѕРІРёС‚Рµ СЃРїРёСЃРѕРє.".into());
         }
         if let Some(existing) = providers.iter().find(|p| p.id == input.id) {
             if (existing.base_url.trim_end_matches('/') != input.base_url.trim_end_matches('/')
@@ -633,7 +706,9 @@ impl ProviderService {
                     && self.env_key(&input.id, &existing.base_url).is_none())
                 && !input.api_key.as_ref().is_some_and(|key| !key.trim().is_empty())
             {
-                return Err("При смене адреса или протокола введите ключ явно.".into());
+                return Err(
+                    "РџСЂРё СЃРјРµРЅРµ Р°РґСЂРµСЃР° РёР»Рё РїСЂРѕС‚РѕРєРѕР»Р° РІРІРµРґРёС‚Рµ РєР»СЋС‡ СЏРІРЅРѕ.".into(),
+                );
             }
         }
         let mut next = providers.clone();
@@ -649,7 +724,7 @@ impl ProviderService {
         } else {
             next.push(provider);
         }
-        let dir = self.path.parent().ok_or("Не задан каталог настроек")?;
+        let dir = self.path.parent().ok_or("РќРµ Р·Р°РґР°РЅ РєР°С‚Р°Р»РѕРі РЅР°СЃС‚СЂРѕРµРє")?;
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
         serde_json::to_writer_pretty(&mut temp, &next).map_err(|e| e.to_string())?;
@@ -657,7 +732,7 @@ impl ProviderService {
         let old_key = if changed_key.is_some() { self.credentials.get(&self.scope, &input.id)? } else { None };
         if let Some(key) = changed_key.as_ref() {
             if let Err(e) = self.credentials.put(&self.scope, &input.id, key) {
-                return Err(format!("Не удалось сохранить ключ: {e}"));
+                return Err(format!("РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ РєР»СЋС‡: {e}"));
             }
         }
         if let Err(e) = temp.persist(&self.path) {
@@ -669,11 +744,11 @@ impl ProviderService {
                 };
                 if rollback.is_err() {
                     return Err(format!(
-                        "Не удалось сохранить настройки: {e}; также не удалось восстановить прежний ключ."
+                        "РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ РЅР°СЃС‚СЂРѕР№РєРё: {e}; С‚Р°РєР¶Рµ РЅРµ СѓРґР°Р»РѕСЃСЊ РІРѕСЃСЃС‚Р°РЅРѕРІРёС‚СЊ РїСЂРµР¶РЅРёР№ РєР»СЋС‡."
                     ));
                 }
             }
-            return Err(format!("Не удалось сохранить настройки: {e}"));
+            return Err(format!("РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ РЅР°СЃС‚СЂРѕР№РєРё: {e}"));
         }
         *providers = next;
         drop(providers);
@@ -683,7 +758,7 @@ impl ProviderService {
         let mut providers = self.providers.lock().await;
         let mut next = providers.clone();
         next.retain(|p| p.id != id);
-        let dir = self.path.parent().ok_or("Не задан каталог настроек")?;
+        let dir = self.path.parent().ok_or("РќРµ Р·Р°РґР°РЅ РєР°С‚Р°Р»РѕРі РЅР°СЃС‚СЂРѕРµРє")?;
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
         serde_json::to_writer_pretty(&mut temp, &next).map_err(|e| e.to_string())?;
@@ -726,9 +801,17 @@ impl ProviderService {
                     .or_else(|| self.env_key(&input.id, &input.base_url))
                     .or_else(|| (input.protocol == "ollama").then(|| "ollama".into()))
                     .or_else(|| public_catalog_base.map(|_| String::new()))
-                    .ok_or("Введите API-ключ для указанного адреса.")?
+                    .ok_or("Р’РІРµРґРёС‚Рµ API-РєР»СЋС‡ РґР»СЏ СѓРєР°Р·Р°РЅРЅРѕРіРѕ Р°РґСЂРµСЃР°.")?
             };
         let request = async {
+            if input.id == "anymodel"
+                && input.protocol == "openai-chat"
+                && input.base_url.trim_end_matches('/') == anymodel::BASE_URL
+            {
+                return anymodel::discover(&key).await.map_err(|_| {
+                    "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ СЃРїРёСЃРѕРє РјРѕРґРµР»РµР№. РџСЂРѕРІРµСЂСЊС‚Рµ URL, РїСЂРѕС‚РѕРєРѕР» Рё РєР»СЋС‡.".to_string()
+                });
+            }
             match input.protocol.as_str() {
                 "openai-chat" | "openai-responses" | "ollama" => {
                     if let Some(base) = public_catalog_base {
@@ -758,14 +841,14 @@ impl ProviderService {
                 "anthropic-messages" => {
                     AnthropicConfig::new(key).with_base_url(input.base_url).client().list_models().await
                 }
-                _ => return Err("Неизвестный протокол API.".to_string()),
+                _ => return Err("РќРµРёР·РІРµСЃС‚РЅС‹Р№ РїСЂРѕС‚РѕРєРѕР» API.".to_string()),
             }
             .map(|list| list.data.into_iter().map(|m| m.id).collect())
-            .map_err(|_| "Не удалось получить список моделей. Проверьте URL, протокол и ключ.".to_string())
+            .map_err(|_| "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ СЃРїРёСЃРѕРє РјРѕРґРµР»РµР№. РџСЂРѕРІРµСЂСЊС‚Рµ URL, РїСЂРѕС‚РѕРєРѕР» Рё РєР»СЋС‡.".to_string())
         };
         tokio::time::timeout(std::time::Duration::from_secs(20), request)
             .await
-            .map_err(|_| "Превышено время ожидания списка моделей.".to_string())?
+            .map_err(|_| "РџСЂРµРІС‹С€РµРЅРѕ РІСЂРµРјСЏ РѕР¶РёРґР°РЅРёСЏ СЃРїРёСЃРєР° РјРѕРґРµР»РµР№.".to_string())?
     }
     #[cfg(test)]
     pub async fn chat(&self, id: &str, model: &str, messages: Vec<Turn>) -> Result<String, String> {
@@ -1180,8 +1263,8 @@ mod tests {
             is_new: false,
             protocol: "openai-chat".into(),
         };
-        assert!(service.save(changed()).await.err().unwrap().contains("ключ"));
-        assert!(service.discover(changed()).await.unwrap_err().contains("ключ"));
+        assert!(service.save(changed()).await.err().unwrap().contains("РєР»СЋС‡"));
+        assert!(service.discover(changed()).await.unwrap_err().contains("РєР»СЋС‡"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {

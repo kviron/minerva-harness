@@ -3,6 +3,9 @@ name = "minerva-runtime"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
+minerva-delegation = { path = "../delegation" }
+minerva-tool-subagent = { path = "../../plugins/tool-subagent" }
+tracing = "0.1"
 rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 mh-session-query = { path = "../../plugins/mh-session-query" }
 mh-skills = { path = "../../plugins/mh-skills" }

@@ -81,10 +81,13 @@ fn run(context: Arc<ContextService>, tools: &ToolRegistry, cancellation: Cancell
     ProviderRunContext {
         reasoning_effort: None,
         selection: None,
+        followups: None,
         session_id: "session".into(),
         run_id: "run".into(),
         tools: tools.snapshot(),
         tool_context: ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "session".into(),
             run_id: "run".into(),
             call_id: String::new(),

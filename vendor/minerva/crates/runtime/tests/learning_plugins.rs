@@ -137,6 +137,8 @@ async fn optional_learning_persists_and_enforces_scope() {
             "load_skill",
             json!({"name":"demo"}),
             minerva_runtime::tools::ToolContext {
+                delegation_reads: Default::default(),
+                write_approved: false,
                 session_id: "first".into(),
                 run_id: "skill-test".into(),
                 call_id: "load".into(),
@@ -159,6 +161,8 @@ async fn optional_learning_persists_and_enforces_scope() {
         assert!(tools.definitions().iter().any(|tool| tool.name == name));
     }
     let tool_context = |policy| minerva_runtime::tools::ToolContext {
+        delegation_reads: Default::default(),
+        write_approved: false,
         session_id: "first".into(),
         run_id: "memory-test".into(),
         call_id: "remember".into(),

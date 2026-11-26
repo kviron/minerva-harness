@@ -134,6 +134,23 @@ struct ForkSession {
     id: String,
 }
 impl Runtime {
+    fn stop_shell_jobs_for_read_only(
+        &self,
+        session: &str,
+        policy: crate::tools::PermissionPolicy,
+    ) -> Result<(), String> {
+        if policy != crate::tools::PermissionPolicy::ReadOnly {
+            return Ok(());
+        }
+        if let Ok(jobs) = self.plugins.jobs() {
+            jobs.request_stop_session(session);
+            for child in self.sessions.internal_delegation_descendants(session).map_err(|error| error.to_string())? {
+                jobs.request_stop_session(&child);
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_session(&self, id: &str, workspace: Option<&str>) -> Result<(), String> {
         self.plugins
             .context()
@@ -237,7 +254,9 @@ impl Runtime {
                             .into_iter()
                             .find(|p| p.session_ids.contains(&a.session_id))
                             .ok_or("Workspace not found")?;
-                        let root = project.path.ok_or("Папка рабочего пространства не выбрана")?;
+                        let root = project
+                            .path
+                            .ok_or("РџР°РїРєР° СЂР°Р±РѕС‡РµРіРѕ РїСЂРѕСЃС‚СЂР°РЅСЃС‚РІР° РЅРµ РІС‹Р±СЂР°РЅР°")?;
                         encoded(terminals.open(std::path::Path::new(&root), a.cols, a.rows)?)
                     }
                     "mh-terminal.write" => terminals.write(&a.id, &a.data).map(|_| Value::Null),
@@ -383,7 +402,9 @@ impl Runtime {
                 if !harness.local {
                     return Err("Live permission changes are unavailable in this profile".into());
                 }
-                encoded(harness.context.workspace_set_permission_policy(&a.session_id, a.permission_policy)?)
+                let policy = harness.context.workspace_set_permission_policy(&a.session_id, a.permission_policy)?;
+                self.stop_shell_jobs_for_read_only(&a.session_id, policy)?;
+                encoded(policy)
             }
             "workspace.save" => {
                 let a: Workspace = args(params)?;
@@ -394,7 +415,9 @@ impl Runtime {
                 if self.sessions.baseline(&a.session_id)?.active_run.is_some() {
                     return Err("Wait for the active run before changing its workspace or policy".into());
                 }
-                encoded(harness.context.workspace_save(&a.session_id, a.settings)?)
+                let settings = harness.context.workspace_save(&a.session_id, a.settings)?;
+                self.stop_shell_jobs_for_read_only(&a.session_id, settings.permission_policy)?;
+                encoded(settings)
             }
             "tools.list" => {
                 let a: Session = args(params)?;

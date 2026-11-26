@@ -546,6 +546,8 @@ export function ToolWindowStripe({
   visible,
   showNames = false,
   buttonWidth,
+  navigation: Navigation,
+  workspaceShown = true,
 }: {
   side: StripeSide;
   windows: ToolWindowContribution[];
@@ -554,6 +556,8 @@ export function ToolWindowStripe({
   showNames?: boolean;
   /** Button width with names, px. */
   buttonWidth?: number;
+  navigation?: NonNullable<ReturnType<typeof useWorkbenchChrome.getState>["navigation"]>;
+  workspaceShown?: boolean;
 }) {
   const isActive = (w: ToolWindowContribution) => visible[slotOf(w)] === w.id;
   const stripeButtons = useToolWindowLayout((s) => s.stripeButtons);
@@ -577,13 +581,29 @@ export function ToolWindowStripe({
       {list.map((w) => (
         <div key={w.id} className={styles.stripeSlot}>
           {indicator(slot, w.id)}
-          <StripeButton tw={w} active={isActive(w)} focused={focused === w.id} side={side} showName={showNames} />
+          <StripeButton
+            tw={w}
+            active={workspaceShown && isActive(w)}
+            focused={workspaceShown && focused === w.id}
+            side={side}
+            showName={showNames}
+          />
         </div>
       ))}
       <div className={clsx(styles.stripeSlot, styles.stripeSlotEnd)}>{indicator(slot, null)}</div>
     </div>
   );
 
+  const buttons = (
+    <>
+      {renderGroup(side, primary)}
+      {dragging && <div className={styles.stripeSeparator} data-stripe-separator="" role="separator" />}
+      {(split.length > 0 || dragging) && renderGroup(`${side}-split`, split)}
+      {side === "left" && <StripeMore windows={moreWindows} />}
+      <div className={styles.stripeSpacer} data-stripe-spacer="" />
+      {renderGroup(lowerSlot(side), lower)}
+    </>
+  );
   return (
     <nav
       aria-label={side === "left" ? "Tool windows" : "Right tool windows"}
@@ -598,12 +618,7 @@ export function ToolWindowStripe({
       )}
       onKeyDown={onStripeKeyDown}
     >
-      {renderGroup(side, primary)}
-      {dragging && <div className={styles.stripeSeparator} data-stripe-separator="" role="separator" />}
-      {(split.length > 0 || dragging) && renderGroup(`${side}-split`, split)}
-      {side === "left" && <StripeMore windows={moreWindows} />}
-      <div className={styles.stripeSpacer} data-stripe-spacer="" />
-      {renderGroup(lowerSlot(side), lower)}
+      {Navigation ? <Navigation>{buttons}</Navigation> : buttons}
     </nav>
   );
 }
@@ -1317,17 +1332,15 @@ function useToolWindowAppearance() {
  * between islands. A CSS grid does the layout, so a window resize costs no script.
  */
 export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
-  const { navigation: Navigation, sidebar: Sidebar } = useWorkbenchChrome();
+  const { navigation: Navigation, sidebar: Sidebar, primary, workspaceOpen } = useWorkbenchChrome();
   const windows = useToolWindows();
   const effectiveVisible = useEffectiveVisible(windows);
   const effectiveMaximized = useEffectiveMaximized(windows);
-  const visible = useMemo(
-    () => (Navigation ? (Object.fromEntries(SLOTS.map((slot) => [slot, null])) as SlotRecord) : effectiveVisible),
-    [Navigation, effectiveVisible],
-  );
-  const maximized = Navigation ? null : effectiveMaximized;
+  const workspaceShown = !primary || !!workspaceOpen;
+  const visible = effectiveVisible;
+  const maximized = workspaceShown ? effectiveMaximized : null;
   const appearance = useToolWindowAppearance();
-  const bars = !Navigation && appearance.bars;
+  const bars = appearance.bars;
   const { widescreen } = appearance;
   const stripes = useStripes();
   const names = (side: StripeSide) => stripes[side].names ?? appearance.names;
@@ -1357,6 +1370,8 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
       visible={visible}
       showNames={names(side)}
       buttonWidth={stripes[side].width}
+      navigation={side === "left" ? (Navigation ?? undefined) : undefined}
+      workspaceShown={workspaceShown}
     />
   );
   const sizes = useToolWindowLayout((s) => s.sizes);
@@ -1405,10 +1420,10 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
       ref={frameRef}
       className={clsx(styles.frame, !rightStripe && styles.frameNoRight, !bars && !Navigation && styles.frameNoLeft)}
     >
-      {Navigation && <Navigation />}
-      {Sidebar && <Sidebar />}
+      {!bars && Navigation && <Navigation />}
       {bars && stripe("left")}
       {bars && stripeHandle("left")}
+      {Sidebar && <Sidebar />}
       <WorkspaceLayout>
         <div
           ref={gridRef}

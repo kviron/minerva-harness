@@ -731,6 +731,12 @@ impl Host {
             self.runtime.clone(),
             self.minerva.clone(),
         ));
+        if let Err(error) = self.minerva.register_project_executor(
+            root,
+            Arc::new(ide_agent::delegation::HostExecutor::new(Arc::downgrade(&agents))),
+        ) {
+            tracing::warn!(%error, "Could not register the project delegation executor");
+        }
         let settings = settings.clone();
         {
             let settings = settings.clone();

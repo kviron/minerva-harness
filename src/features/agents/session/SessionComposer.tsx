@@ -35,7 +35,6 @@ import {
 } from "../store";
 import { PermissionLine } from "./QuestionForm";
 import { SessionStatus } from "./SessionStatus";
-import { WorkingSubagents } from "./toolEntries";
 import { SessionProviderPicker } from "./SessionProviderPicker";
 import { useSessionProvider } from "./useSessionProvider";
 
@@ -144,7 +143,6 @@ export function SessionComposer({
   commits,
   changesOpen,
   onToggleChanges,
-  onOpenSubagent,
 }: {
   task: AgentTask;
   focusRequest: number;
@@ -155,7 +153,6 @@ export function SessionComposer({
   commits: readonly AgentCommit[];
   changesOpen: boolean;
   onToggleChanges: () => void;
-  onOpenSubagent: (id: string) => void;
 }) {
   const { sendWith, whileRunning } = useAgentSettings();
   const project = useProject((s) => s.project);
@@ -297,7 +294,6 @@ export function SessionComposer({
         </div>
       )}
       <Tray task={task} entries={entries}>
-        <WorkingSubagents entries={entries} onOpen={onOpenSubagent} />
         {task.queue.length > 0 && <Queue task={task} />}
       </Tray>
       <SessionAssets task={task} entries={entries} head={head} onFocusComposer={() => setAssetFocus((n) => n + 1)} />

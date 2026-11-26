@@ -16,6 +16,136 @@ use tokio::io::AsyncBufReadExt;
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
 const WAIT: Duration = Duration::from_secs(20);
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the installed Claude Code CLI; does not call the model"]
+async fn installed_claude_initializes_inside_a_named_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = crate::provider::load(None, None)
+        .into_iter()
+        .find(|spec| spec.id == "claude")
+        .unwrap()
+        .resolve_for_launch(dir.path());
+    let peer = connect(&spec, dir.path(), Arc::new(ide_jsonrpc::NoopHandler), Box::new(|_| {})).unwrap();
+    let created: Value = tokio::time::timeout(WAIT, peer.request("session/new", json!({"cwd":dir.path()}), None))
+        .await
+        .unwrap()
+        .unwrap();
+    let managed: Value =
+        peer.request("_openidea/managed_process", json!({"sessionId":created["sessionId"]}), None).await.unwrap();
+    let job = managed["jobName"].as_str().unwrap();
+    assert!(ide_core::process::Job::named_is_running(job).unwrap());
+    let stale: Result<Value, _> = peer
+        .request(
+            "session/prompt",
+            json!({"sessionId":created["sessionId"],"prompt":[{"type":"text","text":"Must not be sent"}],
+                "_meta":{"openidea":{"processJob":"replacement"}}}),
+            None,
+        )
+        .await;
+    assert!(stale.unwrap_err().to_string().contains("process changed before prompt dispatch"));
+    peer.kill();
+    tokio::time::timeout(WAIT, async {
+        while ide_core::process::Job::named_is_running(job).unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the installed Claude Code CLI; does not call the model"]
+async fn installed_claude_accepts_the_restricted_delegation_profile() {
+    for writable in [false, true] {
+        installed_claude_delegation_profile(writable).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the installed Claude Code CLI and the configured live model"]
+async fn live_claude_delegated_read_uses_the_configured_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("checkout");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::write(cwd.join("marker.txt"), "delegated-fixture-4b9c").unwrap();
+    let spec = crate::provider::load(None, None)
+        .into_iter()
+        .find(|spec| spec.id == "claude")
+        .unwrap()
+        .resolve_for_launch(&cwd);
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let handler = Arc::new(TestClient { seen: seen.clone(), answers: Arc::default() });
+    let peer = connect(&spec, &cwd, handler, Box::new(|_| {})).unwrap();
+    let created: Value = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd":cwd,
+                "_meta":{"openidea":{"delegatedReadOnly":true}},
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let session = created["sessionId"].as_str().unwrap();
+    let turn = uuid::Uuid::new_v4().to_string();
+    let result: Value = tokio::time::timeout(Duration::from_secs(60), peer.request("session/prompt", json!({
+        "sessionId":session,
+        "prompt":[{"type":"text","text":"Use Read on marker.txt in your working directory and report its exact contents."}],
+        "_meta":{"openidea":{"delegatedReadOnly":true,"nativeTurnId":turn}},
+    }), None)).await.expect("Claude model request timed out").unwrap();
+    assert_eq!(result["stopReason"], "end_turn");
+    assert_eq!(result["_meta"]["openidea"]["nativeTurnId"], turn);
+    let text: String = seen
+        .lock()
+        .updates
+        .iter()
+        .filter(|(owner, update)| owner == session && update["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|(_, update)| update["content"]["text"].as_str())
+        .collect();
+    assert!(text.contains("delegated-fixture-4b9c"));
+    peer.kill();
+}
+
+#[cfg(windows)]
+async fn installed_claude_delegation_profile(writable: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = crate::provider::load(None, None)
+        .into_iter()
+        .find(|spec| spec.id == "claude")
+        .unwrap()
+        .resolve_for_launch(dir.path());
+    let peer = connect(&spec, dir.path(), Arc::new(ide_jsonrpc::NoopHandler), Box::new(|_| {})).unwrap();
+    let created: Value = tokio::time::timeout(
+        WAIT,
+        peer.request(
+            "session/new",
+            json!({
+                "cwd":dir.path(),
+                "_meta":{"openidea":{"delegatedReadOnly":true,"delegatedWritable":writable}},
+            }),
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let managed: Value =
+        peer.request("_openidea/managed_process", json!({"sessionId":created["sessionId"]}), None).await.unwrap();
+    let job = managed["jobName"].as_str().unwrap();
+    assert!(ide_core::process::Job::named_is_running(job).unwrap());
+    peer.kill();
+    tokio::time::timeout(WAIT, async {
+        while ide_core::process::Job::named_is_running(job).unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 // ---------- the client side ----------
 
 #[derive(Default)]
@@ -41,6 +171,10 @@ impl Handler for TestClient {
     }
 
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
+        if method == "_openidea/scoped_file_write" {
+            self.seen.lock().asked.push(params);
+            return Ok(json!(self.answers.lock().pop_front().flatten() == Some("allow")));
+        }
         assert_eq!(method, "session/request_permission");
         self.seen.lock().asked.push(params);
         Ok(match self.answers.lock().pop_front().flatten() {
@@ -335,10 +469,12 @@ impl Cli for Replay {
         let kill = CancellationToken::new();
         self.kills.lock().push(kill.clone());
         let (sent, errors, token) = (self.sent.clone(), self.errors.clone(), kill.clone());
+        let session = launch.args.windows(2).find(|pair| pair[0] == "--session-id").map(|pair| pair[1].clone());
         sent.lock().push(Vec::new());
         tokio::spawn(async move {
             let mut lines = BufReader::new(cli_in).lines();
-            let mut subs: Vec<(String, String)> = Vec::new();
+            let mut subs: Vec<(String, String)> =
+                session.into_iter().map(|id| ("__TEST_CLAUDE_SESSION__".into(), id)).collect();
             for frame in frames {
                 match frame {
                     Frame::Launch(_) => {}
@@ -394,7 +530,13 @@ impl Cli for Replay {
             token.cancelled().await;
             drop(cli_out);
         });
-        Ok(cli::CliIo { stdin: Box::pin(shim_in), stdout: Box::pin(shim_out), kill })
+        Ok(cli::CliIo {
+            stdin: Box::pin(shim_in),
+            stdout: Box::pin(shim_out),
+            kill,
+            #[cfg(windows)]
+            job_name: None,
+        })
     }
 }
 
@@ -483,6 +625,90 @@ async fn closing_the_connection_stops_the_processes() {
     })
     .await
     .expect("every process was stopped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_session_uses_fixed_readonly_launch_and_rejects_mode_changes() {
+    let mut processes = load_fixture("simple");
+    processes[0].retain(|frame| !matches!(frame, Frame::Launch(_)));
+    for frame in &mut processes[0] {
+        if let Frame::Cli(message) = frame
+            && message["response"]["request_id"] == "req_1"
+        {
+            message["response"]["response"]["current_permission_mode"] = json!("dontAsk");
+        }
+    }
+    let cli = replay_cli(processes);
+    let config = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let h = Harness::connect(
+        cli.clone(),
+        config.path().into(),
+        config.path().join("pending"),
+        std::fs::canonicalize(cwd.path()).unwrap(),
+        vec!["--dangerously-skip-permissions".into(), "--plugin-dir".into(), "untrusted".into()],
+    )
+    .await;
+    let response = h
+        .request(
+            "session/new",
+            json!({
+                "cwd":h.cwd,"mcpServers":[{"name":"untrusted","command":"danger"}],
+                "_meta":{"openidea":{"delegatedReadOnly":true}}
+            }),
+        )
+        .await
+        .unwrap();
+    let session = response["sessionId"].as_str().unwrap();
+    let args = cli.launched.lock()[0].clone();
+    assert!(args.iter().any(|arg| arg == "--safe-mode"));
+    assert!(!args.iter().any(|arg| arg.contains("skip-permissions") || arg == "--plugin-dir"));
+    assert!(args.windows(2).any(|pair| pair == ["--tools", "Read,Glob,Grep"]));
+    let path = args.windows(2).find(|pair| pair[0] == "--mcp-config").unwrap();
+    let mcp: Value = serde_json::from_str(&std::fs::read_to_string(&path[1]).unwrap()).unwrap();
+    assert_eq!(mcp, json!({"mcpServers":{}}));
+    for mode in ["bypassPermissions", "acceptEdits", "default"] {
+        let error = h
+            .request("session/set_config_option", json!({"sessionId":session,"configId":"mode","value":mode}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fixed"));
+    }
+    h.client.kill();
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_session_closes_the_process_if_permission_mode_is_unconfirmed() {
+    let mut processes = load_fixture("simple");
+    processes[0].retain(|frame| !matches!(frame, Frame::Launch(_)));
+    for frame in &mut processes[0] {
+        if let Frame::Cli(message) = frame
+            && message["response"]["request_id"] == "req_1"
+        {
+            message["response"]["response"]["current_permission_mode"] = json!("default");
+        }
+    }
+    let cli = replay_cli(processes);
+    let config = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let h = Harness::connect(
+        cli.clone(),
+        config.path().into(),
+        config.path().join("pending"),
+        std::fs::canonicalize(cwd.path()).unwrap(),
+        Vec::new(),
+    )
+    .await;
+    let error = h
+        .request(
+            "session/new",
+            json!({
+                "cwd":h.cwd, "_meta":{"openidea":{"delegatedReadOnly":true}}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not confirm the delegated permission mode"));
+    assert!(cli.kills.lock()[0].is_cancelled());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -658,7 +884,13 @@ impl Cli for Recorder {
                 }
             }
         });
-        Ok(cli::CliIo { stdin: Box::pin(shim_in), stdout: Box::pin(shim_out), kill: real.kill })
+        Ok(cli::CliIo {
+            stdin: Box::pin(shim_in),
+            stdout: Box::pin(shim_out),
+            kill: real.kill,
+            #[cfg(windows)]
+            job_name: real.job_name,
+        })
     }
 }
 
@@ -950,11 +1182,42 @@ fn which_result_ends_a_turn() {
 }
 
 #[test]
+fn terminal_identity_requires_a_matching_input_uuid() {
+    let current = turn(&["prompt", "steer"], false);
+    for missing in [json!({}), json!({"user_message_uuids": []}), json!({"user_message_uuid": null})] {
+        assert_eq!(result_identity(&current, &missing), ResultIdentity::Unattributed);
+        assert!(belongs(&current, &missing), "ordinary CLI error compatibility is retained");
+    }
+    assert_eq!(
+        result_identity(&current, &json!({"user_message_uuid":"steer"})),
+        ResultIdentity::Matched("steer".into())
+    );
+    assert_eq!(
+        result_identity(&current, &json!({"user_message_uuids":["old","steer"]})),
+        ResultIdentity::Matched("steer".into())
+    );
+    assert_eq!(result_identity(&current, &json!({"user_message_uuid":"prompt"})), ResultIdentity::Foreign);
+    assert_eq!(result_identity(&current, &json!({"user_message_uuid":"other-turn"})), ResultIdentity::Foreign);
+    assert_eq!(
+        result_identity(&current, &json!({"origin":{"kind":"task-notification"},"user_message_uuid":"steer"})),
+        ResultIdentity::Foreign
+    );
+    assert_eq!(
+        result_identity(&turn(&["prompt", "steer"], true), &json!({"user_message_uuid":"prompt"})),
+        ResultIdentity::Matched("prompt".into())
+    );
+}
+
+#[test]
 fn how_results_end_turns() {
     let t = turn(&["a"], false);
     let end = |r: Value| turn_end(&t, &r, Some(1.5e12));
     assert_eq!(end(json!({"subtype": "success", "stop_reason": "end_turn"})), TurnEnd::Stop("end_turn"));
     assert_eq!(end(json!({"subtype": "success", "stop_reason": "max_tokens"})), TurnEnd::Stop("max_tokens"));
+    assert_eq!(
+        end(json!({"subtype":"success","terminal_reason":"api_error"})),
+        TurnEnd::Fail { message: "Claude Code could not complete the model request (api_error).".into(), data: None }
+    );
     assert_eq!(
         end(json!({"subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_streaming"})),
         TurnEnd::Stop("cancelled")
@@ -1274,4 +1537,133 @@ fn mcp_servers_become_an_mcp_config() {
     let kept = path.to_path_buf();
     drop(path);
     assert!(!kept.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_prompt_uses_host_uuid_and_ignores_unattributed_terminal_results() {
+    delegated_prompt_case(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writable_claude_files_require_a_host_bound_turn_and_grant() {
+    delegated_prompt_case(true).await;
+}
+
+async fn delegated_prompt_case(writable: bool) {
+    let cwd = tempfile::tempdir().unwrap();
+    let file = dunce::canonicalize(cwd.path()).unwrap().join("fixture.txt");
+    let mut processes = load_fixture("simple");
+    processes[0].retain(|frame| !matches!(frame, Frame::Launch(_)));
+    let fixture_uuid = processes[0]
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Shim(message) if message["type"] == "user" => message["uuid"].as_str().map(str::to_owned),
+            _ => None,
+        })
+        .unwrap();
+    let mut frames = Vec::new();
+    for frame in processes.remove(0) {
+        match frame {
+            Frame::Cli(mut message) if message["type"] == "control_response" => {
+                if message["response"]["response"].is_object() {
+                    message["response"]["response"]["current_permission_mode"] =
+                        json!(if writable { "manual" } else { "dontAsk" });
+                }
+                frames.push(Frame::Cli(message));
+            }
+            Frame::Cli(mut message) if message["type"] == "system" && message["subtype"] == "init" => {
+                message["session_id"] = json!("__TEST_CLAUDE_SESSION__");
+                message["tools"] = if writable {
+                    json!(["Glob", "Grep", "Read", "Write", "Edit"])
+                } else {
+                    json!(["Glob", "Grep", "Read"])
+                };
+                message["mcp_servers"] = json!([]);
+                frames.push(Frame::Cli(message));
+            }
+            Frame::Cli(mut message) if message["type"] == "result" => {
+                if writable {
+                    for (request, path, allowed) in [
+                        ("granted", file.clone(), true),
+                        ("denied", file.clone(), false),
+                        ("outside", file.parent().unwrap().join("../outside.txt"), false),
+                    ] {
+                        let input = json!({"file_path":path,"content":"fixture write"});
+                        frames.push(Frame::Cli(json!({"type":"control_request","request_id":request,
+                            "request":{"subtype":"can_use_tool","tool_name":"Write","tool_use_id":request,"input":input}})));
+                        let reply = if allowed {
+                            json!({"behavior":"allow","updatedInput":input,"toolUseID":request})
+                        } else {
+                            json!({"behavior":"deny","message":"No active checkout write grant","toolUseID":request})
+                        };
+                        frames.push(Frame::Shim(json!({"type":"control_response","response":{
+                            "subtype":"success","request_id":request,"response":reply
+                        }})));
+                    }
+                }
+                frames.push(Frame::Cli(
+                    json!({"type":"command_lifecycle","command_uuid":fixture_uuid,"state":"completed"}),
+                ));
+                message.as_object_mut().unwrap().remove("user_message_uuids");
+                message.as_object_mut().unwrap().remove("user_message_uuid");
+                message["result"] = json!("UNATTRIBUTED TERMINAL MUST BE IGNORED");
+                frames.push(Frame::Cli(message.clone()));
+                message["user_message_uuid"] = json!("cf7cc601-e7e0-4e5d-8b69-cd5982b1d9ba");
+                frames.push(Frame::Cli(message.clone()));
+                message["user_message_uuid"] = json!(fixture_uuid);
+                message["result"] = json!("hello there");
+                frames.push(Frame::Cli(message));
+            }
+            other => frames.push(other),
+        }
+    }
+    let cli = replay_cli(vec![frames]);
+    let config = tempfile::tempdir().unwrap();
+    let h = Harness::connect(
+        cli.clone(),
+        config.path().into(),
+        config.path().join("pending"),
+        std::fs::canonicalize(cwd.path()).unwrap(),
+        Vec::new(),
+    )
+    .await;
+    let response = h
+        .request(
+            "session/new",
+            json!({"cwd":h.cwd,"_meta":{"openidea":{"delegatedReadOnly":true,"delegatedWritable":writable}}}),
+        )
+        .await
+        .unwrap();
+    let session = response["sessionId"].as_str().unwrap();
+    for turn in [Value::Null, json!("not-a-uuid"), json!("00000000-0000-0000-0000-000000000000")] {
+        assert!(h.request("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"Reply with exactly: hello there"}],"_meta":{"openidea":{"nativeTurnId":turn}}})).await.is_err());
+    }
+    assert!(
+        h.request("_openidea/steer", json!({"sessionId":session,"prompt":[{"type":"text","text":"unbound steering"}]}))
+            .await
+            .is_err()
+    );
+    if writable {
+        h.answers.lock().extend([Some("allow"), Some("deny")]);
+    }
+    let turn = "410c21fa-d2a9-4233-93d5-bdc9fbe57ce1";
+    let result = h.request("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"Reply with exactly: hello there"}],"_meta":{"openidea":{"nativeTurnId":turn}}})).await.unwrap();
+    assert_eq!(result["_meta"]["openidea"]["nativeTurnId"], turn);
+    assert_eq!(result["_meta"]["openidea"]["nativeThreadId"], session);
+    assert_eq!(result["stopReason"], "end_turn");
+    let sent = cli.sent.lock();
+    let users = sent[0].iter().filter(|message| message["type"] == "user").collect::<Vec<_>>();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["uuid"], turn);
+    assert!(!h.text(session, "agent_message_chunk").contains("UNATTRIBUTED"));
+    if writable {
+        let asked = &h.seen.lock().asked;
+        assert_eq!(asked.len(), 2);
+        assert_eq!(
+            asked[0],
+            json!({"sessionId":session,"turnId":turn,"toolUseId":"granted","name":"Write","path":file})
+        );
+        assert_eq!(asked[1]["toolUseId"], "denied");
+    }
+    h.client.kill();
 }

@@ -1,5 +1,5 @@
 import { auxiliaryWindow } from "@/platform/auxWindow";
-import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { Button, IconButton, T, lockDragCursor } from "@/ui";
 import { useChromeIconSize } from "@/ui/density";
 import { maybeEditorService, useWorkbenchChrome } from "@/workbench/contributions";
@@ -8,13 +8,13 @@ import { AgentsView } from "./AgentsView";
 import { openHome, useAgents } from "./store";
 import styles from "./AgentNavigation.module.css";
 
-export function AgentNavigation() {
+export function AgentNavigation({ children }: { children?: ReactNode }) {
   const iconSize = useChromeIconSize();
   return (
-    <nav className={styles.rail} aria-label="Agent navigation">
+    <nav className={children ? styles.embeddedRail : styles.rail} aria-label="Agent navigation">
       <IconButton icon="home" iconSize={iconSize} title="Chats" pressed onClick={() => openHome()} />
       <IconButton icon="plugin" iconSize={iconSize} title="Plugins" action="plugins.settings" />
-      <div className={styles.spacer} />
+      {children ?? <div className={styles.spacer} />}
       <IconButton icon="settings" iconSize={iconSize} title="Settings…" action="file.settings" />
     </nav>
   );

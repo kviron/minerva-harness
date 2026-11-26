@@ -7,6 +7,74 @@ struct Pending {
     cancellation: Cancellation,
     expires: tokio::time::Instant,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(kind: &str) -> ToolContext {
+        ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
+            session_id: "child".into(),
+            run_id: "activation".into(),
+            call_id: kind.into(),
+            cwd: None,
+            policy: PermissionPolicy::ReadOnly,
+            live_policy: None,
+            cancellation: Default::default(),
+            interactions: Arc::default(),
+            sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn question_answers_require_the_current_session_run_call_and_kind() {
+        let broker = InteractionBroker::default();
+        let question = context("question");
+        let approval = context("approval");
+        let question_wait = broker.request(&question, "question", "Question", "Which approach?", vec!["one".into()]);
+        let approval_wait = broker.request(&approval, "approval", "Approval", "Allow action?", vec![]);
+        let answer = async {
+            while broker.list("child").len() != 2 {
+                tokio::task::yield_now().await;
+            }
+            assert!(broker.list_questions("child", "previous").is_empty());
+            assert!(broker.list_questions("other-child", "activation").is_empty());
+            let visible = broker.list_questions("child", "activation");
+            assert_eq!(visible.len(), 1);
+            let original = &visible[0];
+            for (session, run, call) in [
+                ("other-child", "activation", "question"),
+                ("child", "previous", "question"),
+                ("child", "activation", "other-call"),
+            ] {
+                let mut stale = original.clone();
+                stale.session_id = session.into();
+                stale.run_id = run.into();
+                stale.call_id = call.into();
+                assert!(!broker.answer_question(&stale, "one".into()));
+            }
+            let permission = broker.list("child").into_iter().find(|item| item.kind == "approval").unwrap();
+            assert!(!broker.answer_question(&permission, "one".into()));
+            assert!(!broker.answer_question(original, "not offered".into()));
+            broker.pending.lock().unwrap().get_mut(&original.id).unwrap().expires = tokio::time::Instant::now();
+            assert!(broker.list_questions("child", "activation").is_empty());
+            assert!(!broker.answer_question(original, "one".into()));
+            broker.pending.lock().unwrap().get_mut(&original.id).unwrap().expires =
+                tokio::time::Instant::now() + Duration::from_secs(30);
+            assert!(broker.answer_question(original, "one".into()));
+            assert!(!broker.answer_question(original, "one".into()));
+            broker.cancel_call(&approval);
+        };
+        let (question, approval, ()) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(question_wait, approval_wait, answer) })
+                .await
+                .unwrap();
+        assert_eq!(question.unwrap(), "one");
+        assert!(approval.is_err());
+    }
+}
 #[derive(Default)]
 pub struct InteractionBroker {
     pending: Mutex<BTreeMap<String, Pending>>,
@@ -30,6 +98,27 @@ impl InteractionBroker {
             .collect()
     }
     pub fn answer(&self, answer: InteractionAnswer) -> bool {
+        self.answer_matching(answer, |_| true)
+    }
+
+    pub fn list_questions(&self, session_id: &str, run_id: &str) -> Vec<PendingInteraction> {
+        self.list(session_id).into_iter().filter(|item| item.kind == "question" && item.run_id == run_id).collect()
+    }
+
+    /// Delivers to the exact live call. The caller must authorize the binding before using it.
+    pub fn answer_question(&self, question: &PendingInteraction, answer: String) -> bool {
+        self.answer_matching(
+            InteractionAnswer {
+                session_id: question.session_id.clone(),
+                id: question.id.clone(),
+                decision: "answer".into(),
+                answer: Some(answer),
+            },
+            |item| item.kind == "question" && item.run_id == question.run_id && item.call_id == question.call_id,
+        )
+    }
+
+    fn answer_matching(&self, answer: InteractionAnswer, matches: impl FnOnce(&PendingInteraction) -> bool) -> bool {
         let Ok(mut pending) = self.pending.lock() else {
             return false;
         };
@@ -37,6 +126,7 @@ impl InteractionBroker {
             return false;
         };
         if item.view.session_id != answer.session_id
+            || !matches(&item.view)
             || item.cancellation.is_cancelled()
             || item.expires <= tokio::time::Instant::now()
         {
@@ -118,7 +208,7 @@ impl InteractionBroker {
                 view,
                 reply,
                 cancellation: ctx.cancellation.clone(),
-                expires: tokio::time::Instant::now() + Duration::from_secs(600),
+                expires: tokio::time::Instant::now() + INTERACTION_TIMEOUT,
             },
         );
         struct Cleanup<'a>(&'a InteractionBroker, String);
@@ -130,6 +220,6 @@ impl InteractionBroker {
             }
         }
         let _cleanup = Cleanup(self, id);
-        tokio::select! {result=rx=>result.map_err(|_|"interaction expired or cancelled".into()),_=ctx.cancellation.cancelled()=>Err("interaction cancelled".into()),_=tokio::time::sleep(Duration::from_secs(600))=>Err("interaction expired".into())}
+        tokio::select! {result=rx=>result.map_err(|_|"interaction expired or cancelled".into()),_=ctx.cancellation.cancelled()=>Err("interaction cancelled".into()),_=tokio::time::sleep(INTERACTION_TIMEOUT)=>Err("interaction expired".into())}
     }
 }

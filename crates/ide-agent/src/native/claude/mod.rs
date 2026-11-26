@@ -8,6 +8,7 @@
 //! way.
 
 pub(crate) mod cli;
+mod delegated;
 pub(crate) mod history;
 mod settings;
 mod tools;
@@ -167,6 +168,7 @@ pub(super) struct Shim {
 }
 
 struct Session {
+    delegation: Option<delegated::Profile>,
     id: String,
     cwd: PathBuf,
     mcp_config: Option<tempfile::TempPath>,
@@ -214,6 +216,7 @@ struct Turn {
 #[derive(Debug, Clone, PartialEq)]
 enum TurnEnd {
     Stop(&'static str),
+    CorrelatedStop { reason: &'static str, turn_id: String },
     Fail { message: String, data: Option<Value> },
 }
 
@@ -225,6 +228,9 @@ struct Proc {
     kill: CancellationToken,
     next: AtomicU64,
     gone: AtomicBool,
+    inventory_confirmed: AtomicBool,
+    #[cfg(windows)]
+    job_name: Option<String>,
 }
 
 type RpcResult = Result<Value, (i64, String, Option<Value>)>;
@@ -352,8 +358,19 @@ impl Shim {
         pending: bool,
         params: &Value,
     ) -> Arc<Session> {
+        let delegation = if params.pointer("/_meta/openidea/delegatedReadOnly") == Some(&json!(true)) {
+            Some(if params.pointer("/_meta/openidea/delegatedWritable") == Some(&json!(true)) {
+                delegated::Profile::WorkspaceWrite
+            } else {
+                delegated::Profile::ReadOnly
+            })
+        } else {
+            None
+        };
         let mcp_off = mcp_off(params);
-        let mcp_config = mcp_config(params).and_then(|json| match write_mcp_config(&json) {
+        let mcp_json =
+            if delegation.is_some() { Some(json!({"mcpServers":{}}).to_string()) } else { mcp_config(params) };
+        let mcp_config = mcp_json.and_then(|json| match write_mcp_config(&json) {
             Ok(path) => Some(path),
             Err(e) => {
                 tracing::warn!("Claude Code session {id}: cannot write its MCP configuration: {e}");
@@ -362,6 +379,7 @@ impl Shim {
         });
         let skills = params.pointer("/_meta/openidea/skills");
         let session = Arc::new(Session {
+            delegation,
             id: id.to_owned(),
             mcp_config,
             mcp_off,
@@ -414,7 +432,8 @@ impl Shim {
                         "promptCapabilities": { "image": true, "embeddedContext": true },
                         "sessionCapabilities": { "fork": {} },
                         "mcpCapabilities": { "stdio": true, "http": true, "sse": true },
-                        "_meta": { "openidea": { "rollback": true, "steer": true, "backgroundTasks": true, "contextUsage": true } },
+                        "_meta": { "openidea": { "rollback": true, "steer": true, "backgroundTasks": true, "contextUsage": true,
+                            "processJournal": cfg!(windows) } },
                     },
                     "agentInfo": { "name": "claude", "title": "Claude Code", "version": self.version() },
                     "authMethods": [],
@@ -445,7 +464,11 @@ impl Shim {
                     session.replay(&chain);
                 }
                 session.announce_commands();
-                Ok(json!({ "configOptions": session.st.lock().settings.options() }))
+                let mut response = json!({ "configOptions": session.st.lock().settings.options() });
+                if session.delegation.is_some() {
+                    response["sessionId"] = json!(id);
+                }
+                Ok(response)
             }
             "session/fork" => {
                 let source = self.session(&params)?;
@@ -465,7 +488,11 @@ impl Shim {
                     (start, st.settings.clone())
                 };
                 self.save_pending(&id, Some(&start));
-                let session = self.add_session(&id, source.cwd.clone(), start, true, &params);
+                let mut fork_params = params.clone();
+                if source.delegation.is_some() {
+                    fork_params["_meta"] = json!({"openidea":{"delegatedReadOnly":true}});
+                }
+                let session = self.add_session(&id, source.cwd.clone(), start, true, &fork_params);
                 session.st.lock().settings = settings;
                 let options = session.st.lock().settings.options();
                 Ok(json!({ "sessionId": id, "configOptions": options }))
@@ -489,8 +516,29 @@ impl Shim {
             "session/prompt" => {
                 let session = self.session(&params)?;
                 let prompt = params.get("prompt").cloned().unwrap_or_default();
-                match rt.block_on(session.prompt(&prompt))? {
-                    TurnEnd::Stop(reason) => Ok(json!({ "stopReason": reason })),
+                let native_turn = params.pointer("/_meta/openidea/nativeTurnId").and_then(Value::as_str);
+                #[cfg(windows)]
+                let expected_job = params.pointer("/_meta/openidea/processJob").and_then(Value::as_str);
+                match rt.block_on(session.prompt(
+                    &prompt,
+                    native_turn,
+                    #[cfg(windows)]
+                    expected_job,
+                ))? {
+                    TurnEnd::Stop(reason) => {
+                        let response = json!({ "stopReason": reason });
+                        #[cfg(windows)]
+                        let response = {
+                            let mut response = response;
+                            if expected_job.is_some() && reason != "cancelled" {
+                                response["_meta"]["openidea"]["processTurnSettled"] = json!(true);
+                            }
+                            response
+                        };
+                        Ok(response)
+                    }
+                    TurnEnd::CorrelatedStop { reason, turn_id } => Ok(json!({ "stopReason": reason,
+                        "_meta":{"openidea":{"nativeThreadId":session.id,"nativeTurnId":turn_id}} })),
                     TurnEnd::Fail { message, data } => Err((codes::INTERNAL_ERROR, message, data)),
                 }
             }
@@ -498,6 +546,12 @@ impl Shim {
                 let session = self.session(&params)?;
                 session.steer(params.get("prompt").cloned().unwrap_or_default()).map_err(invalid)?;
                 Ok(json!({}))
+            }
+            #[cfg(windows)]
+            "_openidea/managed_process" => {
+                let session = self.session(&params)?;
+                let proc = rt.block_on(session.ensure()).map_err(internal)?;
+                Ok(json!({ "jobName": proc.job_name }))
             }
             "_openidea/context_usage" => {
                 let session = self.session(&params)?;
@@ -689,6 +743,10 @@ impl Session {
             args.extend(["--settings".to_owned(), settings.clone()]);
         }
         args.extend(start.args());
+        if let Some(profile) = self.delegation {
+            args = profile
+                .args(&start, self.mcp_config.as_deref().ok_or("Delegated MCP configuration could not be created")?);
+        }
         let launch =
             Launch { program: shim.config.program.clone(), args, cwd: self.cwd.clone(), env: shim.config.env.clone() };
         let io = shim
@@ -703,6 +761,9 @@ impl Session {
             kill: io.kill.clone(),
             next: AtomicU64::new(1),
             gone: AtomicBool::new(false),
+            inventory_confirmed: AtomicBool::new(false),
+            #[cfg(windows)]
+            job_name: io.job_name,
         });
         let mut stdin = io.stdin;
         let kill = io.kill.clone();
@@ -751,7 +812,20 @@ impl Session {
             }
         });
         // Stop ends the turn only: the client stops background tasks one by one.
-        let init = proc.control(json!({ "subtype": "initialize", "perTaskStopAffordance": true })).await?;
+        let init = proc.control(json!({ "subtype": "initialize", "perTaskStopAffordance": true })).await;
+        let init = match init.and_then(|init| {
+            if let Some(profile) = self.delegation {
+                profile.verify_permission_mode(&init)?;
+            }
+            Ok(init)
+        }) {
+            Ok(init) => init,
+            Err(error) => {
+                proc.kill.cancel();
+                proc.end();
+                return Err(error);
+            }
+        };
         let applied = proc.control(json!({ "subtype": "get_settings" })).await.unwrap_or_default();
         let chosen = {
             let mut st = self.st.lock();
@@ -789,6 +863,9 @@ impl Session {
     }
 
     async fn set(self: &Arc<Self>, option: &str, value: &str) -> Result<(), String> {
+        if self.delegation.is_some() && !matches!(option, settings::MODEL | settings::EFFORT) {
+            return Err("Delegated session permission settings are fixed".into());
+        }
         let proc = self.ensure().await?;
         if !self.st.lock().settings.valid(option, value) {
             return Err(format!("{option} has no value {value}"));
@@ -850,9 +927,28 @@ impl Session {
         }
     }
 
-    async fn prompt(self: &Arc<Self>, prompt: &Value) -> Result<TurnEnd, (i64, String, Option<Value>)> {
+    async fn prompt(
+        self: &Arc<Self>,
+        prompt: &Value,
+        native_turn: Option<&str>,
+        #[cfg(windows)] expected_job: Option<&str>,
+    ) -> Result<TurnEnd, (i64, String, Option<Value>)> {
+        let uuid = if self.delegation.is_some() {
+            let id = native_turn.ok_or_else(|| invalid("Delegated prompt requires a host-bound native turn UUID"))?;
+            if uuid::Uuid::parse_str(id).is_err() || uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.is_nil()) {
+                return Err(invalid("Invalid delegated native turn UUID"));
+            }
+            id.to_owned()
+        } else {
+            new_uuid(false)
+        };
         let proc = self.ensure().await.map_err(internal)?;
-        let uuid = new_uuid(false);
+        #[cfg(windows)]
+        if let Some(expected) = expected_job
+            && proc.job_name.as_deref() != Some(expected)
+        {
+            return Err(internal("Claude Code process changed before prompt dispatch"));
+        }
         let message = user_message(prompt, &uuid, false);
         let rx = {
             let mut st = self.st.lock();
@@ -875,6 +971,9 @@ impl Session {
     }
 
     fn steer(&self, prompt: Value) -> Result<(), String> {
+        if self.delegation.is_some() {
+            return Err("Delegated steering requires durable host turn binding".into());
+        }
         let uuid = new_uuid(true);
         let mut message = user_message(&prompt, &uuid, true);
         message["priority"] = json!("now");
@@ -1001,6 +1100,25 @@ impl Session {
         let mut updates = Vec::new();
         let mut finished = None;
         let mut read_title = false;
+        if let Some(profile) = self.delegation {
+            let inventory = if kind == "system" && msg["subtype"] == "init" {
+                profile.verify_inventory(&msg, &self.id).inspect(|()| {
+                    proc.inventory_confirmed.store(true, Ordering::Release);
+                })
+            } else if matches!(kind, "assistant" | "stream_event" | "result")
+                && !proc.inventory_confirmed.load(Ordering::Acquire)
+            {
+                Err("Claude Code did not confirm the delegated tool inventory before responding".into())
+            } else {
+                Ok(())
+            };
+            if let Err(error) = inventory {
+                self.fail_turn(&error);
+                proc.kill.cancel();
+                proc.end();
+                return;
+            }
+        }
         {
             let mut st = self.st.lock();
             let st = &mut *st;
@@ -1046,7 +1164,7 @@ impl Session {
                     }
                     updates.extend(st.tr.on_rate_limit(&info));
                 }
-                "command_lifecycle" => {
+                "command_lifecycle" if self.delegation.is_none() => {
                     let uuid = msg.get("command_uuid").and_then(Value::as_str);
                     let state = msg.get("state").and_then(Value::as_str);
                     let last = st.turn.as_ref().and_then(|t| t.uuids.last()).map(String::as_str);
@@ -1074,6 +1192,14 @@ impl Session {
                     }
                 }
                 "result" => {
+                    if self.delegation.is_some()
+                        && !st
+                            .turn
+                            .as_ref()
+                            .is_some_and(|turn| matches!(result_identity(turn, &msg), ResultIdentity::Matched(_)))
+                    {
+                        return;
+                    }
                     updates.extend(st.tr.on_result(&msg));
                     if st.pending {
                         // The CLI wrote the session: it resumes as it is from now on.
@@ -1092,6 +1218,16 @@ impl Session {
                     {
                         let turn = st.turn.take().unwrap_or_else(|| unreachable!());
                         let end = turn_end(&turn, &msg, st.limit_resets_ms);
+                        let end = if self.delegation.is_some() {
+                            match end {
+                                TurnEnd::Stop(reason) => {
+                                    TurnEnd::CorrelatedStop { reason, turn_id: turn.uuids[0].clone() }
+                                }
+                                other => other,
+                            }
+                        } else {
+                            end
+                        };
                         finished = Some((turn, end));
                     }
                 }
@@ -1115,6 +1251,9 @@ impl Session {
     /// Claude Code is asked for, as it titles no session run the way the Agent SDK runs it.
     /// Without a title the next turn tries again.
     fn read_title(self: &Arc<Self>) {
+        if self.delegation.is_some() {
+            return;
+        }
         let me = self.clone();
         tokio::spawn(async move {
             let reader = me.clone();
@@ -1175,6 +1314,47 @@ impl Session {
         let name = req.get("tool_name").and_then(Value::as_str).unwrap_or_default().to_owned();
         let input = req.get("input").cloned().unwrap_or_else(|| json!({}));
         let tool_use = req.get("tool_use_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if let Some(profile) = self.delegation {
+            if matches!(profile, delegated::Profile::WorkspaceWrite) && matches!(name.as_str(), "Write" | "Edit") {
+                let deny = json!({"behavior":"deny","message":"No active checkout write grant","toolUseID":tool_use});
+                if !proc.inventory_confirmed.load(Ordering::Acquire) {
+                    return deny;
+                }
+                let Some(updated) = profile.workspace_input(&self.cwd, &name, &input) else { return deny };
+                let Some(shim) = self.shim() else { return deny };
+                let Some(client) = shim.client.get().cloned() else { return deny };
+                let turn = self
+                    .st
+                    .lock()
+                    .turn
+                    .as_ref()
+                    .filter(|turn| !turn.cancelled)
+                    .and_then(|turn| turn.uuids.first().cloned());
+                let Some(turn) = turn else { return deny };
+                let request = json!({
+                    "sessionId":self.id,"turnId":turn,"toolUseId":tool_use,
+                    "name":name,"path":updated["file_path"],
+                });
+                let approval = tokio::time::timeout(
+                    ide_minerva::minerva_runtime::tools::INTERACTION_TIMEOUT,
+                    client.request::<_, bool>("_openidea/scoped_file_write", request, None),
+                )
+                .await;
+                if matches!(approval, Ok(Ok(true)))
+                    && !proc.gone.load(Ordering::Acquire)
+                    && self
+                        .st
+                        .lock()
+                        .turn
+                        .as_ref()
+                        .is_some_and(|current| !current.cancelled && current.uuids.first() == Some(&turn))
+                {
+                    return json!({"behavior":"allow","updatedInput":updated,"toolUseID":tool_use});
+                }
+                return deny;
+            }
+            return delegated::permission(&self.cwd, &name, &input, &tool_use);
+        }
         let deny = |message: &str| json!({ "behavior": "deny", "message": message, "toolUseID": tool_use });
         let Some(shim) = self.shim() else { return deny("The session closed.") };
         let Some(client) = shim.client.get().cloned() else { return deny("The session closed.") };
@@ -1319,20 +1499,37 @@ fn join_answers(items: &[&str]) -> String {
         .join(", ")
 }
 
-/// Whether `result` ends `turn`: it answers the turn's last message, or (stopped) any of
-/// its messages, or names none (the CLI's own error before the turn began).
-fn belongs(turn: &Turn, result: &Value) -> bool {
+/// Evidence carried by a terminal result, independent of ordinary-session compatibility.
+#[derive(Debug, PartialEq, Eq)]
+enum ResultIdentity {
+    Matched(String),
+    Unattributed,
+    Foreign,
+}
+
+/// A delegated terminal can use only `Matched` as correlation evidence. A future
+/// delegated sender must commit its primary UUID to the host admission ledger before
+/// `proc.send`; `Turn.uuids` alone is process-local and cannot prove durable delivery.
+fn result_identity(turn: &Turn, result: &Value) -> ResultIdentity {
     // Prompts are sent with the origin `human`, and their results echo it.
     if result.get("origin").is_some_and(|o| !o.is_null() && o.get("kind").and_then(Value::as_str) != Some("human")) {
-        return false;
+        return ResultIdentity::Foreign;
     }
     let mut uuids = strings(result.get("user_message_uuids"));
     uuids.extend(result.get("user_message_uuid").and_then(Value::as_str).map(str::to_owned));
     if uuids.is_empty() {
-        return true;
+        return ResultIdentity::Unattributed;
     }
     let last = turn.uuids.last();
-    uuids.iter().any(|u| Some(u) == last) || turn.cancelled && uuids.iter().any(|u| turn.uuids.contains(u))
+    match uuids.into_iter().find(|uuid| Some(uuid) == last || turn.cancelled && turn.uuids.contains(uuid)) {
+        Some(uuid) => ResultIdentity::Matched(uuid),
+        None => ResultIdentity::Foreign,
+    }
+}
+
+/// Ordinary sessions also accept the CLI's errors that name no input message.
+fn belongs(turn: &Turn, result: &Value) -> bool {
+    !matches!(result_identity(turn, result), ResultIdentity::Foreign)
 }
 
 /// How `result` ends `turn`.
@@ -1353,8 +1550,10 @@ fn turn_end(turn: &Turn, result: &Value, limit_resets_ms: Option<f64>) -> TurnEn
     if matches!(status, Some(401 | 403)) {
         return TurnEnd::Fail { message: format!("Claude Code authentication failed: {text}"), data: None };
     }
-    let failed =
-        result.get("is_error").and_then(Value::as_bool) == Some(true) || s("subtype").is_some_and(|t| t != "success");
+    let api_error = s("terminal_reason") == Some("api_error");
+    let failed = api_error
+        || result.get("is_error").and_then(Value::as_bool) == Some(true)
+        || s("subtype").is_some_and(|t| t != "success");
     if failed {
         let errors: Vec<String> =
             strings(result.get("errors")).into_iter().filter(|e| !e.starts_with("[ede_diagnostic]")).collect();
@@ -1362,6 +1561,8 @@ fn turn_end(turn: &Turn, result: &Value, limit_resets_ms: Option<f64>) -> TurnEn
             text
         } else if !errors.is_empty() {
             errors.join("\n")
+        } else if api_error {
+            "Claude Code could not complete the model request (api_error).".into()
         } else {
             format!("Claude Code failed ({}).", s("subtype").unwrap_or("error"))
         };

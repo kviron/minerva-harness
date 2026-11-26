@@ -261,6 +261,8 @@ struct Inner {
     /// Fired by [`Peer::kill`]; stops tasks and kills the child.
     kill: CancellationToken,
     pid: Option<u32>,
+    #[cfg(windows)]
+    job_name: std::sync::OnceLock<String>,
     /// Fired when the reader task has stopped (EOF, error or kill).
     reader_done: CancellationToken,
     /// Fired once the child process has exited and been reaped (after [`Peer::kill`],
@@ -401,6 +403,31 @@ impl Peer {
         on_stderr: Box<dyn Fn(String) + Send + Sync>,
         framing: Framing,
     ) -> std::io::Result<Self> {
+        Self::spawn_process(command, args, cwd, env, handler, on_stderr, (framing, false))
+    }
+
+    #[cfg(windows)]
+    pub fn spawn_framed_contained(
+        command: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        handler: Arc<dyn Handler>,
+        on_stderr: Box<dyn Fn(String) + Send + Sync>,
+        framing: Framing,
+    ) -> std::io::Result<Self> {
+        Self::spawn_process(command, args, cwd, env, handler, on_stderr, (framing, true))
+    }
+
+    fn spawn_process(
+        command: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        handler: Arc<dyn Handler>,
+        on_stderr: Box<dyn Fn(String) + Send + Sync>,
+        (framing, _suspended): (Framing, bool),
+    ) -> std::io::Result<Self> {
         use std::process::Stdio;
         // Windows resolves a bare name only as `.exe`; find the file a child
         // would (`PATH` × `PATHEXT`, e.g. `codex` → `codex.cmd`) first.
@@ -411,6 +438,10 @@ impl Peer {
             .envs(ide_core::process::shell_env_in(cwd))
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         ide_core::process::prepare(cmd.as_std_mut());
+        #[cfg(windows)]
+        if _suspended {
+            ide_core::process::suspend_on_spawn(cmd.as_std_mut());
+        }
         // Wrappers (`npx`, `codex.cmd`, launcher scripts) start the real server as a child:
         // stopping the connection stops the whole tree.
         ide_core::process::own_group(cmd.as_std_mut());
@@ -423,6 +454,14 @@ impl Peer {
 
         let on_output: Arc<dyn Fn(String) + Send + Sync> = Arc::from(on_stderr);
         let peer = Self::start(stdout, stdin, handler, false, pid, framing, Some(on_output.clone()));
+        #[cfg(windows)]
+        let job = peer.attach_windows_job();
+        #[cfg(windows)]
+        if _suspended {
+            job.as_ref()
+                .ok_or_else(|| std::io::Error::other("Cannot contain the suspended JSON-RPC process"))?
+                .resume_suspended(pid.ok_or_else(|| std::io::Error::other("Suspended JSON-RPC process has no PID"))?)?;
+        }
 
         let stderr_task = stderr.map(|stderr| {
             let name = command.to_owned();
@@ -432,19 +471,41 @@ impl Peer {
             }))
         });
 
-        peer.supervise(child, stderr_task);
+        peer.supervise(
+            child,
+            stderr_task,
+            #[cfg(windows)]
+            job,
+        );
         Ok(peer)
     }
 
     /// Kills `child` when the connection is torn down; closes the connection when it exits.
     /// After an exit of its own, the connection is reported closed only once what the
     /// process wrote last (stderr, stray stdout) has been read, so a crash report has it.
-    fn supervise(&self, mut child: tokio::process::Child, stderr_task: Option<tokio::task::JoinHandle<()>>) {
+    #[cfg(windows)]
+    fn attach_windows_job(&self) -> Option<ide_core::process::Job> {
+        self.pid().and_then(|pid| {
+            let name = format!("Global\\OpenIDEA-JsonRpc-{}", uuid::Uuid::new_v4());
+            let job = ide_core::process::Job::for_pid_named(pid, &name)?;
+            let _ = self.inner.job_name.set(name);
+            Some(job)
+        })
+    }
+
+    fn supervise(
+        &self,
+        mut child: tokio::process::Child,
+        stderr_task: Option<tokio::task::JoinHandle<()>>,
+        #[cfg(windows)] job: Option<ide_core::process::Job>,
+    ) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let (status, killed) = tokio::select! {
                 status = child.wait() => (status.ok(), false),
                 _ = inner.kill.cancelled() => {
+                    // Keep checking descendants from the root PID: a wrapper can
+                    // spawn before it is assigned to the Windows job.
                     if let Some(pid) = child.id() {
                         let _ = tokio::task::spawn_blocking(move || ide_core::process::kill_tree_of(pid)).await;
                     }
@@ -452,6 +513,23 @@ impl Peer {
                     (child.wait().await.ok(), true)
                 }
             };
+            #[cfg(windows)]
+            if let Some(job) = job {
+                use std::time::Duration;
+                // Keep the handle after the leader exits: a wrapper may already have
+                // exited while a server it started is still holding project files.
+                job.terminate();
+                let stopped = tokio::time::timeout(Duration::from_secs(4), async {
+                    while job.try_is_running()? {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })
+                .await;
+                if !matches!(stopped, Ok(Ok(()))) {
+                    tracing::warn!(?stopped, "JSON-RPC process tree exit was not confirmed");
+                }
+            }
             inner.exited.cancel();
             if !killed {
                 // Bounded: a grandchild may keep the pipes open.
@@ -503,7 +581,14 @@ impl Peer {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let peer = Self::start(reader, writer, handler, true, child.id(), Framing::ContentLength, None);
-        peer.supervise(child, None);
+        #[cfg(windows)]
+        let job = peer.attach_windows_job();
+        peer.supervise(
+            child,
+            None,
+            #[cfg(windows)]
+            job,
+        );
         peer
     }
 
@@ -530,6 +615,8 @@ impl Peer {
             closed,
             kill: CancellationToken::new(),
             pid,
+            #[cfg(windows)]
+            job_name: std::sync::OnceLock::new(),
             reader_done: CancellationToken::new(),
             exited: CancellationToken::new(),
         });
@@ -723,6 +810,13 @@ impl Peer {
     /// OS process id when this peer owns a child process.
     pub fn pid(&self) -> Option<u32> {
         self.inner.pid
+    }
+
+    /// The Job Object attached to this process, if available. A wrapper can have
+    /// started descendants before attachment; this identity alone does not prove containment.
+    #[cfg(windows)]
+    pub fn job_name(&self) -> Option<&str> {
+        self.inner.job_name.get().map(String::as_str)
     }
 
     /// Kills the child process (if any) and tears down the connection.

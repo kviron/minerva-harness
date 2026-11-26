@@ -27,6 +27,24 @@ pub(crate) struct Applied {
 }
 
 impl Timeline {
+    pub fn message_ids(&self) -> HashMap<String, usize> {
+        self.messages.clone()
+    }
+
+    pub fn restore_message_ids(&mut self, ids: HashMap<String, usize>) {
+        self.messages = ids
+            .into_iter()
+            .filter(|(id, index)| {
+                !id.is_empty()
+                    && match self.entries.get(*index) {
+                        Some(AgentEntry::Message { .. }) => true,
+                        Some(AgentEntry::User { .. }) => id.starts_with("followup:"),
+                        _ => false,
+                    }
+            })
+            .collect();
+    }
+
     pub fn from_entries(entries: Vec<AgentEntry>) -> Self {
         let mut t = Self { entries, ..Self::default() };
         for (i, e) in t.entries.iter().enumerate() {
@@ -56,19 +74,36 @@ impl Timeline {
         match kind {
             "user_question" => {
                 let id = str_field(update, "id");
+                let delegated = id.starts_with(crate::async_questions::DELEGATED_QUESTION_PREFIX);
+                let picked = delegated.then(|| update.get("chosen").and_then(Value::as_str)).flatten();
                 let Ok(questions) = serde_json::from_value::<Vec<crate::model::AgentQuestion>>(
                     update.get("questions").cloned().unwrap_or(Value::Null),
                 ) else {
                     return out;
                 };
-                if id.is_empty()
-                    || questions.is_empty()
-                    || self.entries.iter().any(|e| matches!(e, AgentEntry::Question { id: known, .. } if known == &id))
-                {
+                if id.is_empty() || questions.is_empty() {
                     return out;
                 }
-                let index =
-                    self.push(AgentEntry::Question { id, title: str_field(update, "title"), questions, chosen: None });
+                if let Some((index, AgentEntry::Question { chosen, .. })) = self
+                    .entries
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, entry)| matches!(entry, AgentEntry::Question { id: known, .. } if known == &id))
+                {
+                    if chosen.is_none()
+                        && let Some(picked) = picked
+                    {
+                        *chosen = Some(picked.to_owned());
+                        out.changed.push(index);
+                    }
+                    return out;
+                }
+                let index = self.push(AgentEntry::Question {
+                    id,
+                    title: str_field(update, "title"),
+                    questions,
+                    chosen: picked.map(str::to_owned),
+                });
                 out.changed.push(index);
             }
             "agent_message_chunk" | "agent_thought_chunk" => {
@@ -217,6 +252,9 @@ impl Timeline {
                     description: None,
                     status: AgentSubagentStatus::Running,
                     error: None,
+                    fallback: None,
+                    delivery_run_id: None,
+                    queued_followups: Vec::new(),
                     prompt: None,
                     reply: None,
                     tools: 0,
@@ -229,8 +267,18 @@ impl Timeline {
                 i
             }
         };
-        let AgentEntry::Subagent { title, description, status, error, ended_ms, cancellable, .. } =
-            &mut self.entries[index]
+        let AgentEntry::Subagent {
+            title,
+            description,
+            status,
+            error,
+            fallback,
+            delivery_run_id,
+            queued_followups,
+            ended_ms,
+            cancellable,
+            ..
+        } = &mut self.entries[index]
         else {
             return (index, false);
         };
@@ -240,6 +288,17 @@ impl Timeline {
         }
         if let Some(v) = update.get("description") {
             *description = v.as_str().map(str::to_owned);
+        }
+        if let Some(v) = update.get("fallback") {
+            *fallback = serde_json::from_value(v.clone()).ok();
+        }
+        if let Some(v) = update.get("deliveryRunId") {
+            *delivery_run_id = v.as_str().map(str::to_owned);
+        }
+        if let Some(v) = update.get("queuedFollowups")
+            && let Ok(items) = serde_json::from_value(v.clone())
+        {
+            *queued_followups = items;
         }
         if let Some(v) = update.get("capabilities") {
             *cancellable = v.get("cancel").is_some_and(Value::is_object);
@@ -251,6 +310,9 @@ impl Timeline {
             *ended_ms = if working { None } else { ended_ms.or(Some(now)) };
             *status = next;
             *error = message;
+            if !working {
+                *delivery_run_id = None;
+            }
         }
         (index, stopped)
     }
@@ -265,6 +327,25 @@ impl Timeline {
             _ => *field = Some(text.to_owned()),
         }
         Some(index)
+    }
+
+    pub fn user_followup(&mut self, id: &str, text: &str, steered: bool) -> usize {
+        if let Some(&index) = self.messages.get(id)
+            && let AgentEntry::User { text: existing, .. } = &mut self.entries[index]
+        {
+            *existing = text.to_owned();
+            return index;
+        }
+        let index = self.push(AgentEntry::User {
+            text: text.to_owned(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+            sent_ms: None,
+            done_ms: None,
+            steered,
+        });
+        self.messages.insert(id.to_owned(), index);
+        index
     }
 
     /// Adds, replaces or (with `append`) extends session message `id`.
@@ -307,11 +388,12 @@ impl Timeline {
     pub fn stop_subagents(&mut self, now: f64) -> Vec<usize> {
         let mut changed = Vec::new();
         for (i, e) in self.entries.iter_mut().enumerate() {
-            if let AgentEntry::Subagent { status, ended_ms, .. } = e
+            if let AgentEntry::Subagent { status, ended_ms, delivery_run_id, .. } = e
                 && matches!(status, AgentSubagentStatus::Running | AgentSubagentStatus::NeedsInput)
             {
                 *status = AgentSubagentStatus::Cancelled;
                 *ended_ms = Some(now);
+                *delivery_run_id = None;
                 changed.push(i);
             }
         }
@@ -569,5 +651,43 @@ mod tests {
     fn long_output_keeps_its_tail() {
         let s = tail("é".repeat(MAX_OUTPUT));
         assert!(s.starts_with('…') && s.len() <= MAX_OUTPUT + 3);
+    }
+
+    #[test]
+    fn child_delivery_run_is_exact_and_cleared_when_it_stops() {
+        let mut timeline = Timeline::default();
+        timeline.subagent("child", &serde_json::json!({"deliveryRunId":"run-a","state":{"state":"running"}}), 1.0);
+        let AgentEntry::Subagent { delivery_run_id, .. } = &timeline.entries[0] else { panic!() };
+        assert_eq!(delivery_run_id.as_deref(), Some("run-a"));
+        timeline.subagent("child", &serde_json::json!({"deliveryRunId":"run-b","state":{"state":"running"}}), 2.0);
+        let AgentEntry::Subagent { delivery_run_id, .. } = &timeline.entries[0] else { panic!() };
+        assert_eq!(delivery_run_id.as_deref(), Some("run-b"));
+        timeline.subagent("child", &serde_json::json!({"state":{"state":"idle","stopReason":"end_turn"}}), 3.0);
+        let AgentEntry::Subagent { delivery_run_id, .. } = &timeline.entries[0] else { panic!() };
+        assert!(delivery_run_id.is_none());
+    }
+
+    #[test]
+    fn child_followup_projection_survives_storage_and_clears_explicitly() {
+        let mut timeline = Timeline::default();
+        timeline.subagent(
+            "child",
+            &serde_json::json!({"queuedFollowups":[
+                {"id":"work-one","prompt":"Inspect parser","state":"queued"},
+                {"id":"work-two","prompt":"Check lexer","state":"requested"},
+                {"id":"work-three","prompt":"Review tests","state":"unknown"}
+            ]}),
+            1.0,
+        );
+        let persisted = serde_json::to_value(&timeline.entries[0]).unwrap();
+        let restored: AgentEntry = serde_json::from_value(persisted).unwrap();
+        let AgentEntry::Subagent { queued_followups, .. } = restored else { panic!() };
+        assert_eq!(queued_followups.len(), 3);
+        assert_eq!(queued_followups[0].id, "work-one");
+        assert_eq!(queued_followups[1].state, crate::AgentFollowupState::Requested);
+        assert_eq!(queued_followups[2].state, crate::AgentFollowupState::Unknown);
+        timeline.subagent("child", &serde_json::json!({"queuedFollowups":[]}), 2.0);
+        let AgentEntry::Subagent { queued_followups, .. } = &timeline.entries[0] else { panic!() };
+        assert!(queued_followups.is_empty());
     }
 }

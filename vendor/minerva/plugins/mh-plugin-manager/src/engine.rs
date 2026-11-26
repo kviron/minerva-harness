@@ -371,6 +371,8 @@ mod tests {
             sink: std::sync::Arc::new(|_| Ok(())),
         };
         let ctx = ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "s".into(),
             run_id: "r".into(),
             call_id: "c".into(),

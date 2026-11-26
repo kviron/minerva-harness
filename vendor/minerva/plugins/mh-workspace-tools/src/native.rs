@@ -151,17 +151,25 @@ fn register(registry: &ToolRegistry, include_shell: bool) -> Result<(), String> 
         if name == "shell" && !include_shell {
             continue;
         }
-        registry.register(
-            if name == "ask_user" { "native.interaction" } else { "native.workspace" },
-            ToolDefinition {
-                name: name.into(),
-                description: description.into(),
-                input_schema,
-                output_schema: json!({"type":"object"}),
-                side_effect,
-            },
-            move |ctx, args| Box::pin(async move { dispatch(name, ctx, args).await }),
-        )?;
+        let definition = ToolDefinition {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            output_schema: json!({"type":"object"}),
+            side_effect,
+        };
+        let handler =
+            move |ctx, args| -> crate::tools::ToolFuture { Box::pin(async move { dispatch(name, ctx, args).await }) };
+        if name == "ask_user" {
+            registry.register_with_timeout(
+                "native.interaction",
+                definition,
+                crate::tools::INTERACTION_TIMEOUT + Duration::from_secs(5),
+                handler,
+            )?;
+        } else {
+            registry.register("native.workspace", definition, handler)?;
+        }
     }
     Ok(())
 }
@@ -190,6 +198,7 @@ async fn dispatch(name: &str, ctx: ToolContext, args: Value) -> Result<Value, St
             if ctx.cancellation.is_cancelled() {
                 return Err("tool cancelled".into());
             }
+            ctx.verify_admitted_write()?;
             atomic_write(&dir, &path, content)?;
             Ok(json!({"path":requested,"bytes":content.len()}))
         }
@@ -216,6 +225,7 @@ async fn dispatch(name: &str, ctx: ToolContext, args: Value) -> Result<Value, St
             if ctx.cancellation.is_cancelled() {
                 return Err("tool cancelled".into());
             }
+            ctx.verify_admitted_write()?;
             atomic_write(&dir, &path, &updated)?;
             Ok(
                 json!({"path":requested,"diff":format!("--- {requested}\n+++ {requested}\n-{}\n+{}",old.chars().take(32768).collect::<String>(),new.chars().take(32768).collect::<String>()),"bytes":updated.len()}),
@@ -272,6 +282,52 @@ async fn dispatch(name: &str, ctx: ToolContext, args: Value) -> Result<Value, St
         _ => Err("unknown native tool".into()),
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NarrowedPolicy(PermissionPolicy);
+
+    impl LivePermissionPolicy for NarrowedPolicy {
+        fn read_policy(&self, _: &str) -> Result<PermissionPolicy, String> {
+            Ok(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn file_handlers_recheck_the_policy_of_an_already_admitted_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "original").unwrap();
+        for (current, expected) in [
+            (PermissionPolicy::Ask, "tool policy changed; approval required"),
+            (PermissionPolicy::ReadOnly, "tool writes are forbidden in read-only mode"),
+        ] {
+            for (tool, args) in [
+                ("write_file", json!({"path":"note.txt","content":"changed"})),
+                ("patch_file", json!({"path":"note.txt","oldText":"original","newText":"changed"})),
+            ] {
+                // Invoke the handler directly to model a policy change after registry admission.
+                let ctx = ToolContext {
+                    cwd: Some(dir.path().to_path_buf()),
+                    policy: PermissionPolicy::Allow,
+                    live_policy: Some(Arc::new(NarrowedPolicy(current))),
+                    write_approved: false,
+                    session_id: "session".into(),
+                    run_id: "run".into(),
+                    call_id: "edit".into(),
+                    delegation_reads: Default::default(),
+                    cancellation: Default::default(),
+                    interactions: Default::default(),
+                    sink: None,
+                };
+                assert_eq!(dispatch(tool, ctx, args).await.unwrap_err(), expected);
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+            }
+        }
+    }
+}
+
 async fn shell(ctx: &ToolContext, args: &Value) -> Result<Value, String> {
     use tokio::io::AsyncReadExt;
     let cwd = ctx.cwd.as_ref().ok_or("select a workspace directory first")?.canonicalize().map_err(error)?;
@@ -298,7 +354,11 @@ async fn shell(ctx: &ToolContext, args: &Value) -> Result<Value, String> {
         .kill_on_drop(true)
         .spawn()
         .map_err(error)?;
-    let tree = super::process_tree::ProcessTree::attach(&child)?;
+    let tree = super::process_tree::ProcessTree::attach(
+        &child,
+        #[cfg(windows)]
+        None,
+    )?;
     #[cfg(windows)]
     {
         use tokio::io::AsyncWriteExt;

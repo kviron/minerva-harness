@@ -3100,6 +3100,7 @@ name = "mh-sessions"
 version = "0.1.0"
 dependencies = [
  "cordis-rs",
+ "minerva-delegation",
  "minerva-plugin-sdk",
  "rusqlite",
  "serde",
@@ -3176,6 +3177,7 @@ dependencies = [
  "base64 0.22.1",
  "cap-std",
  "cordis-rs",
+ "libc",
  "mh-context",
  "mh-tool-runtime",
  "serde",
@@ -3243,6 +3245,15 @@ dependencies = [
  "minerva-runtime",
  "serde_json",
  "ts-rs",
+]
+
+[[package]]
+name = "minerva-delegation"
+version = "0.1.0"
+dependencies = [
+ "minerva-plugin-sdk",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -3347,8 +3358,10 @@ dependencies = [
  "mh-tool-runtime",
  "mh-workspace-tools",
  "mh-workspaces",
+ "minerva-delegation",
  "minerva-plugin-host",
  "minerva-plugin-sdk",
+ "minerva-tool-subagent",
  "rig-agent",
  "rig-core",
  "rusqlite",
@@ -3357,6 +3370,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3386,6 +3400,18 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "uuid",
+]
+
+[[package]]
+name = "minerva-tool-subagent"
+version = "0.1.0"
+dependencies = [
+ "mh-tool-runtime",
+ "minerva-delegation",
+ "minerva-plugin-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

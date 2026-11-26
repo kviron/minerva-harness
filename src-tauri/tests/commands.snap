@@ -2,7 +2,7 @@
 # name, trust class, placement in a remote window, in bindings.ts, how Tauri runs it.
 agent_accept_changes                         trusted            project_host bindings async
 agent_answer_question                        trusted            project_host bindings async
-agent_archive                                always             project_host bindings sync
+agent_archive                                always             project_host bindings async
 agent_base_text                              trusted            project_host bindings async
 agent_cancel                                 always             project_host bindings sync
 agent_changes                                trusted            project_host bindings async
@@ -14,6 +14,8 @@ agent_create                                 trusted            project_host bin
 agent_custom_import                          trusted            desktop      bindings sync
 agent_custom_remove                          trusted            desktop      bindings sync
 agent_custom_save                            trusted            desktop      bindings sync
+agent_delegation_followup                    trusted            project_host bindings async
+agent_delegation_followup_now                trusted            project_host bindings async
 agent_delete                                 trusted            project_host bindings async
 agent_entries                                always             project_host bindings sync
 agent_external_sessions                      trusted            project_host bindings async
@@ -51,6 +53,7 @@ agent_shell                                  trusted            project_host bin
 agent_skills_list                            always             project_host bindings async
 agent_skills_set_mode                        always             project_host bindings sync
 agent_stop_background                        always             project_host bindings async
+agent_stop_delegation_tree                   always             project_host bindings async
 agent_subscribe                              always             project_host bindings sync
 agent_unarchive                              always             project_host bindings sync
 agent_unqueue                                always             project_host bindings sync

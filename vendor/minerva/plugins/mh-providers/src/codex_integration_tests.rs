@@ -90,6 +90,8 @@ async fn live_subscription_generates_nonce_without_tools_or_history() {
         run_id: "nonce".into(),
         tools: ToolRegistry::default().snapshot(),
         tool_context: HostToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "live-verification".into(),
             run_id: "nonce".into(),
             call_id: String::new(),
@@ -104,6 +106,7 @@ async fn live_subscription_generates_nonce_without_tools_or_history() {
         messages: Vec::new(),
         reasoning_effort: Some("low".into()),
         selection: None,
+        followups: None,
     };
     let result = service
         .chat_agent(
@@ -257,6 +260,8 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
         run_id: "run".into(),
         tools: tools.snapshot(),
         tool_context: HostToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "session".into(),
             run_id: "run".into(),
             call_id: String::new(),
@@ -271,6 +276,7 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
         messages: Vec::new(),
         reasoning_effort: Some("ultra".into()),
         selection: Some(control.clone()),
+        followups: None,
     };
     let result = service
         .chat_agent(ID, "gpt-6.2-astra", vec![Turn::plain("user", "inspect")], Arc::new(|_| Ok(())), run)

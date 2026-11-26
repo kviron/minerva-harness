@@ -54,6 +54,10 @@ export const commands = {
 	 *  ACP Registry ids and taken ids.
 	 */
 	agentCustomSave: (input: CustomAgentInput) => typedError<null, IdeError>(__TAURI_INVOKE("agent_custom_save", { input })),
+	/**  Sends a follow-up to a delegated child. Returns whether it is queued. */
+	agentDelegationFollowup: (task: string, subagent: string, operation: string, prompt: string) => typedError<AgentDelegationReceipt, IdeError>(__TAURI_INVOKE("agent_delegation_followup", { task, subagent, operation, prompt })),
+	/**  Requests next-step delivery of an existing queued Minerva child follow-up. */
+	agentDelegationFollowupNow: (task: string, subagent: string, workItem: string, expectedRun: string) => typedError<boolean, IdeError>(__TAURI_INVOKE("agent_delegation_followup_now", { task, subagent, workItem, expectedRun })),
 	agentDelete: (task: string, removeWorktree: boolean) => typedError<null, IdeError>(__TAURI_INVOKE("agent_delete", { task, removeWorktree })),
 	/**  Entries of `task`'s conversation, or of its subagent `subagent`'s. */
 	agentEntries: (task: string, subagent: string | null) => typedError<AgentEntry[], IdeError>(__TAURI_INVOKE("agent_entries", { task, subagent })),
@@ -162,6 +166,8 @@ export const commands = {
 	agentSkillsSetMode: (name: string, scope: McpScope, mode: AgentSkillMode) => typedError<AgentSkillState[], IdeError>(__TAURI_INVOKE("agent_skills_set_mode", { name, scope, mode })),
 	/**  Stops one of the task's background tasks. */
 	agentStopBackground: (task: string, background: string) => typedError<null, IdeError>(__TAURI_INVOKE("agent_stop_background", { task, background })),
+	/**  Requests cancellation of a Minerva session's delegated descendants. */
+	agentStopDelegationTree: (task: string) => typedError<null, IdeError>(__TAURI_INVOKE("agent_stop_delegation_tree", { task })),
 	/**
 	 *  Streams the project's agent events to `subscriber`, one of the project's windows (a remote
 	 *  host sees them all as one `window`); returns every task.
@@ -2356,6 +2362,11 @@ export type AgentCost = {
 	currency: string,
 };
 
+export type AgentDelegationReceipt = {
+	queued: boolean,
+	workItemId: string,
+};
+
 /**  One item of a task's conversation. */
 export type AgentEntry = { type: "user"; text: string; 
 /**  Names of the files and images sent with it. */
@@ -2383,7 +2394,9 @@ startedMs?: number | null; endedMs?: number | null } | { type: "plan"; items: Ag
 /**  A subagent the agent started: its own session, whose entries are listed separately. */
 { type: "subagent"; 
 /**  The subagent's session id. */
-id: string; title: string | null; description: string | null; status: AgentSubagentStatus; error: string | null; 
+id: string; title: string | null; description: string | null; status: AgentSubagentStatus; error: string | null; fallback?: AgentSubagentFallback | null; 
+/**  Exact internal run accepting explicit next-step input; absent for unsupported or idle children. */
+deliveryRunId?: string | null; queuedFollowups?: AgentQueuedFollowup[]; 
 /**  What it was asked to do, last. */
 prompt: string | null; 
 /**  Its answer. */
@@ -2462,6 +2475,8 @@ export type AgentEvent_Serialize =
 ({ type: "providers" }) & { catalog?: never; entry?: never; eventId?: never; from?: never; id?: never; index?: never; length?: never; limits?: never; provider?: never; reason?: never; subagent?: never; task?: never; text?: never } | 
 /**  The task needs attention once (finished turn, explicit input, or failure). */
 ({ type: "attention"; task: string; eventId: string; reason: AgentAttentionReason }) & { catalog?: never; entry?: never; from?: never; id?: never; index?: never; length?: never; limits?: never; provider?: never; subagent?: never; text?: never };
+
+export type AgentFollowupState = "queued" | "requested" | "unknown";
 
 /**  A form the agent asks the user to fill in (ACP `elicitation/create`, form mode). */
 export type AgentForm = {
@@ -2655,6 +2670,12 @@ export type AgentQuestionOption = {
 export type AgentQueued = {
 	id: string,
 	prompt: AgentPrompt,
+};
+
+export type AgentQueuedFollowup = {
+	id: string,
+	prompt: string,
+	state: AgentFollowupState,
 };
 
 export type AgentRegistry = {
@@ -2876,6 +2897,11 @@ export type AgentStatus =
 "ready" | "failed" | 
 /**  The account's usage limit was reached; the conversation can go on once it resets. */
 "limited" | "archived";
+
+export type AgentSubagentFallback = {
+	requested: string,
+	reason: string,
+};
 
 /**  What a subagent is doing, as its parent reports it. */
 export type AgentSubagentStatus = "running" | 

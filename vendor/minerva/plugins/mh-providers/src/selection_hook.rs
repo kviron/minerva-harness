@@ -1,6 +1,6 @@
 //! One frozen selection binds preparation, Rig selection, and dispatch for a step.
 use super::{
-    estimate_message, project_message, reasoning,
+    estimate_message, prepare_step_history, project_message, reasoning,
     routes::{Route, Routes},
     AgentRunContext, ProviderService, PREAMBLE,
 };
@@ -69,15 +69,8 @@ impl AgentHook for SelectionHook {
                 reasoning::prepare(&route.provider, &route.model, selection.reasoning_effort.as_deref())?
             };
             let prepared = self.run.context.prepare_enriched(&self.run.session_id, &self.run.messages).await?;
-            let history = event.history.iter().map(|message| Arc::new(project_message(message))).collect::<Vec<_>>();
             let preamble = format!("{}\n{}", PREAMBLE, prepared.system_prompt);
-            let estimated = history
-                .iter()
-                .map(|m| estimate_message(m))
-                .sum::<usize>()
-                .saturating_add(estimate_message(&project_message(event.prompt)))
-                .saturating_add(crate::context::estimate_tokens(&preamble))
-                .saturating_add(self.schema_tokens);
+            let (history, estimated) = prepare_step_history(event.history, event.prompt, &preamble, self.schema_tokens);
             let spec = route.spec.as_ref();
             let context_window = spec
                 .as_ref()

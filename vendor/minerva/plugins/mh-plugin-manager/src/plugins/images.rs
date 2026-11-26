@@ -218,6 +218,8 @@ mod tests {
     use crate::tools::{Cancellation, InteractionBroker, PermissionPolicy};
     fn context() -> ToolContext {
         ToolContext {
+            delegation_reads: Default::default(),
+            write_approved: false,
             session_id: "s".into(),
             run_id: "r".into(),
             call_id: "c".into(),

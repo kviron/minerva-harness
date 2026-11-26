@@ -8,6 +8,7 @@ import { confirm, showError, confirmChecked } from "@/workbench/messages";
 import { promptInput } from "@/workbench/inputDialogs";
 import { hasTaskTerminal, isBusy } from "./model";
 import { groupNameError, type OrganizeGroup } from "./organize";
+import { agentProviderId } from "./providerOptions";
 import {
   archiveTask,
   deleteTaskGroup,
@@ -26,6 +27,7 @@ import {
   renameTask,
   setSessionLocation,
   showImportSessions,
+  stopDelegationTree,
   undockTask,
   useAgents,
 } from "./store";
@@ -211,6 +213,21 @@ export function groupMenu(group: OrganizeGroup): MenuItem[] {
 }
 
 export const taskActions: Action[] = [
+  {
+    id: "agents.stopDelegationTree",
+    title: "Stop tree",
+    category: "Agents",
+    when: "projectOpen",
+    enabled: ({ arg }) =>
+      resolveTasks([arg]).some((task) => task.status !== "archived" && agentProviderId(task.provider) === "minerva"),
+    run: async ({ arg }) => {
+      const [task] = resolveTasks([arg]);
+      if (!task || task.status === "archived" || agentProviderId(task.provider) !== "minerva") return;
+      await stopDelegationTree(task.id).catch((error: unknown) =>
+        showError(tx("Couldn't stop the delegation tree"), String(error)),
+      );
+    },
+  },
   {
     id: "agents.importSessions",
     title: "Import Sessions from Other Apps…",

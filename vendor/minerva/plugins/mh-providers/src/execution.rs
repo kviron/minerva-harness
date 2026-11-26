@@ -51,6 +51,8 @@ impl ProviderService {
             dynamic_tools = run.tools.rig_tools(run.tool_context.clone());
             identity_hook = run.tools.identity_hook();
             step_hook = Some(ProviderStepHook {
+                followups: followups::StepFollowups::new(run.followups.clone()),
+                history: hook.clone(),
                 schema_tokens: serde_json::to_string(&run.tools.definitions())
                     .map_err(|e| e.to_string())?
                     .len()

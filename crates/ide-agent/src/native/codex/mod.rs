@@ -3,6 +3,7 @@
 //! a subagent session of the thread that spawned it.
 
 mod commands;
+mod scoped_files;
 mod translate;
 mod trust;
 
@@ -59,7 +60,14 @@ pub(crate) fn connect(
 ) -> std::io::Result<Peer> {
     attach(client, |events| {
         let command = super::newest_install(&spec.command);
-        Peer::spawn_framed(&command, &spec.args, cwd, &spec.env, events, on_stderr, Framing::Lines)
+        #[cfg(windows)]
+        {
+            Peer::spawn_framed_contained(&command, &spec.args, cwd, &spec.env, events, on_stderr, Framing::Lines)
+        }
+        #[cfg(not(windows))]
+        {
+            Peer::spawn_framed(&command, &spec.args, cwd, &spec.env, events, on_stderr, Framing::Lines)
+        }
     })
 }
 
@@ -158,7 +166,8 @@ fn attach(
     client: Arc<dyn Handler>,
     connect_codex: impl FnOnce(Arc<dyn Handler>) -> std::io::Result<Peer>,
 ) -> std::io::Result<Peer> {
-    let shim = Arc::new(CodexShim {
+    let shim = Arc::new_cyclic(|weak| CodexShim {
+        weak: weak.clone(),
         runtime: tokio::runtime::Handle::current(),
         codex: OnceLock::new(),
         client: OnceLock::new(),
@@ -188,6 +197,7 @@ fn attach(
 }
 
 struct CodexShim {
+    weak: Weak<Self>,
     runtime: tokio::runtime::Handle,
     codex: OnceLock<Peer>,
     client: OnceLock<Peer>,
@@ -224,6 +234,9 @@ struct Thread {
     completed: Option<String>,
     /// The `session/prompt` waiting for its turn to end.
     prompt: Option<PendingPrompt>,
+    /// Reject output that cannot be associated with the active delegated prompt.
+    delegated_output: bool,
+    scoped_files: bool,
     /// The current turn's tool items, for approval titles.
     items: HashMap<String, Value>,
     /// Output of running commands, by item id.
@@ -248,11 +261,18 @@ struct Thread {
 }
 
 struct PendingPrompt {
+    host_file_grant: Option<String>,
+    file_turn_ready: Option<tokio::sync::watch::Sender<()>>,
+    delegated_read_only: bool,
+    require_exact_turn: bool,
+    require_started_notification: bool,
     done: oneshot::Sender<(Value, Option<Value>)>,
     /// Known once `turn/start` answers or `turn/started` arrives.
     turn: Option<String>,
     /// Cancelled before the turn was known: interrupt it as soon as it is.
     cancel: bool,
+    early_notifications: Option<std::collections::VecDeque<(String, Value)>>,
+    early_overflow: bool,
 }
 
 struct Output {
@@ -340,6 +360,25 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, ResponseError>
 /// Fills a `thread/start`/`thread/resume`/`thread/fork` request's `config` with the session's
 /// MCP servers and its staged skills: the off ones, by path (`skills.config` entries with
 /// `enabled = false`, which the CLI honors for the copies it discovers natively too).
+fn delegated_thread_config(effective: &Value) -> Result<Value, ResponseError> {
+    let servers = effective
+        .pointer("/config/mcp_servers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("Codex did not report effective MCP configuration"))?;
+    let overrides: serde_json::Map<String, Value> =
+        servers.keys().map(|name| (name.clone(), json!({"enabled": false}))).collect();
+    Ok(json!({
+        "mcp_servers": overrides,
+        "features": { "apps": false, "plugins": false },
+        "approval_policy": "never",
+        "sandbox_mode": "read-only"
+    }))
+}
+
+fn delegated_session(params: &Value) -> bool {
+    params.pointer("/_meta/openidea/delegatedReadOnly").and_then(Value::as_bool) == Some(true)
+}
+
 fn apply_thread_config(params: &Value, request: &mut Value) {
     let mut config = translate::mcp_config(params).unwrap_or_else(|| json!({}));
     let off: Vec<Value> = params
@@ -385,11 +424,43 @@ impl CodexShim {
             "session/fork" => self.fork_session(&params).await,
             "session/set_config_option" => self.set_config(&params).await,
             "session/prompt" => self.prompt(&params).await,
+            "_openidea/probe_workspace_sandbox" => self.probe_workspace_sandbox(&params).await,
             "_openidea/steer" => self.steer(&params).await,
             "_openidea/rollback" => self.rollback(&params).await,
             "session/close" => self.close(&params).await,
             _ => Err(error(codes::METHOD_NOT_FOUND, format!("unsupported method {method}"))),
         }
+    }
+
+    async fn probe_workspace_sandbox(&self, params: &Value) -> Result<Value, ResponseError> {
+        #[cfg(windows)]
+        let command = json!(["cmd.exe", "/d", "/c", "exit 0"]);
+        #[cfg(not(windows))]
+        let command = json!(["/bin/sh", "-c", "exit 0"]);
+        let session = str_param(params, "sessionId")?;
+        let cwd = self
+            .state
+            .lock()
+            .threads
+            .get(session)
+            .and_then(|thread| thread.cwd.clone())
+            .ok_or_else(|| invalid("Codex session has no working directory"))?;
+        let cwd = dunce::canonicalize(cwd).map_err(|error| invalid(error.to_string()))?;
+        let result = self
+            .call(
+                "command/exec",
+                json!({
+                    "command":command,
+                    "cwd":cwd,
+                    "timeoutMs":5000,
+                    "sandboxPolicy":translate::scoped_workspace_sandbox(&cwd),
+                }),
+            )
+            .await?;
+        if result["exitCode"].as_i64() != Some(0) {
+            return Err(invalid("Codex could not start a workspace-scoped process"));
+        }
+        Ok(json!({"ready":true}))
     }
 
     async fn initialize(&self) -> Result<Value, ResponseError> {
@@ -403,7 +474,7 @@ impl CodexShim {
             .and_then(|ua| ua.split_whitespace().next())
             .and_then(|first| first.split_once('/'))
             .map(|(_, v)| v.to_owned());
-        Ok(json!({
+        let response = json!({
             "protocolVersion": 1,
             "agentCapabilities": {
                 "loadSession": true,
@@ -414,7 +485,16 @@ impl CodexShim {
             },
             "agentInfo": { "name": "codex", "title": "Codex", "version": version },
             "authMethods": [],
-        }))
+        });
+        #[cfg(windows)]
+        let response = {
+            let mut response = response;
+            if let Some(name) = self.codex().job_name() {
+                response["agentCapabilities"]["_meta"]["openidea"]["processJob"] = json!(name);
+            }
+            response
+        };
+        Ok(response)
     }
 
     /// Cache only complete, successful listings; a failed page must never become availability.
@@ -485,32 +565,72 @@ impl CodexShim {
 
     async fn new_session(&self, params: &Value) -> Result<Value, ResponseError> {
         let models = self.models().await?;
-        self.prepare_project_trust(params).await;
         let mut request = json!({ "cwd": params.get("cwd") });
-        apply_thread_config(params, &mut request);
+        self.apply_session_config(params, &mut request).await?;
+        let scoped_files = scoped_files::requested(params);
+        if scoped_files {
+            scoped_files::configure_thread(&mut request);
+            request["dynamicTools"] = scoped_files::definitions();
+        }
         let result = self.call("thread/start", request).await?;
         let (id, options) = self.open_thread(&result, &models, None);
         if id.is_empty() {
             return Err(error(codes::INTERNAL_ERROR, "codex started no thread"));
         }
-        self.apply_skill_roots(&id, params).await;
-        self.publish_skills(&id).await;
+        if scoped_files && let Some(thread) = self.state.lock().threads.get_mut(&id) {
+            thread.scoped_files = true;
+        }
+        if !delegated_session(params) {
+            self.apply_skill_roots(&id, params).await;
+            self.publish_skills(&id).await;
+        }
         Ok(json!({ "sessionId": id, "configOptions": options }))
+    }
+
+    async fn apply_session_config(&self, params: &Value, request: &mut Value) -> Result<(), ResponseError> {
+        if delegated_session(params) {
+            let effective = self
+                .call(
+                    "config/read",
+                    json!({
+                        "cwd": params.get("cwd"), "includeLayers": false
+                    }),
+                )
+                .await?;
+            request["config"] = delegated_thread_config(&effective)?;
+        } else {
+            self.prepare_project_trust(params).await;
+            apply_thread_config(params, request);
+        }
+        Ok(())
     }
 
     /// Resumes the thread and replays its history before answering.
     async fn load_session(&self, params: &Value) -> Result<Value, ResponseError> {
         let id = str_param(params, "sessionId")?;
         let models = self.models().await?;
-        self.prepare_project_trust(params).await;
         let mut request = json!({ "threadId": id, "cwd": params.get("cwd") });
-        apply_thread_config(params, &mut request);
+        self.apply_session_config(params, &mut request).await?;
+        let scoped_files = scoped_files::requested(params);
+        if scoped_files {
+            // The verified original thread retains its definitions in Codex's rollout.
+            scoped_files::configure_thread(&mut request);
+        }
         let result = self.call("thread/resume", request).await?;
+        if delegated_session(params) && result.pointer("/thread/id").and_then(Value::as_str) != Some(id) {
+            return Err(error(codes::INTERNAL_ERROR, "Codex resumed a different thread"));
+        }
         let (_, options) = self.open_thread(&result, &models, None);
+        if scoped_files && let Some(thread) = self.state.lock().threads.get_mut(id) {
+            thread.scoped_files = true;
+        }
         let cwd = self.state.lock().threads.get(id).and_then(|t| t.cwd.clone());
         let thread = result.get("thread").unwrap_or(&Value::Null);
         for update in translate::history(thread, cwd.as_deref()) {
             self.emit(id, update);
+        }
+        if delegated_session(params) {
+            return Ok(json!({ "sessionId": id, "configOptions": options }));
         }
         self.apply_skill_roots(id, params).await;
         self.publish_skills(id).await;
@@ -555,14 +675,47 @@ impl CodexShim {
         let session = str_param(params, "sessionId")?.to_owned();
         let prompt = params.get("prompt").unwrap_or(&Value::Null);
         let command = commands::parse(prompt);
+        let delegated_read_only = params.pointer("/_meta/openidea/delegatedReadOnly") == Some(&json!(true));
+        let journaled = params.pointer("/_meta/openidea/processJournal") == Some(&json!(true));
+        let compact = command.as_ref().is_some_and(|command| command.command == BuiltinCommand::Compact);
+        let require_exact_turn = delegated_read_only || (journaled && !compact);
+        if delegated_read_only && command.is_some() {
+            return Err(invalid("Local Codex commands are disabled for delegated read-only tasks"));
+        }
         if let Some(command) = command.as_ref()
             && !command.starts_turn()
         {
-            return self.local_command(&session, command).await;
+            let mut reply = self.local_command(&session, command).await?;
+            if journaled {
+                reply["_meta"]["openidea"]["processTurnSettled"] = json!(true);
+            }
+            return Ok(reply);
         }
         let input = translate::user_input(prompt);
         if input.is_empty() {
             return Err(invalid("empty prompt"));
+        }
+        if delegated_read_only {
+            let status = self
+                .call(
+                    "mcpServerStatus/list",
+                    json!({
+                        "threadId": session, "detail": "toolsAndAuthOnly", "limit": 100
+                    }),
+                )
+                .await?;
+            if !delegated_mcp_is_disabled(&status) {
+                let inventory = status.get("data").and_then(Value::as_array);
+                let detail = if status.get("nextCursor").is_some_and(|cursor| !cursor.is_null()) {
+                    "the inventory is paginated".into()
+                } else if let Some(servers) = inventory {
+                    let unverified = servers.iter().filter(|server| server["runtimeStatus"] != "disabled").count();
+                    format!("{} server(s) reported, {unverified} without confirmed disabled status", servers.len())
+                } else {
+                    "the inventory is missing".into()
+                };
+                return Err(invalid(format!("Delegated Codex requires a verified disabled MCP inventory: {detail}")));
+            }
         }
         let models = if command.is_none() { Some(self.models().await?) } else { None };
         let (done, ended) = oneshot::channel();
@@ -576,7 +729,22 @@ impl CodexShim {
                 return Err(invalid("a turn is already running"));
             }
             let cancel = t.early_cancel.take().is_some_and(|at| at.elapsed() < EARLY_CANCEL);
-            t.prompt = Some(PendingPrompt { done, turn: None, cancel });
+            t.delegated_output = delegated_read_only;
+            let host_file_grant = (t.scoped_files && delegated_read_only && journaled)
+                .then(|| params.pointer("/_meta/openidea/scopedFileGrant").and_then(Value::as_str).map(str::to_owned))
+                .flatten();
+            t.prompt = Some(PendingPrompt {
+                file_turn_ready: host_file_grant.as_ref().map(|_| tokio::sync::watch::channel(()).0),
+                host_file_grant,
+                done,
+                turn: None,
+                cancel,
+                delegated_read_only,
+                require_exact_turn,
+                require_started_notification: journaled && compact,
+                early_notifications: require_exact_turn.then(Default::default),
+                early_overflow: false,
+            });
             t.error = None;
             t.settings.clone()
         };
@@ -610,13 +778,47 @@ impl CodexShim {
                         request["effort"] = json!(effort);
                     }
                 }
+                if delegated_read_only {
+                    request["approvalPolicy"] = json!("never");
+                    request["sandboxPolicy"] = json!({"type":"readOnly"});
+                }
                 self.call("turn/start", request).await
             }
         };
         if let Ok(started) = &started
             && let Some(turn) = started.pointer("/turn/id").and_then(Value::as_str)
         {
+            if delegated_read_only
+                && let Some(operation) = params.pointer("/_meta/openidea/delegatedOperation").and_then(Value::as_str)
+            {
+                let client = self.client.get().ok_or_else(|| invalid("OpenIDEA connection closed"))?;
+                if let Err(cause) = client
+                    .request::<_, Value>(
+                        "_openidea/delegated_codex_turn",
+                        json!({"sessionId":session,"nativeTurnId":turn,"operation":operation}),
+                        None,
+                    )
+                    .await
+                {
+                    self.interrupt(&session, turn);
+                    if let Some(thread) = self.state.lock().threads.get_mut(&session) {
+                        thread.prompt = None;
+                    }
+                    return Err(error(
+                        codes::INTERNAL_ERROR,
+                        format!("Could not record delegated Codex turn: {cause}"),
+                    ));
+                }
+            }
             self.turn_known(&session, turn, false);
+            if require_exact_turn && let Some(shim) = self.weak.upgrade() {
+                shim.replay_early_notifications(&session, turn)?;
+            }
+        } else if started.is_ok() && require_exact_turn {
+            if let Some(thread) = self.state.lock().threads.get_mut(&session) {
+                thread.prompt = None;
+            }
+            return Err(error(codes::INTERNAL_ERROR, "Codex did not return the started turn identity"));
         }
         if started.is_ok()
             && command.is_none()
@@ -634,8 +836,21 @@ impl CodexShim {
             return Err(e);
         }
         let (turn, last_error) = ended.await.map_err(|_| error(codes::INTERNAL_ERROR, "Codex exited"))?;
+        // Compaction only acknowledges scheduling. Its identity arrives in turn/started.
+        let confirmed_turn_id =
+            require_exact_turn.then(|| delegated_completion_id(started.as_ref().ok(), &turn)).transpose()?;
+        if journaled && !matches!(turn["status"].as_str(), Some("completed" | "interrupted" | "failed")) {
+            return Err(error(codes::INTERNAL_ERROR, "Codex returned an unconfirmed terminal status"));
+        }
         let rate_limits = self.state.lock().rate_limits.clone();
-        stop_reason(&turn, last_error, rate_limits.as_ref())
+        let mut reply = stop_reason(&turn, last_error, rate_limits.as_ref())?;
+        if let Some(turn_id) = confirmed_turn_id {
+            reply["_meta"] = json!({"openidea":{"nativeTurnId":turn_id,"nativeThreadId":session}});
+        }
+        if journaled {
+            reply["_meta"]["openidea"]["processTurnSettled"] = json!(true);
+        }
+        Ok(reply)
     }
 
     /// Runs commands that codex-acp historically handled locally: configuration, status,
@@ -858,7 +1073,10 @@ impl CodexShim {
         match t.turn.clone() {
             Some(turn) => self.interrupt(session, &turn),
             None => match t.prompt.as_mut() {
-                Some(p) => p.cancel = true,
+                Some(p) => {
+                    p.cancel = true;
+                    p.file_turn_ready.take();
+                }
                 None => t.early_cancel = Some(Instant::now()),
             },
         }
@@ -883,12 +1101,20 @@ impl CodexShim {
         if t.completed.as_deref() == Some(turn) {
             return;
         }
+        if (t.delegated_output || t.prompt.as_ref().is_some_and(|prompt| prompt.require_exact_turn))
+            && t.prompt.as_ref().is_none_or(|p| p.turn.as_deref().is_some_and(|active| active != turn))
+        {
+            return;
+        }
         if started {
             t.turn = Some(turn.to_owned());
         }
         let Some(p) = t.prompt.as_mut() else { return };
         if p.turn.is_none() {
             p.turn = Some(turn.to_owned());
+            if let Some(ready) = p.file_turn_ready.take() {
+                ready.send_replace(());
+            }
         }
         if started && p.turn.as_deref() == Some(turn) && std::mem::take(&mut p.cancel) {
             self.interrupt(session, turn);
@@ -911,6 +1137,58 @@ impl CodexShim {
 
     fn on_codex_notification(self: &Arc<Self>, method: &str, params: &Value) {
         let thread = params.get("threadId").and_then(Value::as_str).unwrap_or_default();
+        if method.starts_with("item/")
+            || matches!(method, "turn/started" | "turn/completed" | "error" | "turn/plan/updated")
+        {
+            let mut state = self.state.lock();
+            if let Some(prompt) = state.threads.get_mut(thread).and_then(|t| t.prompt.as_mut())
+                && let Some(buffer) = prompt.early_notifications.as_mut()
+            {
+                if buffer.len() < 256 {
+                    buffer.push_back((method.to_owned(), params.clone()));
+                } else {
+                    prompt.early_overflow = true;
+                }
+                return;
+            }
+        }
+        self.dispatch_codex_notification(thread, method, params);
+    }
+
+    fn replay_early_notifications(self: &Arc<Self>, thread: &str, turn: &str) -> Result<(), ResponseError> {
+        loop {
+            let next = {
+                let mut state = self.state.lock();
+                let Some(agent_thread) = state.threads.get_mut(thread) else { return Ok(()) };
+                let Some(prompt) = agent_thread.prompt.as_mut() else { return Ok(()) };
+                if prompt.early_overflow {
+                    agent_thread.prompt = None;
+                    drop(state);
+                    self.interrupt(thread, turn);
+                    return Err(error(codes::INTERNAL_ERROR, "Too many Codex events arrived before turn confirmation"));
+                }
+                let next = prompt.early_notifications.as_mut().and_then(|buffer| buffer.pop_front());
+                if next.is_none() {
+                    prompt.early_notifications = None;
+                }
+                next
+            };
+            let Some((method, params)) = next else { return Ok(()) };
+            self.dispatch_codex_notification(thread, &method, &params);
+        }
+    }
+
+    fn dispatch_codex_notification(self: &Arc<Self>, thread: &str, method: &str, params: &Value) {
+        if method.starts_with("item/") || matches!(method, "error" | "turn/plan/updated") {
+            let turn = params.get("turnId").and_then(Value::as_str);
+            let state = self.state.lock();
+            if state.threads.get(thread).is_some_and(|t| {
+                (t.delegated_output || t.prompt.as_ref().is_some_and(|prompt| prompt.require_exact_turn))
+                    && (turn.is_none() || t.prompt.as_ref().and_then(|p| p.turn.as_deref()) != turn)
+            }) {
+                return;
+            }
+        }
         match method {
             "configWarning" => {
                 let Some(summary) = params.get("summary").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
@@ -1186,6 +1464,11 @@ impl CodexShim {
         let (parent, answer, name) = {
             let mut state = self.state.lock();
             let Some(t) = state.threads.get_mut(thread) else { return };
+            if (t.delegated_output || t.prompt.as_ref().is_some_and(|prompt| prompt.require_exact_turn))
+                && t.prompt.as_ref().and_then(|p| p.turn.as_deref()) != Some(id)
+            {
+                return;
+            }
             if t.turn.as_deref().is_none_or(|r| r == id) {
                 t.turn = None;
             }
@@ -1193,14 +1476,22 @@ impl CodexShim {
             t.items.clear();
             t.last_chunk = None;
             let error = t.error.take();
-            if t.prompt.as_ref().is_some_and(|p| p.turn.as_deref().is_none_or(|p| p == id))
+            let delegated = t.prompt.as_ref().is_some_and(|prompt| prompt.delegated_read_only);
+            if t.prompt
+                .as_ref()
+                .is_some_and(|p| p.turn.as_deref().map_or(!p.require_started_notification, |active| active == id))
                 && let Some(p) = t.prompt.take()
             {
                 let _ = p.done.send((turn.clone(), error.clone()));
             }
             let answer = std::mem::take(&mut t.answer);
-            let name =
-                completed && !id.is_empty() && t.parent.is_none() && t.settings.is_some() && !t.named && !t.naming;
+            let name = completed
+                && !delegated
+                && !id.is_empty()
+                && t.parent.is_none()
+                && t.settings.is_some()
+                && !t.named
+                && !t.naming;
             t.naming |= name;
             (t.parent.clone(), (answer, error), name)
         };
@@ -1253,6 +1544,9 @@ impl CodexShim {
 
     /// Requests from codex: approvals and questions, asked as ACP permission requests.
     fn on_codex_request(&self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
+        if method == "item/tool/call" {
+            return Ok(self.scoped_file_call(params));
+        }
         let thread = params.get("threadId").and_then(Value::as_str).unwrap_or_default().to_owned();
         let item_id = params.get("itemId").and_then(Value::as_str).unwrap_or_default().to_owned();
         let (item, cwd) = {
@@ -1569,6 +1863,31 @@ fn skills_text(response: &Value) -> String {
     } else {
         format!("Available skills:\n{}", names.iter().map(|name| format!("- {name}")).collect::<Vec<_>>().join("\n"))
     }
+}
+
+fn delegated_completion_id<'a>(started: Option<&Value>, completed: &'a Value) -> Result<&'a str, ResponseError> {
+    let started = started.and_then(|reply| reply.pointer("/turn/id")).and_then(Value::as_str);
+    completed
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && Some(*id) == started)
+        .ok_or_else(|| error(codes::INTERNAL_ERROR, "Codex completion does not match the started turn"))
+}
+
+fn delegated_mcp_is_disabled(response: &Value) -> bool {
+    response.get("nextCursor").is_none_or(Value::is_null)
+        && response.get("data").and_then(Value::as_array).is_some_and(|servers| {
+            servers.iter().all(|server| {
+                server["runtimeStatus"] == "disabled"
+                    && ["tools", "resources", "resourceTemplates"].iter().all(|key| {
+                        server.get(key).is_none_or(|value| {
+                            value.is_null()
+                                || value.as_array().is_some_and(Vec::is_empty)
+                                || value.as_object().is_some_and(serde_json::Map::is_empty)
+                        })
+                    })
+            })
+        })
 }
 
 fn mcp_text(response: &Value) -> String {

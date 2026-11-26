@@ -1,5 +1,6 @@
 /** An agent task as an editor tab: the conversation, a composer and the task's changed files. */
 import type { AgentTask } from "@/bindings";
+import { executeAction } from "@/platform/actions";
 import { useTx } from "@/platform/i18n";
 import { onIdeEvent } from "@/platform/ipc";
 import { isSameOrInside } from "@/platform/paths";
@@ -8,6 +9,7 @@ import { EmptyState, Icon, IconButton, T } from "@/ui";
 import { notifications, useEditorShown, useToolWindowShown, type EditorInput } from "@/workbench/contributions";
 import clsx from "clsx";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useShallow } from "zustand/react/shallow";
 import { useChangesWidthStyle } from "./ChangesResizer";
 import styles from "./Session.module.css";
@@ -27,8 +29,12 @@ import { ChangesPane, useChangesOpen, useLocalHead } from "./session/ChangesPane
 import { FoldedContent } from "./session/Folds";
 import { QuestionCard } from "./session/QuestionForm";
 import { BackgroundTasks } from "./session/BackgroundTasks";
+import { SubagentRoster } from "./session/SubagentRoster";
+import { SubagentComposer } from "./session/SubagentComposer";
+import { SubagentFollowupQueue } from "./session/SubagentFollowupQueue";
 import { SessionComposer } from "./session/SessionComposer";
 import { Stream } from "./session/Stream";
+import { agentProviderId } from "./providerOptions";
 import { focusedSession, registerReachableSession, setFocusedSession, type FocusedSession } from "./sessionFocus";
 import {
   cancelTask,
@@ -37,15 +43,26 @@ import {
   markVisible,
   refreshChanges,
   scheduleChanges,
+  setHistorySubagent,
   useAgents,
 } from "./store";
 
-export function SessionEditor({ input, docked = false }: { input: EditorInput; docked?: boolean }) {
+export function SessionEditor({
+  input,
+  docked = false,
+  headerTools,
+}: {
+  input: EditorInput;
+  docked?: boolean;
+  headerTools?: HTMLElement | null;
+}) {
   const id = (input.data as { task: string }).task;
-  return <TaskSession key={id} id={id} docked={docked} />;
+  return <TaskSession key={id} id={id} docked={docked} headerTools={headerTools} />;
 }
 
-function TaskSession({ id, docked }: { id: string; docked: boolean }) {
+const ROOT_PATH: string[] = [];
+
+function TaskSession({ id, docked, headerTools }: { id: string; docked: boolean; headerTools?: HTMLElement | null }) {
   const task = useAgents((s) => s.tasks.get(id));
   const entries = useAgents((s) => s.entries.get(id));
   // Grouping needs commits of the task's own: local checkouts keep the flat list.
@@ -65,7 +82,17 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
   const [changesOpen, setChangesOpen] = useChangesOpen(id, changes ?? null, docked);
   const changesWidth = useChangesWidthStyle();
   // The subagent conversation shown, with the subagents that lead to it (empty: the task's own).
-  const [path, setPath] = useState<string[]>([]);
+  const [localPath, setLocalPath] = useState<string[]>(ROOT_PATH);
+  const useHistoryPath = useAgents((s) => s.mainAgent && s.lastTask === id);
+  const historyPath = useAgents((s) => (s.historySubagent?.task === id ? s.historySubagent.path : ROOT_PATH));
+  const path = useHistoryPath ? historyPath : localPath;
+  const setPath = useCallback(
+    (next: string[]) => {
+      if (useHistoryPath) setHistorySubagent(id, next);
+      else setLocalPath(next);
+    },
+    [id, useHistoryPath],
+  );
   const view = path.at(-1) ?? null;
   const viewEntries = useAgents((s) => s.entries.get(entriesKey(id, view)));
   const loadError = useAgents((s) => s.entryLoads.get(entriesKey(id, view))?.error);
@@ -106,7 +133,7 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
       void loadEntries(id, view).catch(() => undefined);
     }
   }, [id, view, connected]);
-  const openSubagent = useCallback((sub: string) => setPath((p) => [...p, sub]), []);
+  const openSubagent = useCallback((sub: string) => setPath([...path, sub]), [path, setPath]);
   const [finding, setFinding] = useState(false);
   const [findFocus, setFindFocus] = useState(0);
   const [inputFocus, setInputFocus] = useState(0);
@@ -142,6 +169,35 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
     if (session.focusInput) return registerReachableSession(session);
   }, [session]);
   if (!task) return <EmptyState title="This agent task no longer exists" />;
+  const currentChild = cards.at(-1);
+  const canFollowup =
+    currentChild &&
+    currentChild.id.startsWith("del_") &&
+    agentProviderId(task.provider) === "minerva" &&
+    task.status !== "archived" &&
+    (subagentWorking(currentChild.status) || currentChild.status === "done");
+  const tools = !view && (
+    <>
+      <SubagentRoster
+        entries={entries}
+        onOpen={openSubagent}
+        onStopTree={
+          agentProviderId(task.provider) === "minerva" && task.status !== "archived"
+            ? () => void executeAction("agents.stopDelegationTree", task.id)
+            : undefined
+        }
+      />
+      <BackgroundTasks
+        tasks={(task.background ?? []).filter((background) => background.kind !== "local_agent")}
+        canStop={task.capabilities?.backgroundTasks ?? false}
+        onStop={(id) =>
+          void stopBackgroundTask(task.id, id).catch((error: unknown) =>
+            notifications().notify({ level: "error", title: "Couldn't stop the background task", body: String(error) }),
+          )
+        }
+      />
+    </>
+  );
   return (
     <div
       ref={sessionRoot}
@@ -160,21 +216,17 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
       }}
     >
       <div className={styles.conversation} hidden={docked && changesOpen}>
-        {!view && (
-          <BackgroundTasks
-            tasks={(task.background ?? []).filter((background) => background.kind !== "local_agent")}
-            canStop={task.capabilities?.backgroundTasks ?? false}
-            onStop={(id) =>
-              void stopBackgroundTask(task.id, id).catch((error: unknown) =>
-                notifications().notify({
-                  level: "error",
-                  title: "Couldn't stop the background task",
-                  body: String(error),
-                }),
-              )
-            }
-          />
-        )}
+        {headerTools
+          ? createPortal(tools, headerTools)
+          : headerTools === undefined &&
+            !view && (
+              <header className={styles.conversationTools}>
+                {entries?.some((entry) => entry.type === "subagent") && (
+                  <strong title={task.title}>{task.title}</strong>
+                )}
+                {tools}
+              </header>
+            )}
         {view && <SubagentBar task={task} path={path} cards={cards} onNavigate={setPath} />}
         <FoldedContent.Provider value={finding && shown}>
           <Stream
@@ -191,9 +243,21 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
           />
         </FoldedContent.Provider>
         {view ? (
-          <div className={styles.readOnly}>
-            <T>Subagents take their instructions from the agent that started them.</T>
-          </div>
+          canFollowup ? (
+            <SubagentComposer
+              key={view}
+              task={task.id}
+              subagent={view}
+              working={subagentWorking(currentChild.status)}
+              deliveryRunId={currentChild.deliveryRunId}
+              queuedFollowups={currentChild.queuedFollowups ?? []}
+            />
+          ) : (
+            <div className={styles.readOnly}>
+              <SubagentFollowupQueue items={currentChild?.queuedFollowups ?? []} />
+              <T>Subagents take their instructions from the agent that started them.</T>
+            </div>
+          )
         ) : (
           <>
             <QuestionCard task={task} entries={entries ?? null} />
@@ -207,7 +271,6 @@ function TaskSession({ id, docked }: { id: string; docked: boolean }) {
               commits={commits}
               changesOpen={changesOpen}
               onToggleChanges={() => setChangesOpen(!changesOpen)}
-              onOpenSubagent={openSubagent}
             />
           </>
         )}

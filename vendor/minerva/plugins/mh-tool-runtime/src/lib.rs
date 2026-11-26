@@ -1,6 +1,8 @@
 //! Scoped admission, policy, cancellation and canonical tool validation.
 //! DSH contracts/pipeline/executor mapped to owned Rust snapshots and futures;
 //! approval/questions use per-call oneshots rather than Cordis waterfalls.
+#[cfg(test)]
+mod delegation_tests;
 pub mod files;
 mod interaction;
 #[cfg(test)]
@@ -14,7 +16,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -77,9 +79,24 @@ pub trait ToolEventSink: Send + Sync {
 }
 pub trait LivePermissionPolicy: Send + Sync {
     fn read_policy(&self, session_id: &str) -> Result<PermissionPolicy, String>;
+
+    fn run_writable_delegation(
+        &self,
+        _caller: minerva_plugin_sdk::delegation::Caller,
+        _request: minerva_plugin_sdk::delegation::StartRequest,
+        _child: Option<String>,
+        _policy: PermissionPolicy,
+        _cancel: Cancellation,
+    ) -> ToolFuture {
+        Box::pin(async { Err("Writable delegation requires an OpenIDEA checkout lease".into()) })
+    }
 }
 #[derive(Clone)]
 pub struct ToolContext {
+    /// Populated by the admitted snapshot, never by model arguments.
+    pub delegation_reads: BTreeMap<String, u64>,
+    /// Bound to this call by the registry after a positive interactive approval.
+    pub write_approved: bool,
     pub session_id: String,
     pub run_id: String,
     pub call_id: String,
@@ -92,19 +109,25 @@ pub struct ToolContext {
     pub sink: Option<Arc<dyn ToolEventSink>>,
 }
 impl ToolContext {
+    pub fn verify_admitted_write(&self) -> Result<(), String> {
+        match self.effective_policy()? {
+            PermissionPolicy::ReadOnly => Err("tool writes are forbidden in read-only mode".into()),
+            PermissionPolicy::Ask if !self.write_approved => Err("tool policy changed; approval required".into()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn effective_policy(&self) -> Result<PermissionPolicy, String> {
         let current = match &self.live_policy {
             Some(reader) => reader.read_policy(&self.session_id)?,
             None => self.policy,
         };
-        Ok(match (self.policy, current) {
-            (PermissionPolicy::ReadOnly, _) | (_, PermissionPolicy::ReadOnly) => PermissionPolicy::ReadOnly,
-            (PermissionPolicy::Ask, _) | (_, PermissionPolicy::Ask) => PermissionPolicy::Ask,
-            _ => PermissionPolicy::Allow,
-        })
+        Ok(self.policy.restrict(current))
     }
 }
+
 struct Registration {
+    id: u64,
     owner: String,
     definition: ToolDefinition,
     handler: Arc<ToolHandler>,
@@ -119,7 +142,8 @@ impl cordis::Service for ToolRegistry {
     const NAME: &'static str = "studio.tools";
 }
 #[derive(Clone, Default)]
-pub struct AdmittedTools(BTreeMap<String, Arc<Registration>>, IdentityHook);
+pub struct AdmittedTools(BTreeMap<String, Arc<Registration>>, IdentityHook, Arc<tokio::sync::RwLock<()>>);
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
 impl ToolRegistry {
     pub fn register<F>(&self, owner: &str, definition: ToolDefinition, handler: F) -> Result<(), String>
     where
@@ -153,6 +177,7 @@ impl ToolRegistry {
         tools.insert(
             definition.name.clone(),
             Arc::new(Registration {
+                id: NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed),
                 owner: owner.into(),
                 definition,
                 handler: Arc::new(handler),
@@ -180,11 +205,34 @@ impl ToolRegistry {
         {
             let tools = self.0.lock().expect("tool registry poisoned").clone();
             let hook = IdentityHook { names: tools.keys().cloned().collect(), pending: Arc::default() };
-            AdmittedTools(tools, hook)
+            AdmittedTools(tools, hook, Arc::default())
         }
     }
 }
 impl AdmittedTools {
+    pub fn try_quiesce_writes(&self) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
+        self.2.clone().try_write_owned().map_err(|_| "Tool writes are still active".into())
+    }
+
+    pub fn delegation_reads(&self) -> BTreeMap<String, u64> {
+        self.0.iter().filter(|(_, tool)| delegation_reader(tool)).map(|(name, tool)| (name.clone(), tool.id)).collect()
+    }
+    pub fn delegation_writes(&self) -> BTreeMap<String, u64> {
+        self.0.iter().filter(|(_, tool)| delegation_writer(tool)).map(|(name, tool)| (name.clone(), tool.id)).collect()
+    }
+
+    pub fn restrict_to_registrations(self, allowed: &BTreeMap<String, u64>) -> Self {
+        self.restrict_delegation(allowed, false)
+    }
+
+    pub fn restrict_delegation(mut self, allowed: &BTreeMap<String, u64>, writable: bool) -> Self {
+        self.0.retain(|name, tool| {
+            (delegation_reader(tool) || writable && delegation_writer(tool)) && allowed.get(name) == Some(&tool.id)
+        });
+        self.1 = IdentityHook { names: self.0.keys().cloned().collect(), pending: Arc::default() };
+        self
+    }
+
     pub fn restrict_to(mut self, names: &[String]) -> Self {
         self.0.retain(|name, _| names.contains(name));
         self.1 = IdentityHook { names: self.0.keys().cloned().collect(), pending: Arc::default() };
@@ -205,6 +253,7 @@ impl AdmittedTools {
         self
     }
     pub async fn execute(&self, name: &str, args: Value, mut ctx: ToolContext) -> Result<Value, String> {
+        ctx.delegation_reads = self.delegation_reads();
         let caller_cancellation = ctx.cancellation.clone();
         ctx.cancellation = Cancellation::child(caller_cancellation.clone());
         let tool = self.0.get(name).ok_or("tool was not admitted for this step")?;
@@ -229,10 +278,13 @@ impl AdmittedTools {
                     PermissionPolicy::ReadOnly => return Err("tool writes are forbidden in read-only mode".into()),
                     PermissionPolicy::Ask => {
                         emit("requires-approval", None)?;
-                        let answer = ctx
-                            .interactions
-                            .request(&ctx, "approval", name, &format!("Allow {name} for this call?"), vec![])
-                            .await?;
+                        let prompt = if delegation_writer(tool) {
+                            let path = args.get("path").and_then(Value::as_str).ok_or("Missing workspace file path")?;
+                            format!("Allow {name} on {path:?} for this call?")
+                        } else {
+                            format!("Allow {name} for this call?")
+                        };
+                        let answer = ctx.interactions.request(&ctx, "approval", name, &prompt, vec![]).await?;
                         if answer != "allow" {
                             return Err("tool approval denied".into());
                         }
@@ -241,21 +293,37 @@ impl AdmittedTools {
                     PermissionPolicy::Allow => {}
                 }
             }
-            if ctx.cancellation.is_cancelled() {
-                return Err("tool cancelled".into());
-            }
-            if !tool.active.load(Ordering::SeqCst) {
-                return Err("tool owner was revoked".into());
-            }
-            if tool.definition.side_effect {
-                match ctx.effective_policy()? {
-                    PermissionPolicy::ReadOnly => return Err("tool writes are forbidden in read-only mode".into()),
-                    PermissionPolicy::Ask if !approved => return Err("tool policy changed; approval required".into()),
-                    _ => {}
+            let _write_dispatch = if tool.definition.side_effect {
+                Some(self.2.try_read().map_err(|_| "Tool writes are paused")?)
+            } else {
+                None
+            };
+            let verify_dispatch = || -> Result<(), String> {
+                if ctx.cancellation.is_cancelled() || caller_cancellation.is_cancelled() {
+                    return Err("tool cancelled".into());
                 }
-            }
+                if !tool.active.load(Ordering::SeqCst) {
+                    return Err("tool owner was revoked".into());
+                }
+                if tool.definition.side_effect {
+                    match ctx.effective_policy()? {
+                        PermissionPolicy::ReadOnly => return Err("tool writes are forbidden in read-only mode".into()),
+                        PermissionPolicy::Ask if !approved => {
+                            return Err("tool policy changed; approval required".into())
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            };
+            verify_dispatch()?;
             emit("running", None)?;
-            let output = (tool.handler)(ctx.clone(), args.clone()).await?;
+            if ctx.sink.is_some() {
+                verify_dispatch()?;
+            }
+            let mut admitted = ctx.clone();
+            admitted.write_approved = approved;
+            let output = (tool.handler)(admitted, args.clone()).await?;
             tool.output.validate(&output).map_err(|e| format!("invalid tool output: {e}"))?;
             if serde_json::to_vec(&output).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
                 return Err("tool output exceeds 1 MiB".into());
@@ -349,6 +417,20 @@ impl AdmittedTools {
             })
             .collect()
     }
+}
+fn delegation_writer(tool: &Registration) -> bool {
+    tool.definition.side_effect
+        && tool.owner == "native.workspace"
+        && matches!(tool.definition.name.as_str(), "write_file" | "patch_file")
+}
+
+fn delegation_reader(tool: &Registration) -> bool {
+    tool.active.load(Ordering::SeqCst)
+        && !tool.definition.side_effect
+        && matches!(
+            (tool.owner.as_str(), tool.definition.name.as_str()),
+            ("native.workspace", "read_file" | "search_files") | ("native.interaction", "ask_user")
+        )
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RigCallIdentity {

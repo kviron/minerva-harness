@@ -51,7 +51,7 @@ import { FindBar } from "./FindBar";
 import { OpenFolds, RevealFold } from "./Folds";
 import { Entry } from "./messages";
 import { ProcessRun, TurnFold } from "./ProcessRows";
-import { providerName } from "./shared";
+import { conversationAuthor } from "./shared";
 import { WorkingRow } from "./WorkingRow";
 
 /**
@@ -384,6 +384,7 @@ export function Stream({
   const times = useMemo(() => (entries && !subagent ? replyTimes(entries) : null), [entries, subagent]);
   const thinking = useMemo(() => (entries ? thoughtDurations(entries) : null), [entries]);
   const busy = subagent ? subagentWorking(subagent.status) : isBusy(task.status);
+  const { id: authorId, name: authorName } = conversationAuthor(task.provider, subagent);
   const lastIndex = entries ? entries.length - 1 : -1;
   // Keep the row stable when earlier history is prepended; its author can move with the work.
   const rows = useMemo(() => {
@@ -564,8 +565,8 @@ export function Stream({
                   {authorHeaders.has(row.index) && (
                     <div className={styles.agentAuthor}>
                       <div className={styles.role}>
-                        <Icon name={providerIcon(task.provider)} size={13} />
-                        <span>{providerName(task.provider)}</span>
+                        <Icon name={providerIcon(authorId)} size={13} />
+                        <span>{authorName}</span>
                       </div>
                     </div>
                   )}

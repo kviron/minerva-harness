@@ -82,6 +82,8 @@ pub(super) struct CliIo {
     pub stdin: Pin<Box<dyn AsyncWrite + Send>>,
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
     pub kill: CancellationToken,
+    #[cfg(windows)]
+    pub job_name: Option<String>,
 }
 
 pub(super) type OnStderr = Arc<dyn Fn(String) + Send + Sync>;
@@ -100,6 +102,8 @@ impl Cli for Process {
         ide_core::process::prepare(cmd.as_std_mut());
         // `claude` may be a wrapper (`claude.cmd` → node): stopping it stops what it started.
         ide_core::process::own_group(cmd.as_std_mut());
+        #[cfg(windows)]
+        ide_core::process::suspend_on_spawn(cmd.as_std_mut());
         cmd.args(&l.args)
             .current_dir(&l.cwd)
             .envs(ide_core::process::shell_env())
@@ -111,6 +115,15 @@ impl Cli for Process {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn()?;
+        #[cfg(windows)]
+        let (job_name, job) = {
+            let pid = child.id().ok_or_else(|| std::io::Error::other("Suspended Claude CLI has no PID"))?;
+            let name = format!("Global\\OpenIDEA-Claude-{}", uuid::Uuid::new_v4());
+            let job = ide_core::process::Job::for_pid_named(pid, &name)
+                .ok_or_else(|| std::io::Error::other("Cannot contain Claude Code"))?;
+            job.resume_suspended(pid)?;
+            (Some(name), job)
+        };
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
         if let Some(stderr) = child.stderr.take() {
@@ -129,8 +142,16 @@ impl Cli for Process {
                     let _ = child.wait().await;
                 }
             }
+            #[cfg(windows)]
+            job.terminate();
         });
-        Ok(CliIo { stdin: Box::pin(stdin), stdout: Box::pin(stdout), kill })
+        Ok(CliIo {
+            stdin: Box::pin(stdin),
+            stdout: Box::pin(stdout),
+            kill,
+            #[cfg(windows)]
+            job_name,
+        })
     }
 }
 

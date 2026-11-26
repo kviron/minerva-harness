@@ -1,4 +1,4 @@
-//! Coding agents (Claude Code, Codex, Gemini CLI…) driven over the Agent Client Protocol.
+//! Coding agents (Claude Code, Codex, Gemini CLIР Р†Р вЂљР’В¦) driven over the Agent Client Protocol.
 //!
 //! A task is one agent conversation, working in its own git worktree or in the project
 //! checkout. Each task runs its agent's ACP server as a child process (newline-delimited
@@ -14,6 +14,7 @@ mod catalogs;
 mod cli_update;
 mod config;
 mod conversation;
+pub mod delegation;
 mod elicitation;
 mod external;
 pub mod hermes;
@@ -27,6 +28,7 @@ pub mod security;
 mod shell;
 pub mod skills;
 mod timeline;
+mod workspace_writes;
 mod worktree;
 
 pub use catalogs::AgentCatalogs;
@@ -159,6 +161,7 @@ struct Shared {
     paths: AgentPaths,
     runtime: tokio::runtime::Handle,
     connector: Connector,
+    minerva: std::sync::OnceLock<Arc<ide_minerva::Service>>,
     sinks: RwLock<HashMap<String, AgentSink>>,
     security: RwLock<Option<SecurityHook>>,
     new_task_approvals: RwLock<Option<NewTaskApprovalsHook>>,
@@ -171,6 +174,7 @@ struct Shared {
     copilot_acp_fallback: Mutex<HashSet<CopilotBinaryKey>>,
     /// [`IDLE_RELEASE`], in milliseconds (shorter in tests).
     idle_release_ms: AtomicU64,
+    idle_delegated: delegation::idle::IdleExecutors,
     mcp_servers_hook: RwLock<Option<Arc<McpServersFn>>>,
     mcp_executable_hook: RwLock<Option<Arc<McpExecutableFn>>>,
     skills_policy_hook: RwLock<Option<Arc<SkillsPolicyFn>>>,
@@ -367,9 +371,13 @@ impl Shared {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskFile {
+    #[serde(default)]
+    delegated_read_only: bool,
     task: AgentTask,
     session_id: Option<String>,
     entries: Vec<AgentEntry>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    main_message_ids: HashMap<String, usize>,
     /// Settings the user chose, re-applied to every new or reloaded session.
     #[serde(default)]
     wanted: Vec<AgentConfigChoice>,
@@ -426,6 +434,7 @@ impl PendingModel {
 type Snapshot = BTreeMap<String, worktree::Stamp>;
 
 struct TaskState {
+    delegated_read_only: bool,
     task: AgentTask,
     session_id: Option<String>,
     conversation: Conversation,
@@ -448,6 +457,10 @@ struct TaskState {
     /// the like), as it sent them: unlike a turn they outlive it, so an idle release
     /// waits for the last one. A (re)started process runs nothing yet.
     background_tasks: Vec<Value>,
+    background_revision: Option<u64>,
+    background_writer: Option<workspace_writes::WorkspaceWrite>,
+    #[cfg(windows)]
+    settled_native_writer: Option<(workspace_writes::WorkspaceWrite, String)>,
     /// Shell commands the user ran with `!` since the last prompt, as the text block that
     /// goes ahead of the next one.
     shell_context: Vec<String>,
@@ -522,6 +535,7 @@ struct Task {
     answering_questions: tokio::sync::Mutex<()>,
     /// Unanswered permission requests: where to send the chosen option id.
     permissions: Mutex<HashMap<u32, std::sync::mpsc::Sender<Option<String>>>>,
+    scoped_native: Mutex<Option<Arc<delegation::scoped::ScopedNative>>>,
     next_permission: AtomicU32,
     /// Set while `session/load` replays history we already have.
     replaying: AtomicBool,
@@ -594,6 +608,7 @@ impl AgentManager {
         runtime: tokio::runtime::Handle,
         minerva: Arc<ide_minerva::Service>,
     ) -> Self {
+        let service = minerva.clone();
         let connector: Connector = Arc::new(move |spec, cwd, client, on_stderr| match spec.driver {
             provider::Driver::Minerva => {
                 Ok(native::minerva::connect(minerva.clone(), cwd, client, spec.args.first().cloned()))
@@ -605,7 +620,9 @@ impl AgentManager {
             provider::Driver::Claude => native::claude::connect(spec, cwd, client, on_stderr),
             provider::Driver::Copilot => native::copilot::connect(spec, cwd, client, on_stderr),
         });
-        Self::with_connector(paths, runtime, connector)
+        let manager = Self::with_connector(paths, runtime, connector);
+        let _ = manager.shared.minerva.set(service);
+        manager
     }
 
     fn with_connector(paths: AgentPaths, runtime: tokio::runtime::Handle, connector: Connector) -> Self {
@@ -615,6 +632,7 @@ impl AgentManager {
             paths,
             runtime,
             connector,
+            minerva: std::sync::OnceLock::new(),
             sinks: RwLock::new(HashMap::new()),
             security: RwLock::new(None),
             new_task_approvals: RwLock::new(None),
@@ -624,6 +642,7 @@ impl AgentManager {
             probes: Mutex::new(HashMap::new()),
             copilot_acp_fallback: Mutex::new(HashSet::new()),
             idle_release_ms: AtomicU64::new(IDLE_RELEASE.as_millis() as u64),
+            idle_delegated: Default::default(),
             mcp_servers_hook: RwLock::new(None),
             mcp_executable_hook: RwLock::new(None),
             skills_policy_hook: RwLock::new(None),
@@ -658,7 +677,7 @@ impl AgentManager {
         Self { shared, tasks: RwLock::new(tasks) }
     }
 
-    /// Routes events to `sink` (replacing the previous subscriber); returns every task.
+    /// Routes events to `sink` (replacing the previous subscriber); returns root tasks.
     pub fn subscribe(&self, sink: AgentSink) -> Vec<AgentTask> {
         self.subscribe_as("", sink)
     }
@@ -666,7 +685,15 @@ impl AgentManager {
     /// Routes events to `sink` too, replacing only the sink `subscriber` (a view of the project) had.
     pub fn subscribe_as(&self, subscriber: &str, sink: AgentSink) -> Vec<AgentTask> {
         self.shared.sinks.write().insert(subscriber.to_owned(), sink);
-        let mut tasks: Vec<AgentTask> = self.tasks.read().values().map(|t| t.state.lock().snapshot()).collect();
+        let mut tasks: Vec<AgentTask> = self
+            .tasks
+            .read()
+            .values()
+            .filter_map(|task| {
+                let state = task.state.lock();
+                (!state.delegated_read_only).then(|| state.snapshot())
+            })
+            .collect();
         tasks.sort_by(|a, b| b.updated_ms.total_cmp(&a.updated_ms));
         tasks
     }
@@ -874,9 +901,27 @@ impl AgentManager {
     /// The entries of the task's conversation, or of its subagent `subagent`'s.
     pub fn entries(&self, id: &str, subagent: Option<String>) -> IdeResult<Vec<AgentEntry>> {
         let task = self.task(id)?;
+        let minerva = task.uses_minerva_driver();
         let s = task.state.lock();
         let timeline = s.conversation.timeline(&subagent).ok_or_else(|| IdeError::not_found("no such subagent"))?;
-        Ok(timeline.entries.clone())
+        let entries = timeline.entries.clone();
+        let address = if minerva {
+            subagent.as_deref().and_then(|child| {
+                let delegation = child.strip_prefix("del_")?;
+                let root = s.session_id.clone()?;
+                let parent = s.conversation.parent_of(child)?.clone().unwrap_or_else(|| root.clone());
+                Some((root, parent, delegation.to_owned()))
+            })
+        } else {
+            None
+        };
+        drop(s);
+        if let Some((root, parent, delegation)) = address
+            && let Some(external) = self.delegated_history(&root, &parent, &delegation)?
+        {
+            return Ok(external);
+        }
+        Ok(entries)
     }
 
     /// Session ids the tasks already hold (native drivers reuse the CLI's own id).
@@ -952,6 +997,7 @@ impl AgentManager {
             stats: Box::default(),
         };
         let file = TaskFile {
+            delegated_read_only: false,
             task: task.clone(),
             session_id: Some(session_id.to_owned()),
             entries: Vec::new(),
@@ -963,6 +1009,7 @@ impl AgentManager {
             touched: Some(BTreeSet::new()),
             turn: None,
             subagents: Vec::new(),
+            main_message_ids: HashMap::new(),
             pending_rollback: 0,
             title_renamed: true,
         };
@@ -976,6 +1023,11 @@ impl AgentManager {
     /// Creates the task (and its worktree) and sends `req.prompt` as its first message, unless
     /// `req.idle`.
     pub async fn create(&self, req: NewAgentTask) -> IdeResult<AgentTask> {
+        self.create_with_task_id(req, None).await
+    }
+
+    async fn create_with_task_id(&self, req: NewAgentTask, task_id: Option<String>) -> IdeResult<AgentTask> {
+        let delegated_read_only = task_id.is_some();
         let spec = self
             .shared
             .spec(&req.provider)
@@ -994,7 +1046,12 @@ impl AgentManager {
                 }
                 let dir = self.shared.paths.worktrees_dir.clone();
                 let (t, b) = (title.clone(), req.base.clone());
-                let c = blocking(move || worktree::create(&root, &dir, &t, b.as_deref())).await?;
+                let writer = workspace_writes::WorkspaceWrite::acquire(vec![root.clone()]).await?;
+                let c = blocking(move || {
+                    let _writer = writer;
+                    worktree::create(&root, &dir, &t, b.as_deref())
+                })
+                .await?;
                 (c.path, Some(c.branch), Some(c.base), Some(c.base_commit), BTreeMap::new())
             }
             Isolation::Local => {
@@ -1028,7 +1085,8 @@ impl AgentManager {
             }));
         }
         let now = now_ms();
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        let delegated = task_id.is_some();
+        let id = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         // Copies of the files the user had changed already, for rolling back the task's changes to them.
         let saved = if before.is_empty() {
             None
@@ -1071,6 +1129,7 @@ impl AgentManager {
             stats: Box::default(),
         };
         let file = TaskFile {
+            delegated_read_only,
             task: task.clone(),
             session_id: None,
             entries: Vec::new(),
@@ -1082,14 +1141,20 @@ impl AgentManager {
             touched: (req.isolation == Isolation::Local).then(BTreeSet::new),
             turn: None,
             subagents: Vec::new(),
+            main_message_ids: HashMap::new(),
             pending_rollback: 0,
             title_renamed: false,
         };
         let handle = Task::restore(file, self.shared.clone());
         handle.state.lock().busy = !req.idle;
+        if delegated {
+            handle.persist_state(&handle.state.lock()).map_err(IdeError::internal)?;
+        }
         self.tasks.write().insert(task.id.clone(), handle.clone());
         handle.emit_task();
-        handle.persist();
+        if !delegated {
+            handle.persist();
+        }
         if !req.idle {
             self.shared.runtime.spawn(async move { handle.run(prompt).await });
         }
@@ -1100,6 +1165,9 @@ impl AgentManager {
     /// is cancelled and the message goes next.
     pub async fn prompt(&self, id: &str, prompt: AgentPrompt, now: bool) -> IdeResult<()> {
         let task = self.task(id)?;
+        if task.state.lock().delegated_read_only {
+            return Err(IdeError::unavailable("Delegated native tasks require verified host dispatch"));
+        }
         let _settings = if task.uses_minerva_driver() { Some(task.setting_changes.lock().await) } else { None };
         task.validate_minerva_route()?;
         let prompt = clean(prompt).ok_or_else(|| IdeError::invalid("empty message"))?;
@@ -1154,6 +1222,9 @@ impl AgentManager {
     /// and goes to the agent with the next message.
     pub async fn run_shell(&self, id: &str, command: &str, cancel: ide_core::CancellationToken) -> IdeResult<()> {
         let task = self.task(id)?;
+        if task.state.lock().delegated_read_only {
+            return Err(IdeError::invalid("Shell commands are disabled for delegated read-only tasks"));
+        }
         let command = command.trim();
         if command.is_empty() {
             return Err(IdeError::invalid("empty command"));
@@ -1165,7 +1236,21 @@ impl AgentManager {
             }
             s.task.cwd.0.clone()
         };
-        task.shell(command, &cwd, &cancel).await;
+        let writer = workspace_writes::WorkspaceWrite::acquire(vec![cwd.clone()]).await?;
+        let command = command.to_owned();
+        let cancel = cancel.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        self.shared
+            .runtime
+            .spawn(async move {
+                if task.state.lock().task.status == AgentStatus::Archived {
+                    return Err(IdeError::invalid("the task is archived"));
+                }
+                task.shell(&command, &cwd, &cancel, &writer).await;
+                Ok(())
+            })
+            .await
+            .map_err(|error| IdeError::internal(error.to_string()))??;
         Ok(())
     }
 
@@ -1237,7 +1322,7 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Changes a session setting (model, mode…): right away when the agent runs, else when it next starts.
+    /// Changes a session setting (model, modeР Р†Р вЂљР’В¦): right away when the agent runs, else when it next starts.
     pub async fn set_config(&self, id: &str, option: &str, value: String) -> IdeResult<()> {
         let task = self.task(id)?;
         let minerva = task.uses_minerva_driver();
@@ -1475,6 +1560,7 @@ impl AgentManager {
                 ..s.task.clone()
             };
             TaskFile {
+                delegated_read_only: false,
                 task,
                 session_id: Some(session),
                 entries,
@@ -1487,6 +1573,7 @@ impl AgentManager {
                 // The source's next turn replaces its copies: the fork's last turn is one of its own.
                 turn: None,
                 subagents: s.conversation.saved_subagents(),
+                main_message_ids: s.conversation.main.message_ids(),
                 pending_rollback: total - keep,
                 title_renamed: s.title_renamed,
             }
@@ -1512,7 +1599,7 @@ impl AgentManager {
         let starts = turn_starts(&task.state.lock().conversation.main.entries);
         let Some(&cut) = starts.get(turns as usize) else { return Ok(None) };
         // Dropping every turn starts the conversation over, which needs no agent-side
-        // rewind — and some agents cannot rewind past their first turn (a resumed
+        // rewind Р Р†Р вЂљРІР‚Сњ and some agents cannot rewind past their first turn (a resumed
         // Claude Code session). A fresh session avoids both.
         if turns == 0 {
             task.kill();
@@ -1698,6 +1785,28 @@ impl AgentManager {
             .map_err(|error| IdeError::internal(task.describe(error)))
     }
 
+    /// Requests cancellation of a Minerva task's delegated descendants.
+    pub async fn stop_delegation_tree(&self, id: &str) -> IdeResult<()> {
+        let task = self.task(id)?;
+        let _settings = task.setting_changes.lock().await;
+        if !task.uses_minerva_driver() {
+            return Err(IdeError::invalid("this agent does not support Minerva delegation"));
+        }
+        let saved =
+            task.state.lock().session_id.clone().ok_or_else(|| IdeError::unavailable("the task has no session"))?;
+        let live = task.ensure_session().await.map_err(IdeError::internal)?;
+        if live.driver != provider::Driver::Minerva || live.session != saved {
+            return Err(IdeError::unavailable("the original Minerva session is unavailable"));
+        }
+        let result: IdeResult<Value> = live
+            .peer
+            .request("_openidea/stop_delegation_tree", json!({ "sessionId": live.session }), None)
+            .await
+            .map_err(|error| IdeError::internal(task.describe(error)));
+        task.release_when_idle();
+        result.map(|_| ())
+    }
+
     /// Stops background task `background` of task `id`.
     pub async fn stop_background(&self, id: &str, background: &str) -> IdeResult<()> {
         let task = self.task(id)?;
@@ -1744,9 +1853,42 @@ impl AgentManager {
                 })
                 .ok_or_else(|| IdeError::not_found("the question was already answered"))?
         };
-        let chosen = match answer {
-            None => "Skipped".to_owned(),
-            Some(answer) => {
+        let delegated =
+            question.strip_prefix(async_questions::DELEGATED_QUESTION_PREFIX).and_then(|value| value.split_once(':'));
+        let chosen = match (delegated, answer) {
+            (Some((child, interaction)), Some(answer)) if task.uses_minerva_driver() => {
+                let value = async_questions::delegated_answer(&answer)?;
+                let _settings = task.setting_changes.lock().await;
+                let saved = task
+                    .state
+                    .lock()
+                    .session_id
+                    .clone()
+                    .ok_or_else(|| IdeError::unavailable("the task has no session"))?;
+                let live = task.ensure_session().await.map_err(IdeError::internal)?;
+                if live.driver != provider::Driver::Minerva || live.session != saved {
+                    return Err(IdeError::unavailable("the original Minerva session is unavailable"));
+                }
+                let reply: IdeResult<Value> = live
+                    .peer
+                    .request(
+                        "_openidea/answer_delegation_question",
+                        json!({
+                            "sessionId":live.session,"childId":child,"questionId":interaction,"answer":value
+                        }),
+                        None,
+                    )
+                    .await
+                    .map_err(|error| IdeError::internal(task.describe(error)));
+                task.release_when_idle();
+                if reply?["state"] != "delivered" {
+                    return Err(IdeError::unavailable("the delegated answer was not confirmed"));
+                }
+                value
+            }
+            (Some(_), _) => return Err(IdeError::invalid("the delegated question requires an answer")),
+            (None, None) => "Skipped".to_owned(),
+            (None, Some(answer)) => {
                 let (text, record) = async_questions::reply(&questions, &answer)?;
                 let prompt = AgentPrompt { text, files: Vec::new(), images: Vec::new() };
                 if let Err(prompt) = task.steer(prompt).await {
@@ -1774,8 +1916,12 @@ impl AgentManager {
     }
 
     /// Stops the agent and moves the task to Archived; its worktree stays.
-    pub fn archive(&self, id: &str) -> IdeResult<()> {
+    pub async fn archive(&self, id: &str) -> IdeResult<()> {
         let task = self.task(id)?;
+        let _settings = task.setting_changes.lock().await;
+        task.guard_background_removal().await?;
+        self.guard_delegation_removal(&task).await?;
+        task.guard_background_removal().await?;
         task.kill();
         task.set_status(AgentStatus::Archived, None);
         Ok(())
@@ -1826,6 +1972,10 @@ impl AgentManager {
     /// Forgets the task; with `remove_worktree` also deletes its worktree (the branch stays).
     pub async fn delete(&self, id: &str, remove_worktree: bool) -> IdeResult<()> {
         let task = self.task(id)?;
+        let _settings = task.setting_changes.lock().await;
+        task.guard_background_removal().await?;
+        self.guard_delegation_removal(&task).await?;
+        task.guard_background_removal().await?;
         let live = task.kill();
         let (isolation, cwd, root) = {
             let s = task.state.lock();
@@ -1837,6 +1987,23 @@ impl AgentManager {
         };
         // A copy of the task (a fork) may work in the same worktree.
         let shared = self.tasks.read().values().any(|t| t.id != id && t.state.lock().task.cwd.0 == cwd);
+        let worktree_writer = if remove_worktree && !shared && isolation == Isolation::Worktree && cwd.exists() {
+            tokio::time::timeout(EXIT_WAIT, async {
+                if let Some(peer) = live {
+                    peer.exited().await;
+                }
+                // The turn also holds the checkout through its final change snapshot.
+                while task.state.lock().busy {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| IdeError::unavailable("The agent is still stopping; its worktree was kept"))?;
+            task.guard_background_removal().await?;
+            Some(workspace_writes::WorkspaceWrite::acquire(vec![root.clone(), cwd.clone()]).await?)
+        } else {
+            None
+        };
         self.tasks.write().remove(id);
         *task.deleted.lock() = true;
         let _ = std::fs::remove_file(self.shared.paths.store_dir.join(format!("{id}.json")));
@@ -1850,14 +2017,13 @@ impl AgentManager {
         }
         // The list drops the task now; removing a large worktree's folder can take a while.
         self.shared.emit(AgentEvent::Removed { id: id.to_owned() });
-        if remove_worktree && !shared && isolation == Isolation::Worktree && cwd.exists() {
-            // On Windows the agent's processes lock the folder (their working directory,
-            // open files) until they have exited.
-            if let Some(peer) = live {
-                let _ = tokio::time::timeout(EXIT_WAIT, peer.exited()).await;
-            }
+        if let Some(writer) = worktree_writer {
             let worktrees = self.shared.paths.worktrees_dir.clone();
-            blocking(move || worktree::remove(&root, &worktrees, &cwd)).await?;
+            blocking(move || {
+                let _writer = writer;
+                worktree::remove(&root, &worktrees, &cwd)
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1932,18 +2098,24 @@ impl AgentManager {
         view: AgentChangesView,
     ) -> IdeResult<()> {
         let task = self.task(id)?;
+        if task.state.lock().delegated_read_only {
+            return Err(IdeError::invalid("Rollback is disabled for delegated read-only tasks"));
+        }
+        let at = task.base();
+        let writer = workspace_writes::WorkspaceWrite::acquire(vec![at.cwd().to_path_buf()]).await?;
         if task.state.lock().busy {
             return Err(IdeError::invalid("the agent is working: stop it before rolling back its changes"));
         }
         if view == AgentChangesView::LastTurn {
-            return self.rollback_turn(&task, rel_paths).await;
+            return self.rollback_turn(&task, rel_paths, writer).await;
         }
-        let at = task.base();
         let (before, saved, touched) = {
             let s = task.state.lock();
             (s.before.clone(), s.saved.as_ref().map(|name| self.shared.paths.store_dir.join(name)), s.touched.clone())
         };
+        let in_flight = writer.clone();
         let (restamped, restored) = blocking(move || {
+            let _writer = in_flight;
             let (changes, rev) = match view {
                 AgentChangesView::Group => (at.grouped_changes(&before)?.uncommitted, worktree::head_commit(at.cwd())?),
                 AgentChangesView::SinceStart | AgentChangesView::LastTurn => (at.changes(&before)?, at.rev()?),
@@ -1992,14 +2164,21 @@ impl AgentManager {
 
     /// Puts the last turn's changed files among `rel_paths` (all with `None`) back as they
     /// were when it started.
-    async fn rollback_turn(&self, task: &Task, rel_paths: Option<Vec<String>>) -> IdeResult<()> {
+    async fn rollback_turn(
+        &self,
+        task: &Task,
+        rel_paths: Option<Vec<String>>,
+        writer: workspace_writes::WorkspaceWrite,
+    ) -> IdeResult<()> {
         let (cwd, turn, dir) = task.last_turn();
         let Some(turn) = turn else { return Ok(()) };
         let (before, saved) = {
             let s = task.state.lock();
             (s.before.clone(), s.saved.as_ref().map(|name| self.shared.paths.store_dir.join(name)))
         };
+        let in_flight = writer.clone();
         let restamped = blocking(move || {
+            let _writer = in_flight;
             let changed = match &turn.changed {
                 Some(changed) => changed.clone(),
                 None => worktree::changed_in_turn(&cwd, &turn)?.1,
@@ -2056,7 +2235,12 @@ impl AgentManager {
         let Some(base) = base else {
             return Err(IdeError::invalid("the task has no base revision to accept from"));
         };
+        let writer = workspace_writes::WorkspaceWrite::acquire(vec![cwd.clone(), root.clone()]).await?;
+        if task.state.lock().busy {
+            return Err(IdeError::invalid("the agent is working: stop it before accepting its changes"));
+        }
         blocking(move || {
+            let _writer = writer;
             let wanted: Vec<AgentChange> = worktree::without_untouched(worktree::changes(&cwd, &base)?, &before)
                 .into_iter()
                 .filter(|c| rel_paths.as_ref().is_none_or(|p| p.contains(&c.rel_path)))
@@ -2219,7 +2403,8 @@ impl Task {
     fn restore(file: TaskFile, shared: Arc<Shared>) -> Arc<Self> {
         let mut task = file.task;
         config::add_client_options(&task.provider, &mut task.config);
-        let conversation = Conversation::restore(file.entries, file.subagents);
+        let mut conversation = Conversation::restore(file.entries, file.subagents);
+        conversation.main.restore_message_ids(file.main_message_ids);
         let mut wanted = file.wanted;
         let pending_model = file.pending_switch.or_else(|| {
             let id = file.pending_model?;
@@ -2242,6 +2427,7 @@ impl Task {
             id: task.id.clone(),
             shared,
             state: Mutex::new(TaskState {
+                delegated_read_only: file.delegated_read_only,
                 task,
                 session_id: file.session_id,
                 conversation,
@@ -2257,6 +2443,10 @@ impl Task {
                 title_renamed: file.title_renamed,
                 busy: false,
                 background_tasks: Vec::new(),
+                background_revision: None,
+                background_writer: None,
+                #[cfg(windows)]
+                settled_native_writer: None,
                 shell_context: Vec::new(),
             }),
             live: Mutex::new(None),
@@ -2265,6 +2455,7 @@ impl Task {
             setting_changes: tokio::sync::Mutex::new(()),
             answering_questions: tokio::sync::Mutex::new(()),
             permissions: Mutex::new(HashMap::new()),
+            scoped_native: Mutex::new(None),
             next_permission: AtomicU32::new(1),
             replaying: AtomicBool::new(false),
             start_fresh: AtomicBool::new(false),
@@ -2348,7 +2539,13 @@ impl Task {
     }
 
     fn emit_task(&self) {
-        let task = self.state.lock().snapshot();
+        let task = {
+            let state = self.state.lock();
+            if state.delegated_read_only {
+                return;
+            }
+            state.snapshot()
+        };
         self.shared.emit(AgentEvent::Task { task: Box::new(task) });
     }
 
@@ -2366,9 +2563,15 @@ impl Task {
 
     /// Keeps the agent's background tasks that outlive its turn. Returns whether the last
     /// one just finished, so the idle release starts over from this report.
-    fn set_background_tasks(&self, tasks: Vec<Value>) -> bool {
+    fn set_background_tasks(&self, tasks: Vec<Value>, revision: Option<u64>) -> bool {
         let (emptied, shown) = {
             let mut state = self.state.lock();
+            if let Some(revision) = revision {
+                if state.background_revision.is_some_and(|current| revision <= current) {
+                    return false;
+                }
+                state.background_revision = Some(revision);
+            }
             let active: Vec<_> = tasks.iter().filter(|task| background::is_active(task)).cloned().collect();
             let background = shown_background(&tasks, &state.task.background);
             if state.background_tasks == active && *state.task.background == background {
@@ -2379,6 +2582,13 @@ impl Task {
             *state.task.background = background;
             state.background_tasks = active;
             if emptied {
+                #[cfg(windows)]
+                if !state.busy
+                    && let Some((writer, job)) = state.settled_native_writer.take()
+                {
+                    self.shared.runtime.spawn_blocking(move || writer.clear_windows_job_record(&job));
+                }
+                state.background_writer = None;
                 // Void a release scheduled while the tasks still ran: it would stop the
                 // agent sooner than the usual delay after this one.
                 self.idle_epoch.fetch_add(1, Ordering::AcqRel);
@@ -2389,6 +2599,23 @@ impl Task {
             self.emit_task();
         }
         emptied
+    }
+
+    async fn guard_background_removal(&self) -> IdeResult<()> {
+        let (busy, session) = {
+            let state = self.state.lock();
+            if state.background_writer.is_none() && state.background_tasks.is_empty() {
+                return Ok(());
+            }
+            (state.busy, state.session_id.clone())
+        };
+        if !busy
+            && self.uses_minerva_driver()
+            && self.reconcile_minerva_background(provider::Driver::Minerva, session.as_deref()).await
+        {
+            return Ok(());
+        }
+        Err(IdeError::unavailable("Wait for the agent's background tasks to stop"))
     }
 
     fn clear_shown_background(&self) {
@@ -2412,6 +2639,9 @@ impl Task {
     }
 
     fn emit_attention(&self, reason: AgentAttentionReason) {
+        if self.state.lock().delegated_read_only {
+            return;
+        }
         let n = self.shared.attention_seq.fetch_add(1, Ordering::Relaxed);
         let tag = match reason {
             AgentAttentionReason::Finished => "finished",
@@ -2446,6 +2676,7 @@ impl Task {
 
     fn persist_state(&self, s: &TaskState) -> Result<(), String> {
         let bytes = serde_json::to_vec(&TaskFile {
+            delegated_read_only: s.delegated_read_only,
             task: s.task.clone(),
             session_id: s.session_id.clone(),
             entries: s.conversation.main.entries.clone(),
@@ -2457,6 +2688,7 @@ impl Task {
             touched: s.touched.as_deref().cloned(),
             turn: s.turn.as_deref().cloned(),
             subagents: s.conversation.saved_subagents(),
+            main_message_ids: s.conversation.main.message_ids(),
             pending_rollback: s.pending_rollback,
             title_renamed: s.title_renamed,
         });
@@ -2480,6 +2712,9 @@ impl Task {
         let indices = std::mem::take(&mut *self.dirty.lock());
         let events: Vec<AgentEvent> = {
             let s = self.state.lock();
+            if s.delegated_read_only {
+                return;
+            }
             let mut streamed = self.streamed.lock();
             indices
                 .into_iter()
@@ -2500,7 +2735,13 @@ impl Task {
         self.mark_dirty(changed);
     }
 
-    async fn shell(self: &Arc<Self>, command: &str, cwd: &Path, cancel: &ide_core::CancellationToken) {
+    async fn shell(
+        self: &Arc<Self>,
+        command: &str,
+        cwd: &Path,
+        cancel: &ide_core::CancellationToken,
+        writer: &workspace_writes::WorkspaceWrite,
+    ) {
         let call = format!("shell-{}", uuid::Uuid::new_v4().simple());
         self.apply_local(&json!({
             "sessionUpdate": "tool_call",
@@ -2509,7 +2750,13 @@ impl Task {
             "kind": "execute",
             "status": "in_progress",
         }));
-        let ran = shell::run(command, cwd, cancel).await;
+        #[cfg(windows)]
+        let ran = shell::run(command, cwd, cancel, Some(writer)).await;
+        #[cfg(not(windows))]
+        let ran = {
+            let _ = writer;
+            shell::run(command, cwd, cancel).await
+        };
         let status = if ran.code == Some(0) { "completed" } else { "failed" };
         self.apply_local(&json!({
             "sessionUpdate": "tool_call_update",
@@ -2529,29 +2776,85 @@ impl Task {
 
     /// Runs `prompt`, then the queued messages, until the queue is empty, a turn fails, or
     /// the user stops one. The caller set `busy`.
-    async fn run(self: Arc<Self>, mut prompt: AgentPrompt) {
+    async fn run(self: Arc<Self>, prompt: AgentPrompt) {
+        self.run_with_attempt(prompt, None).await;
+    }
+
+    async fn run_with_attempt(self: Arc<Self>, mut prompt: AgentPrompt, operation: Option<String>) {
+        // A read-only child must not claim concurrent edits as its own changes.
+        let (write_cwd, background_writer) = {
+            let state = self.state.lock();
+            ((!state.delegated_read_only).then(|| state.task.cwd.0.clone()), state.background_writer.clone())
+        };
+        let writer = match (write_cwd, background_writer) {
+            (Some(_), Some(writer)) => Some(writer),
+            (Some(cwd), None) => match workspace_writes::WorkspaceWrite::acquire(vec![cwd]).await {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    self.reject_write_turn(prompt, error);
+                    return;
+                }
+            },
+            (None, _) => None,
+        };
+        let mut write_turn = match writer.as_ref().map(workspace_writes::WorkspaceWrite::claim_turn).transpose() {
+            Ok(turn) => turn.map(Arc::new),
+            Err(error) => {
+                self.reject_write_turn(prompt, error);
+                return;
+            }
+        };
+        let track_changes = writer.is_some();
         loop {
-            self.checkout_before_turn().await;
-            let result = self.turn(&prompt).await;
+            if track_changes {
+                self.checkout_before_turn().await;
+            }
+            let result = self
+                .turn(
+                    &prompt,
+                    operation.as_deref(),
+                    write_turn.as_ref(),
+                    #[cfg(windows)]
+                    writer.as_ref(),
+                )
+                .await;
+            self.scoped_native.lock().take();
             self.cancel_pending.store(false, Ordering::Release);
             tokio::time::sleep(TURN_GRACE).await;
-            self.record_turn_changes().await;
+            if track_changes {
+                self.record_turn_changes().await;
+            }
             let changed = self.state.lock().conversation.end_turn(Some(now_ms()));
             self.mark_dirty(changed);
             let send_now = self.send_now.swap(false, Ordering::AcqRel);
             let next = {
                 let mut s = self.state.lock();
-                let go_on = s.task.status != AgentStatus::Archived
+                let go_on = operation.is_none()
+                    && s.task.status != AgentStatus::Archived
                     && match &result {
                         Ok(stop) => stop != "cancelled" || send_now,
                         Err(_) => false,
                     };
                 let next = (go_on && !s.task.queue.is_empty()).then(|| s.task.queue.remove(0));
                 if next.is_none() {
+                    if !s.background_tasks.is_empty() {
+                        s.background_writer = writer.clone();
+                    }
+                    drop(write_turn.take());
                     s.busy = false;
                 }
                 next
             };
+            #[cfg(windows)]
+            {
+                let settled = {
+                    let mut state = self.state.lock();
+                    state.background_tasks.is_empty().then(|| state.settled_native_writer.take()).flatten()
+                };
+                if let Some((writer, job)) = settled {
+                    let _ = self.shared.runtime.spawn_blocking(move || writer.clear_windows_job_record(&job)).await;
+                }
+            }
             if self.state.lock().task.status == AgentStatus::Archived {
                 self.persist();
                 return;
@@ -2580,6 +2883,28 @@ impl Task {
                 (None, Err(failure)) => return self.fail(failure),
             }
         }
+    }
+
+    fn reject_write_turn(self: &Arc<Self>, prompt: AgentPrompt, error: IdeError) {
+        let message = error.to_string();
+        self.cancel_pending.store(false, Ordering::Release);
+        self.send_now.store(false, Ordering::Release);
+        {
+            let mut state = self.state.lock();
+            state.busy = false;
+            if state.task.status == AgentStatus::Archived {
+                return;
+            }
+            state.task.queue.insert(0, AgentQueued { id: uuid::Uuid::new_v4().simple().to_string(), prompt });
+            state.task.retry = None;
+            state.task.status = AgentStatus::Failed;
+            state.task.error = Some(message.clone());
+            state.task.updated_ms = now_ms();
+        }
+        self.push_entry(AgentEntry::Error { message });
+        self.persist();
+        self.emit_task();
+        self.emit_attention(AgentAttentionReason::Failed);
     }
 
     /// Drops an idle resumable live session so the next turn reloads it.
@@ -2739,6 +3064,7 @@ impl Task {
     /// A turn's background tasks outlive it: the release waits for the last one, and the
     /// delay runs again once the agent reports it done.
     fn release_when_idle(self: &Arc<Self>) {
+        self.enforce_idle_native_cap();
         let turn = self.turns.load(Ordering::Acquire);
         let epoch = self.idle_epoch.load(Ordering::Acquire);
         let delay = Duration::from_millis(self.shared.idle_release_ms.load(Ordering::Relaxed));
@@ -2746,6 +3072,7 @@ impl Task {
         self.shared.runtime.spawn(async move {
             tokio::time::sleep(delay).await;
             let Some(task) = task.upgrade() else { return };
+            let _settings = task.setting_changes.lock().await;
             if task.turns.load(Ordering::Acquire) != turn
                 || task.idle_epoch.load(Ordering::Acquire) != epoch
                 || task.state.lock().busy
@@ -2778,6 +3105,7 @@ impl Task {
     fn fail(self: &Arc<Self>, failure: Failure) {
         self.cancel_permissions();
         let gone = self.live.lock().as_ref().is_none_or(|l| l.peer.is_closed());
+        let watch_minerva_jobs = self.uses_minerva_driver() && self.state.lock().background_writer.is_some();
         if gone {
             let changed = self.state.lock().conversation.settle(now_ms());
             self.mark_dirty(changed);
@@ -2785,10 +3113,15 @@ impl Task {
         self.push_entry(AgentEntry::Error { message: failure.message.clone() });
         // The next message starts the agent again (loading the session): what failed may
         // be fixed outside it meanwhile (signed in, updated, another model chosen).
-        if !gone && let Some(live) = self.live.lock().take() {
+        if !gone
+            && !watch_minerva_jobs
+            && let Some(live) = self.live.lock().take()
+        {
             live.peer.kill();
         }
-        self.clear_shown_background();
+        if !watch_minerva_jobs {
+            self.clear_shown_background();
+        }
         match failure.limit {
             Some(resets) => {
                 self.state.lock().task.resets_ms = resets;
@@ -2847,7 +3180,18 @@ impl Task {
     }
 
     /// Sends one prompt, starting the agent first if needed; returns the stop reason.
-    async fn turn(self: &Arc<Self>, prompt: &AgentPrompt) -> Result<String, Failure> {
+    async fn turn(
+        self: &Arc<Self>,
+        prompt: &AgentPrompt,
+        operation: Option<&str>,
+        write_turn: Option<&Arc<workspace_writes::WorkspaceTurn>>,
+        #[cfg(windows)] writer: Option<&workspace_writes::WorkspaceWrite>,
+    ) -> Result<String, Failure> {
+        let delegated_attempt = match delegation::attempt::claim(self, operation).await.map_err(Failure::from)? {
+            delegation::attempt::Dispatch::Ordinary => None,
+            delegation::attempt::Dispatch::Delegated(intent) => Some(intent),
+            delegation::attempt::Dispatch::Cancelled => return Ok("cancelled".into()),
+        };
         self.turns.fetch_add(1, Ordering::AcqRel);
         self.turn_started.store(false, Ordering::Release);
         self.state.lock().task.resets_ms = None;
@@ -2869,8 +3213,26 @@ impl Task {
         let starting = self.live.lock().as_ref().is_none_or(|l| l.peer.is_closed());
         self.set_status(if starting { AgentStatus::Starting } else { AgentStatus::Running }, None);
         let mut live = self.ensure_session().await.map_err(Failure::from)?;
+        #[cfg(windows)]
+        let _journal = match (live.driver, self.shared.minerva.get(), writer) {
+            (provider::Driver::Minerva, Some(service), Some(writer)) => {
+                let runtime = service.runtime().await.map_err(Failure::from)?;
+                let jobs = runtime.plugins.jobs().map_err(Failure::from)?;
+                let record = writer.clone();
+                let confirm = writer.clone();
+                Some(jobs.bind_process_journal(
+                    &live.session,
+                    move |name| record.record_windows_job(name).map_err(|error| error.to_string()),
+                    move |name| confirm.clear_windows_job_record(name),
+                ))
+            }
+            _ => None,
+        };
         // Stopped while the agent started: the prompt is never sent.
         if self.cancel_pending.load(Ordering::Acquire) {
+            if let Some(intent) = &delegated_attempt {
+                delegation::attempt::cancel_before_prompt(self, intent).await.map_err(Failure::from)?;
+            }
             return Ok("cancelled".into());
         }
         self.set_status(AgentStatus::Running, None);
@@ -2885,8 +3247,150 @@ impl Task {
             content
         };
         let mut content = with_shell(self.content(&live, prompt).await);
-        let mut result: Result<Value, RpcError> =
-            live.peer.request("session/prompt", json!({ "sessionId": live.session, "prompt": content }), None).await;
+        let mut prompt_request = json!({ "sessionId": live.session, "prompt": content });
+        let _native_run_lease = if live.driver == provider::Driver::Minerva
+            && let Some(owner) = write_turn
+            && let Some(service) = self.shared.minerva.get()
+        {
+            let run = uuid::Uuid::new_v4().to_string();
+            #[cfg(windows)]
+            let lease =
+                service.bind_journaled_native_run_lease(&live.session, &run, owner.clone()).map_err(Failure::from)?;
+            #[cfg(not(windows))]
+            let lease = service.bind_native_run_lease(&live.session, &run, owner.clone()).map_err(Failure::from)?;
+            prompt_request["_meta"]["openidea"]["nativeRunId"] = json!(run);
+            Some(lease)
+        } else {
+            None
+        };
+        if self.state.lock().delegated_read_only {
+            prompt_request["_meta"]["openidea"]["delegatedReadOnly"] = json!(true);
+        }
+        let delegated_result_boundary = if let Some(intent) = &delegated_attempt {
+            delegation::attempt::bind_session(self, intent, &live.session).await.map_err(Failure::from)?;
+            if self.cancel_pending.load(Ordering::Acquire) {
+                delegation::attempt::cancel_before_prompt(self, intent).await.map_err(Failure::from)?;
+                return Ok("cancelled".into());
+            }
+            if live.driver == provider::Driver::Claude {
+                let id = delegation::attempt::bind_claude_prompt(self, intent, &live.session)
+                    .await
+                    .map_err(Failure::from)?;
+                prompt_request["_meta"]["openidea"]["nativeTurnId"] = json!(id);
+            } else if live.driver == provider::Driver::Codex {
+                prompt_request["_meta"]["openidea"]["delegatedOperation"] = json!(&intent.operation_id);
+            }
+            self.state.lock().conversation.main.entries.len()
+        } else {
+            0
+        };
+        #[cfg(windows)]
+        let native_journal = if let Some(writer) = writer {
+            let name = match live.driver {
+                provider::Driver::Codex => {
+                    live.init.meta("/openidea/processJob").and_then(Value::as_str).map(str::to_owned)
+                }
+                provider::Driver::Claude
+                    if live.init.meta("/openidea/processJournal").and_then(Value::as_bool) == Some(true) =>
+                {
+                    let status: Value = live
+                        .peer
+                        .request("_openidea/managed_process", json!({ "sessionId": live.session }), None)
+                        .await
+                        .map_err(|error| self.failure(error))?;
+                    status["jobName"].as_str().map(str::to_owned)
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                self.state.lock().settled_native_writer = None;
+                let record = writer.clone();
+                let job = name.clone();
+                blocking(move || record.record_windows_job(&job))
+                    .await
+                    .map_err(|error| Failure::from(error.to_string()))?;
+                match live.driver {
+                    provider::Driver::Codex => prompt_request["_meta"]["openidea"]["processJournal"] = json!(true),
+                    provider::Driver::Claude => prompt_request["_meta"]["openidea"]["processJob"] = json!(name),
+                    _ => unreachable!(),
+                }
+                Some((writer.clone(), name))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let scoped_checkout = self.scoped_native.lock().clone();
+        #[cfg(windows)]
+        let scoped_job = if let Some(scope) = scoped_checkout {
+            let (job, turn) = if live.driver == provider::Driver::Codex {
+                let job = live
+                    .init
+                    .meta("/openidea/processJob")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Failure::from("Scoped Codex requires a managed process".to_owned()))?
+                    .to_owned();
+                let grant = uuid::Uuid::new_v4().to_string();
+                prompt_request["_meta"]["openidea"]["scopedFileGrant"] = json!(grant);
+                prompt_request["_meta"]["openidea"]["processJournal"] = json!(true);
+                (job, grant)
+            } else {
+                let status: Value = live
+                    .peer
+                    .request("_openidea/managed_process", json!({"sessionId":live.session}), None)
+                    .await
+                    .map_err(|error| self.failure(error))?;
+                let job = status["jobName"]
+                    .as_str()
+                    .ok_or_else(|| Failure::from("Scoped Claude requires a managed process".to_owned()))?
+                    .to_owned();
+                let turn = prompt_request
+                    .pointer("/_meta/openidea/nativeTurnId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Failure::from("Scoped Claude requires a bound turn".to_owned()))?
+                    .to_owned();
+                prompt_request["_meta"]["openidea"]["processJob"] = json!(job);
+                (job, turn)
+            };
+            let binding = scope.clone();
+            let session = live.session.clone();
+            let name = job.clone();
+            blocking(move || binding.bind_process(&session, &turn, &name).map_err(IdeError::unavailable))
+                .await
+                .map_err(|error| Failure::from(error.to_string()))?;
+            Some((scope, job))
+        } else {
+            None
+        };
+        let mut result: Result<Value, RpcError> = live.peer.request("session/prompt", prompt_request, None).await;
+        #[cfg(windows)]
+        if let Some((scope, job)) = scoped_job {
+            scope.revoke();
+            live.peer.kill();
+            scope.drain_file_calls().await;
+            let ended = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match ide_core::process::Job::named_is_running(&job) {
+                        Ok(false) => break true,
+                        Ok(true) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        Err(_) => break false,
+                    }
+                }
+            })
+            .await;
+            if !matches!(ended, Ok(true)) {
+                return Err(Failure::from("Scoped native process termination is unconfirmed".to_owned()));
+            }
+            let _ = self.shared.runtime.spawn_blocking(move || scope.stopped(&job)).await;
+        }
+        #[cfg(windows)]
+        if result.as_ref().is_ok_and(|reply| reply.pointer("/_meta/openidea/processTurnSettled") == Some(&json!(true)))
+            && let Some((writer, job)) = native_journal
+        {
+            self.state.lock().settled_native_writer = Some((writer, job));
+        }
         if live.driver == provider::Driver::Copilot
             && !self.turn_started.load(Ordering::Acquire)
             && let Err(RpcError::Server { code, ref message, .. }) = result
@@ -2914,6 +3418,24 @@ impl Task {
         }
         match result {
             Ok(v) => {
+                if live.driver == provider::Driver::Minerva
+                    && let Some(tasks) = v.pointer("/_meta/openidea/backgroundTasks").and_then(Value::as_array)
+                {
+                    let revision = v.pointer("/_meta/openidea/backgroundRevision").and_then(Value::as_u64);
+                    self.set_background_tasks(tasks.clone(), revision);
+                    if let Some(message) = v.pointer("/_meta/openidea/turnError").and_then(Value::as_str) {
+                        return Err(self.failure(RpcError::Server {
+                            code: ide_jsonrpc::codes::INTERNAL_ERROR,
+                            message: message.into(),
+                            data: None,
+                        }));
+                    }
+                }
+                if let Some(intent) = &delegated_attempt {
+                    delegation::attempt::complete(self, intent, &live.session, delegated_result_boundary, &v)
+                        .await
+                        .map_err(Failure::from)?;
+                }
                 if let Some(tokens) = config::tokens_of(&v) {
                     self.state.lock().task.stats.tokens = Some(tokens);
                     self.emit_task();
@@ -2986,6 +3508,14 @@ impl Task {
         first
     }
 
+    fn enforce_idle_native_cap(self: &Arc<Self>) {
+        let state = self.state.lock();
+        if state.delegated_read_only && !state.busy {
+            let task = self.clone();
+            self.shared.runtime.spawn(async move { task.shared.idle_delegated.retain(&task).await });
+        }
+    }
+
     async fn ensure_session(self: &Arc<Self>) -> Result<Live, String> {
         let _guard = self.connecting.lock().await;
         if let Some(live) = self.live.lock().clone()
@@ -3036,7 +3566,25 @@ impl Task {
             }
         };
         *self.live.lock() = Some(live.clone());
+        self.enforce_idle_native_cap();
         Ok(live)
+    }
+
+    async fn reconcile_minerva_background(&self, driver: provider::Driver, saved: Option<&str>) -> bool {
+        if driver != provider::Driver::Minerva {
+            return false;
+        }
+        let (Some(service), Some(session)) = (self.shared.minerva.get(), saved) else { return false };
+        if !service.shell_session_is_quiescent(session).await {
+            return false;
+        }
+        let mut state = self.state.lock();
+        if state.session_id.as_deref() != Some(session) {
+            return false;
+        }
+        state.background_tasks.clear();
+        state.background_writer = None;
+        true
     }
 
     async fn open_session(
@@ -3047,6 +3595,13 @@ impl Task {
         saved: Option<String>,
         pending_model: Option<&PendingModel>,
     ) -> Result<Live, SessionOpenError> {
+        let holds_background_writer = self.state.lock().background_writer.is_some();
+        if holds_background_writer && !self.reconcile_minerva_background(spec.driver, saved.as_deref()).await {
+            return Err(SessionOpenError {
+                message: "Cannot reopen the agent while its previous background work may still be running".into(),
+                allow_acp_fallback: false,
+            });
+        }
         let launch_cwd = cwd.to_path_buf();
         let mut spec = tokio::task::spawn_blocking(move || {
             spec.resolve_for_launch_with_copilot_env(&launch_cwd, provider::prefer_stored_copilot_auth())
@@ -3091,16 +3646,22 @@ impl Task {
         let sign_in_message = spec.sign_in_message(&init.auth_methods);
         let can_load = init.load_session();
         let (capabilities, embedded) = capabilities_of(&init);
-        let mcp_overrides = self.state.lock().task.mcp_overrides.clone();
-        let mcp_servers = self.shared.mcp_servers_for_session(provider_id, &init, &mcp_overrides);
-        let skills_delivery = self.stage_skills(stage_key(spec.driver), cwd).await;
+        let delegated = self.state.lock().delegated_read_only;
+        let (mcp_servers, skills_delivery) = if delegated {
+            (McpForSession { servers: Vec::new(), off: Vec::new() }, None)
+        } else {
+            let mcp_overrides = self.state.lock().task.mcp_overrides.clone();
+            let servers = self.shared.mcp_servers_for_session(provider_id, &init, &mcp_overrides);
+            (servers, self.stage_skills(stage_key(spec.driver), cwd).await)
+        };
         // Agents that compare canonical paths fail in a symlinked directory (macOS `/tmp`).
         let cwd_s = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()).to_string_lossy().into_owned();
 
         let mut tried_auth = false;
         let mut session = None;
         let start_fresh = self.start_fresh.load(Ordering::Acquire);
-        let requires_resume = pending_model.is_some() || (spec.driver == provider::Driver::Minerva && saved.is_some());
+        let requires_resume =
+            pending_model.is_some() || ((delegated || spec.driver == provider::Driver::Minerva) && saved.is_some());
         if requires_resume && (saved.is_none() || !can_load || start_fresh) {
             return Err(SessionOpenError {
                 message: "The agent does not support resuming this session.".into(),
@@ -3109,13 +3670,25 @@ impl Task {
         }
         if let (Some(id), true, false) = (saved, can_load, start_fresh) {
             self.replaying.store(true, Ordering::Release);
-            let mut params = session_params(&cwd_s, &mcp_servers, skills_delivery.as_ref());
+            let mut params = if delegated {
+                json!({"cwd":cwd_s,"mcpServers":[],"_meta":{"openidea":{"delegatedReadOnly":true,"delegatedWritable":self.scoped_native.lock().is_some()}}})
+            } else {
+                session_params(&cwd_s, &mcp_servers, skills_delivery.as_ref())
+            };
             params["sessionId"] = json!(&id);
             let loaded = self.request_with_auth(&peer, &init, &mut tried_auth, "session/load", params).await;
             tokio::time::sleep(REPLAY_GRACE).await;
             self.replaying.store(false, Ordering::Release);
             match loaded {
-                Ok(v) => session = Some((id, v)),
+                Ok(v) if !delegated || v.get("sessionId").and_then(Value::as_str) == Some(id.as_str()) => {
+                    session = Some((id, v));
+                }
+                Ok(_) => {
+                    return Err(SessionOpenError {
+                        message: "Codex did not confirm the original delegated thread.".into(),
+                        allow_acp_fallback: false,
+                    });
+                }
                 // Not silently: a new session would lose the conversation and replace the saved id.
                 Err(e) => {
                     tracing::info!("agent task {}: session/load failed: {e}", self.id);
@@ -3149,7 +3722,11 @@ impl Task {
         let (session_id, result) = match session {
             Some(s) => s,
             None => {
-                let params = session_params(&cwd_s, &mcp_servers, skills_delivery.as_ref());
+                let params = if delegated {
+                    json!({"cwd": cwd_s, "mcpServers": [], "_meta":{"openidea":{"delegatedReadOnly":true,"delegatedWritable":self.scoped_native.lock().is_some()}}})
+                } else {
+                    session_params(&cwd_s, &mcp_servers, skills_delivery.as_ref())
+                };
                 let v = self.request_with_auth(&peer, &init, &mut tried_auth, "session/new", params).await.map_err(
                     |e| match self.sign_in_error(&e, Some(&sign_in_message)) {
                         Some(msg) => SessionOpenError { message: msg, allow_acp_fallback: false },
@@ -3473,7 +4050,7 @@ impl Task {
             if !self.replaying.load(Ordering::Acquire) {
                 let tasks = update.get("tasks").and_then(Value::as_array).cloned().unwrap_or_default();
                 // The last one finished while the agent is up: the usual delay starts over.
-                if self.set_background_tasks(tasks) {
+                if self.set_background_tasks(tasks, update.get("backgroundRevision").and_then(Value::as_u64)) {
                     self.release_when_idle();
                 }
             }
@@ -3583,15 +4160,24 @@ impl Task {
         // Output again: the retried request went through.
         self.set_retry(None);
         let applied = self.state.lock().conversation.apply(session, update, now_ms());
+        let persist_message = !applied.is_empty() && kind == "session_message";
         self.mark_dirty(applied);
         // A subagent can start or finish after the turn that started it: saved right away.
-        if matches!(kind, "subagent_update" | "user_question") {
+        if persist_message || matches!(kind, "subagent_update" | "user_question") {
             self.persist();
         }
     }
 
     /// Blocks the calling (blocking-pool) thread until the user answers.
     fn ask_permission(self: &Arc<Self>, params: &Value) -> Value {
+        if self.state.lock().delegated_read_only {
+            return json!({"outcome":{"outcome":"cancelled"}});
+        }
+        let child_approval =
+            if self.uses_minerva_driver() { native::minerva::ChildApproval::from_permission(params) } else { None };
+        if child_approval.as_ref().is_some_and(|approval| !approval.is_pending(&self.shared)) {
+            return json!({"outcome":{"outcome":"cancelled"}});
+        }
         let id = self.next_permission.fetch_add(1, Ordering::Relaxed);
         let (questions, by_index) = asked_questions(params);
         let title = permission_title(params);
@@ -3679,7 +4265,20 @@ impl Task {
         self.approve_pending();
         self.emit_attention_if_input_pending();
 
-        let answer = rx.recv().ok().flatten();
+        let answer = if let Some(approval) = child_approval {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(reply) => break reply.filter(|_| approval.is_pending(&self.shared)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) if approval.is_pending(&self.shared) => {}
+                    Err(_) => {
+                        self.permissions.lock().remove(&id);
+                        break None;
+                    }
+                }
+            }
+        } else {
+            rx.recv().ok().flatten()
+        };
         let answers = answer
             .as_deref()
             .filter(|_| !asked.is_empty())
@@ -3813,6 +4412,9 @@ impl Task {
         if self.state.lock().busy {
             self.cancel_pending.store(true, Ordering::Release);
         }
+        if let Some(scope) = self.scoped_native.lock().as_ref() {
+            scope.cancel();
+        }
         self.cancel_permissions();
         if let Some(live) = self.live.lock().clone() {
             let _ = live.peer.notify("session/cancel", json!({ "sessionId": live.session }));
@@ -3895,6 +4497,31 @@ impl Handler for Client {
             return Err((codes::INVALID_REQUEST, "agent connection was replaced".to_owned()));
         }
         let result = match method {
+            "_openidea/delegated_codex_turn" => task
+                .shared
+                .runtime
+                .block_on(delegation::attempt::bind_codex_turn(&task, &params))
+                .map(|()| json!({}))
+                .map_err(|error| (codes::INVALID_REQUEST, error)),
+            "_openidea/scoped_file_tool" => {
+                let scope =
+                    task.scoped_native.lock().clone().ok_or((codes::INVALID_REQUEST, "No scoped checkout".into()))?;
+                task.shared
+                    .runtime
+                    .block_on(scope.apply_file_tool(&params, task.shared.minerva.get()))
+                    .map_err(|error| (codes::INVALID_REQUEST, error))
+            }
+            "_openidea/scoped_file_write" => {
+                let scope = task.scoped_native.lock().clone();
+                let granted = if let Some(scope) = scope {
+                    !task.cancel_pending.load(Ordering::Acquire)
+                        && task.shared.runtime.block_on(scope.authorize(&params, task.shared.minerva.get()))
+                        && !task.cancel_pending.load(Ordering::Acquire)
+                } else {
+                    false
+                };
+                Ok(json!(granted))
+            }
             "session/request_permission" => Ok(task.ask_permission(&params)),
             "elicitation/create" => task.elicit(&params, None).map_err(|e| (codes::INVALID_PARAMS, e)),
             _ => Err((codes::METHOD_NOT_FOUND, format!("unsupported method {method}"))),
@@ -4087,7 +4714,7 @@ fn usage_limit(e: &RpcError) -> Option<Option<f64>> {
         .then_some(None)
 }
 
-/// An error's message with the detail ACP agents put in `data` (`{"details": …}` or a string):
+/// An error's message with the detail ACP agents put in `data` (`{"details": Р Р†Р вЂљР’В¦}` or a string):
 /// generic codes such as "Internal error" say nothing without it.
 fn with_details(message: String, data: Option<&Value>) -> String {
     let details = match data {
@@ -4166,7 +4793,7 @@ fn stage_key(driver: provider::Driver) -> &'static str {
 
 /// The session parameters `session/new`, `session/load` and `session/fork` share: the MCP
 /// servers, and the ones off for this session, so an agent that also loads its own
-/// configuration (Claude Code) can keep a same-named server of it off too — plus the
+/// configuration (Claude Code) can keep a same-named server of it off too Р Р†Р вЂљРІР‚Сњ plus the
 /// session's staged skills for the drivers that take them.
 fn session_params(cwd: &str, mcp: &McpForSession, skills: Option<&skills::Delivery>) -> Value {
     let mut params = json!({ "cwd": cwd, "mcpServers": mcp.servers });
@@ -4321,7 +4948,7 @@ mod replay_tests;
 #[cfg(test)]
 mod tests;
 
-/// The name agents know the built-in server by (its tools are `mcp__OpenIDEA__…` in Claude Code).
+/// The name agents know the built-in server by (its tools are `mcp__OpenIDEA__Р Р†Р вЂљР’В¦` in Claude Code).
 const BUILTIN_SERVER: &str = "OpenIDEA";
 
 fn stdio_mcp_servers(executable: Option<&std::path::Path>, supported: bool, root: &std::path::Path) -> Vec<Value> {
@@ -4387,7 +5014,7 @@ fn entry_event(
         if streamed.get(&subagent).is_some_and(|sent| sent.index == i) {
             streamed.remove(&subagent);
         }
-        return AgentEvent::Entry { task: task.to_owned(), subagent, index: i as u32, entry: entry.clone() };
+        return AgentEvent::Entry { task: task.to_owned(), subagent, index: i as u32, entry: Box::new(entry.clone()) };
     };
     match streamed.get(&subagent).filter(|sent| sent.extended_by(i, text)) {
         Some(sent) => {
@@ -4403,7 +5030,7 @@ fn entry_event(
         }
         None => {
             streamed.insert(subagent.clone(), Sent::new(i, text));
-            AgentEvent::Entry { task: task.to_owned(), subagent, index: i as u32, entry: entry.clone() }
+            AgentEvent::Entry { task: task.to_owned(), subagent, index: i as u32, entry: Box::new(entry.clone()) }
         }
     }
 }

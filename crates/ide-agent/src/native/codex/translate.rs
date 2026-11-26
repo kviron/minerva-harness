@@ -86,6 +86,16 @@ impl Mode {
     }
 }
 
+pub(super) fn scoped_workspace_sandbox(cwd: &std::path::Path) -> Value {
+    json!({
+        "type":"workspaceWrite",
+        "writableRoots":[cwd],
+        "networkAccess":false,
+        "excludeTmpdirEnvVar":true,
+        "excludeSlashTmp":true,
+    })
+}
+
 /// A model `model/list` offers.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ModelInfo {

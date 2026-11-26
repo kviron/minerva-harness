@@ -1,8 +1,7 @@
 use super::{output::Output, process, JobOutput, JobSnapshot, JobStatus};
-use crate::tools::Cancellation;
+use crate::tools::{Cancellation, ToolContext};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,8 +15,11 @@ const GLOBAL_SETTLED: usize = 256;
 struct State {
     jobs: BTreeMap<String, Arc<Job>>,
     leases: HashMap<String, HashSet<u64>>,
+    paused_sessions: HashSet<String>,
     next_lease: u64,
     stopped: bool,
+    #[cfg(windows)]
+    journals: HashMap<String, std::sync::Weak<ProcessJournal>>,
 }
 pub(super) struct JobState {
     pub status: JobStatus,
@@ -100,6 +102,23 @@ pub struct ShellJobs {
     changed: watch::Sender<u64>,
     cleanup: tokio::sync::Mutex<()>,
 }
+
+pub struct ShellLaunchPause {
+    state: Arc<Mutex<State>>,
+    session: String,
+}
+
+impl Drop for ShellLaunchPause {
+    fn drop(&mut self) {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).paused_sessions.remove(&self.session);
+    }
+}
+
+#[cfg(windows)]
+pub struct ProcessJournal {
+    pub(super) record: Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+    pub(super) confirm: Box<dyn Fn(&str) + Send + Sync>,
+}
 impl Default for ShellJobs {
     fn default() -> Self {
         Self { state: Arc::default(), changed: watch::channel(0).0, cleanup: Default::default() }
@@ -109,6 +128,20 @@ impl cordis::Service for ShellJobs {
     const NAME: &'static str = "studio.shell-jobs";
 }
 impl ShellJobs {
+    #[cfg(windows)]
+    pub fn bind_process_journal(
+        &self,
+        session: &str,
+        record: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+        confirm: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Arc<ProcessJournal> {
+        let journal = Arc::new(ProcessJournal { record: Box::new(record), confirm: Box::new(confirm) });
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.journals.retain(|_, journal| journal.strong_count() != 0);
+        state.journals.insert(session.into(), Arc::downgrade(&journal));
+        journal
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
@@ -151,6 +184,28 @@ impl ShellJobs {
         jobs.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
         jobs
     }
+    /// Close shell launch admission in the same critical section that checks running
+    /// jobs, including jobs still waiting to publish or to confirm termination.
+    pub fn try_pause_launches(&self, session: &str) -> Result<ShellLaunchPause, String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.stopped || state.leases.get(session).is_some_and(HashSet::is_empty) {
+            return Err("Shell job owner is disconnected".into());
+        }
+        if state.jobs.values().any(|job| job.session == session && job.status().is_active()) {
+            return Err("Shell jobs are still active".into());
+        }
+        if !state.paused_sessions.insert(session.to_owned()) {
+            return Err("Shell launches are already paused".into());
+        }
+        Ok(ShellLaunchPause { state: self.state.clone(), session: session.to_owned() })
+    }
+
+    pub fn session_is_quiescent(&self, session: &str) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A missing lease entry has never closed admission for this session.
+        state.leases.get(session).is_some_and(|leases| leases.is_empty())
+            && !state.jobs.values().any(|job| job.session == session && job.status().is_active())
+    }
     pub(super) fn get(&self, session: &str, id: &str) -> Result<Arc<Job>, String> {
         self.state
             .lock()
@@ -165,14 +220,11 @@ impl ShellJobs {
         self.get(session, id)?.stop();
         Ok(())
     }
-    pub(super) fn start(
-        &self,
-        session: &str,
-        cwd: &Path,
-        command: &str,
-        label: &str,
-        caller: &Cancellation,
-    ) -> Result<Arc<Job>, String> {
+    pub(super) fn start(&self, ctx: &ToolContext, command: &str, label: &str) -> Result<Arc<Job>, String> {
+        let session = ctx.session_id.as_str();
+        let cwd = ctx.cwd.as_deref().ok_or("Select a workspace directory first")?;
+        let caller = &ctx.cancellation;
+        ctx.verify_admitted_write()?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune(&mut state);
         if state.stopped {
@@ -184,18 +236,31 @@ impl ShellJobs {
         if state.leases.get(session).is_some_and(HashSet::is_empty) {
             return Err("Shell job owner is disconnected".into());
         }
+        if state.paused_sessions.contains(session) {
+            return Err("Shell launches are paused".into());
+        }
         let active: Vec<_> = state.jobs.values().filter(|job| job.status().is_active()).collect();
         if active.len() >= GLOBAL_ACTIVE || active.iter().filter(|job| job.session == session).count() >= SESSION_ACTIVE
         {
             return Err("Too many active shell jobs".into());
         }
         // Admission is reserved under this lock before spawning; commands remain gated on Windows stdin until the tree is attached.
-        let child = process::spawn(cwd)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        #[cfg(windows)]
+        let name = format!("Global\\OpenIDEA-MinervaShell-{id}");
+        #[cfg(windows)]
+        let journal =
+            state.journals.get(session).and_then(std::sync::Weak::upgrade).map(|journal| (journal, name.clone()));
+        let child = process::spawn(
+            cwd,
+            #[cfg(windows)]
+            &name,
+        )?;
         if caller.is_cancelled() {
             return Err("Shell launch cancelled".into());
         }
         let job = Arc::new(Job {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             session: session.to_owned(),
             label: display_line(label, 256),
             command: display_line(command, 512),
@@ -216,8 +281,17 @@ impl ShellJobs {
         let owned = job.clone();
         let command = command.to_owned();
         let registry = self.state.clone();
+        let authority = ctx.clone();
         *job.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(tokio::spawn(async move {
-            let result = process::run(child, &command, &owned).await;
+            let result = process::run(
+                child,
+                &command,
+                &owned,
+                authority,
+                #[cfg(windows)]
+                journal,
+            )
+            .await;
             let mut output = owned.state.lock().unwrap_or_else(|e| e.into_inner());
             output.status =
                 if result.as_ref().err().is_some_and(|error| error.starts_with("Shell termination unconfirmed")) {
@@ -258,16 +332,21 @@ impl ShellJobs {
             }
         }
     }
+    fn stop_session_jobs(&self, session: &str) -> Vec<Arc<Job>> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let jobs: Vec<_> = state.jobs.values().filter(|job| job.session == session).cloned().collect();
+        for job in &jobs {
+            job.stop();
+        }
+        jobs
+    }
+
+    pub fn request_stop_session(&self, session: &str) {
+        self.stop_session_jobs(session);
+    }
+
     pub async fn stop_session(&self, session: &str) -> Result<(), String> {
-        let jobs: Vec<_> = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let jobs: Vec<_> = state.jobs.values().filter(|job| job.session == session).cloned().collect();
-            for job in &jobs {
-                job.stop();
-            }
-            jobs
-        };
-        self.join(jobs).await
+        self.join(self.stop_session_jobs(session)).await
     }
     pub async fn shutdown(&self) -> Result<(), String> {
         let jobs = {

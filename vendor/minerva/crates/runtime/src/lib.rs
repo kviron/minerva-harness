@@ -1,7 +1,10 @@
 pub mod config;
+pub mod delegation;
+pub use minerva_plugin_sdk::delegation as delegation_contract;
 pub mod conversation;
 pub mod credential_store;
 pub mod engine;
+pub use mh_sessions::delegation::questions::{DelegationQuestion, QuestionState};
 pub use mh_sessions::events;
 pub mod editor;
 pub mod network_policy;
@@ -60,10 +63,36 @@ pub struct Runtime {
     pub sessions: Arc<SessionService>,
     pub plugins: Arc<PluginManager>,
     agent_loop: Arc<run_supervisor::AgentLoopService>,
+    delegation: tokio::sync::Mutex<Option<delegation::DelegationRuntime>>,
     fibers: Vec<cordis::FiberHandle>,
     shutdown: tokio::sync::Mutex<bool>,
 }
 impl Runtime {
+    pub async fn interrupt_delegation_tree(&self, caller: &delegation_contract::Caller) -> Result<(), String> {
+        let service = self
+            .delegation
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.service.clone())
+            .ok_or("Delegation is disabled")?;
+        service.interrupt_tree(caller).map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    pub async fn interrupt_delegation(
+        &self,
+        caller: &delegation_contract::Caller,
+        id: &str,
+    ) -> Result<delegation_contract::DelegationSnapshot, String> {
+        let service = self
+            .delegation
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.service.clone())
+            .ok_or("Delegation is disabled")?;
+        service.interrupt(caller, id).await.map_err(|error| error.to_string())
+    }
     pub async fn is_stopped(&self) -> bool {
         self.agent_loop.is_stopped().await
     }
@@ -71,12 +100,22 @@ impl Runtime {
         &self.config
     }
     pub async fn start(config: RuntimeConfig) -> Result<Self, RuntimeError> {
-        Self::start_with_packages(config, true).await
+        Self::start_with_packages(config, true, None).await
     }
     pub async fn start_without_packages(config: RuntimeConfig) -> Result<Self, RuntimeError> {
-        Self::start_with_packages(config, false).await
+        Self::start_with_packages(config, false, None).await
     }
-    async fn start_with_packages(config: RuntimeConfig, load_packages: bool) -> Result<Self, RuntimeError> {
+    pub async fn start_with_host_executor(
+        config: RuntimeConfig,
+        host: Arc<dyn delegation_contract::ExecutionPort>,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_with_packages(config, false, Some(host)).await
+    }
+    async fn start_with_packages(
+        config: RuntimeConfig,
+        load_packages: bool,
+        host: Option<Arc<dyn delegation_contract::ExecutionPort>>,
+    ) -> Result<Self, RuntimeError> {
         if [&config.tenant_id, &config.workspace_id, &config.profile].iter().any(|s| s.trim().is_empty())
             || !config.data_dir.is_absolute()
             || !config.config_dir.is_absolute()
@@ -192,7 +231,35 @@ impl Runtime {
                 return Err(error);
             }
         };
-        Ok(Self { learning, config, sessions, plugins, agent_loop, fibers, shutdown: tokio::sync::Mutex::new(false) })
+        let delegation = {
+            match delegation::DelegationRuntime::start(
+                sessions.clone(),
+                agent_loop.clone(),
+                &plugins,
+                host,
+                composition.services.delegation,
+            ) {
+                Ok(service) => Some(service),
+                Err(error) => {
+                    let _ = mh_plugin_manager::optional::OptionalPlugins::shutdown(learning.as_ref()).await;
+                    for fiber in fibers.iter().rev() {
+                        let _ = fiber.dispose().await;
+                    }
+                    plugins.shutdown().await;
+                    return Err(RuntimeError::Bootstrap(error));
+                }
+            }
+        };
+        Ok(Self {
+            learning,
+            config,
+            sessions,
+            plugins,
+            agent_loop,
+            delegation: tokio::sync::Mutex::new(delegation),
+            fibers,
+            shutdown: tokio::sync::Mutex::new(false),
+        })
     }
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
         let mut stopped = self.shutdown.lock().await;
@@ -200,6 +267,10 @@ impl Runtime {
             return Ok(());
         }
         let mut failure = None;
+        if let Some(mut delegation) = self.delegation.lock().await.take() {
+            delegation.shutdown().await;
+        }
+
         if let Err(error) = mh_plugin_manager::optional::OptionalPlugins::shutdown(self.learning.as_ref()).await {
             failure = Some(RuntimeError::Lifecycle(error));
         }

@@ -1,4 +1,5 @@
 //! Embedded model/API engine. Uses the same in-process event normalization as native drivers.
+mod delegation;
 mod jobs;
 #[cfg(test)]
 mod jobs_tests;
@@ -15,7 +16,7 @@ mod tool_updates;
 use ide_jsonrpc::{Handler, Peer, codes};
 use ide_minerva::{
     Service,
-    minerva_runtime::{RunMessage, Runtime, StartRunRequest},
+    minerva_runtime::{RunMessage, Runtime, StartRunRequest, run_supervisor::CheckoutWriteLease},
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -70,6 +71,8 @@ pub(crate) fn connect(
             runs: Arc::new(Mutex::new(HashMap::new())),
             early_cancel: Mutex::new(HashMap::new()),
             job_sessions: Arc::new(Mutex::new(HashSet::new())),
+            delegation_sessions: Arc::new(Mutex::new(HashSet::new())),
+            delegated_runs: Arc::new(Mutex::new(HashMap::new())),
             runtime: tokio::runtime::Handle::current(),
         }),
         client,
@@ -84,6 +87,8 @@ struct Engine {
     runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
     early_cancel: Mutex<HashMap<String, Instant>>,
     job_sessions: Arc<Mutex<HashSet<String>>>,
+    delegation_sessions: Arc<Mutex<HashSet<String>>>,
+    delegated_runs: Arc<Mutex<HashMap<String, (String, String)>>>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -185,13 +190,29 @@ impl Engine {
                     runtime.sessions.request_selection(&id, model, None)?;
                 }
                 self.watch_jobs(&runtime, &id)?;
+                if let Err(error) = self.watch_delegation(&runtime, &id) {
+                    tracing::warn!(%error, "Could not observe Minerva delegates");
+                }
                 Ok(json!({"sessionId":id,"configOptions":options}))
             }
             "session/load" | "session/resume" => {
                 let id = string(&params, "sessionId")?;
                 self.check_session(&runtime, id).await?;
                 if method == "session/load" {
-                    for message in runtime.sessions.load(id)? {
+                    let messages = runtime.sessions.load(id)?;
+                    let manager_inputs: HashSet<_> = messages
+                        .iter()
+                        .filter(|message| {
+                            message.extensions.get("minerva.origin").and_then(Value::as_str) == Some("manager")
+                        })
+                        .map(|message| message.id.clone())
+                        .collect();
+                    for message in messages {
+                        if message.extensions.get("minerva.origin").and_then(Value::as_str) == Some("manager")
+                            || message.parent_id.as_ref().is_some_and(|id| manager_inputs.contains(id))
+                        {
+                            continue;
+                        }
                         for part in message.parts {
                             let kind = match (message.role.as_str(), part.kind.as_str()) {
                                 ("user", "text") => "user_message_chunk",
@@ -207,7 +228,112 @@ impl Engine {
                 }
                 let options = self.session_options(&runtime, id).await?;
                 self.watch_jobs(&runtime, id)?;
+                if let Err(error) = self.watch_delegation(&runtime, id) {
+                    tracing::warn!(%error, "Could not observe Minerva delegates");
+                }
                 Ok(json!({"configOptions":options}))
+            }
+            "_openidea/prepare_task_removal" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                let workspace = self.service.workspace(&self.cwd).await?;
+                let settings = runtime.plugins.harness.context.workspace_get(id)?;
+                let caller = runtime
+                    .sessions
+                    .delegation_caller(id, &workspace.id, settings.cwd.as_deref().ok_or("Session has no workspace")?)
+                    .map_err(|error| error.to_string())?;
+                if caller.session_id != caller.root_session_id {
+                    return Err("Only the root conversation can prepare its delegated tree for removal".into());
+                }
+                let repository = runtime.sessions.delegation_repository();
+                let children = repository.list(&caller).map_err(|error| error.to_string())?;
+                if children.is_empty() {
+                    repository.request_stop_tree(&caller).map_err(|error| error.to_string())?;
+                } else {
+                    runtime.interrupt_delegation_tree(&caller).await?;
+                }
+                let children = repository.list(&caller).map_err(|error| error.to_string())?;
+                if children.iter().any(|child| {
+                    !child.state.terminal()
+                        || child.state == ide_minerva::minerva_runtime::delegation_contract::ActivationState::Unknown
+                }) {
+                    return Err("Delegated work is stopping or has an unknown outcome. Inspect the children and retry archive or delete after their execution is reconciled.".into());
+                }
+                Ok(json!({}))
+            }
+            "_openidea/stop_delegation_tree" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                let workspace = self.service.workspace(&self.cwd).await?;
+                let settings = runtime.plugins.harness.context.workspace_get(id)?;
+                let cwd = settings.cwd.as_deref().ok_or("Session has no workspace")?;
+                let caller = runtime.sessions.delegation_caller(id, &workspace.id, cwd).map_err(|e| e.to_string())?;
+                runtime.interrupt_delegation_tree(&caller).await?;
+                Ok(json!({}))
+            }
+            "_openidea/answer_delegation_question" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                let workspace = self.service.workspace(&self.cwd).await?;
+                let settings = runtime.plugins.harness.context.workspace_get(id)?;
+                let cwd = settings.cwd.as_deref().ok_or("Session has no workspace")?;
+                let caller = runtime.sessions.delegation_caller(id, &workspace.id, cwd).map_err(|e| e.to_string())?;
+                let question = string(&params, "questionId")?;
+                let state = runtime.answer_delegation_question(
+                    &caller,
+                    string(&params, "childId")?,
+                    question,
+                    &format!("openidea-{question}"),
+                    string(&params, "answer")?,
+                )?;
+                Ok(json!({"state":state}))
+            }
+            "_openidea/delegation_prefer_followup" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                let workspace = self.service.workspace(&self.cwd).await?;
+                let settings = runtime.plugins.harness.context.workspace_get(id)?;
+                let caller = runtime
+                    .sessions
+                    .delegation_caller(id, &workspace.id, settings.cwd.as_deref().ok_or("Session has no workspace")?)
+                    .map_err(|error| error.to_string())?;
+                if caller.session_id != caller.root_session_id {
+                    return Err("Only the root conversation can request user follow-up delivery".into());
+                }
+                let child_id = string(&params, "childId")?;
+                let child = runtime
+                    .sessions
+                    .delegation_repository()
+                    .get(&caller, child_id)
+                    .map_err(|error| error.to_string())?;
+                let Some(handle) = child.handle else {
+                    return Ok(json!(false));
+                };
+                if handle.run_id != string(&params, "expectedRunId")? {
+                    return Ok(json!(false));
+                }
+                runtime
+                    .sessions
+                    .prefer_delegation_followup_in_run(child_id, &handle, string(&params, "workItemId")?)
+                    .map(|accepted| json!(accepted))
+                    .map_err(|error| error.to_string())
+            }
+            "_openidea/delegation_followup" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                let workspace = self.service.workspace(&self.cwd).await?;
+                let settings = runtime.plugins.harness.context.workspace_get(id)?;
+                let cwd = settings.cwd.as_deref().ok_or("Session has no workspace")?;
+                let caller = runtime.sessions.delegation_caller(id, &workspace.id, cwd).map_err(|e| e.to_string())?;
+                let receipt = runtime
+                    .followup_delegation_from_user(
+                        &caller,
+                        string(&params, "childId")?,
+                        string(&params, "operationId")?,
+                        string(&params, "prompt")?.to_owned(),
+                    )
+                    .await?;
+                serde_json::to_value(receipt).map_err(|error| error.to_string())
             }
             "_openidea/stop_task" => {
                 let id = string(&params, "sessionId")?;
@@ -244,6 +370,24 @@ impl Engine {
 
     async fn prompt(&self, runtime: Arc<Runtime>, params: Value) -> Result<Value, String> {
         let id = string(&params, "sessionId")?;
+        let run = match params.pointer("/_meta/openidea/nativeRunId") {
+            Some(value) => value
+                .as_str()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .filter(|id| id.get_version() == Some(uuid::Version::Random))
+                .ok_or("Invalid native run ID")?
+                .to_string(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        let lease = if params.pointer("/_meta/openidea/nativeRunId").is_some() {
+            let lease = self.service.native_run_lease(id, &run).ok_or("Native run has no active checkout lease")?;
+            if !lease.parent_holds_write() {
+                return Err("Native run checkout lease is assigned to a child".into());
+            }
+            Some(lease)
+        } else {
+            None
+        };
         self.check_session(&runtime, id).await?;
         self.watch_jobs(&runtime, id)?;
         if self.early_cancel.lock().remove(id).is_some_and(|time| time.elapsed() < Duration::from_secs(2)) {
@@ -282,12 +426,14 @@ impl Engine {
         if let Some(effort) = effort {
             options["reasoningEffort"] = effort;
         }
-        let run = uuid::Uuid::new_v4().to_string();
         let active = ActiveRun { id: run.clone(), cancelled: Arc::new(AtomicBool::new(false)) };
         {
             let mut runs = self.runs.lock();
             if runs.contains_key(id) {
                 return Err("A turn is already running".into());
+            }
+            if runtime.get_run(id, &run).is_ok() {
+                return Err("Native run ID was already used".into());
             }
             runs.insert(id.into(), active.clone());
         }
@@ -296,41 +442,49 @@ impl Engine {
         {
             active.cancelled.store(true, Ordering::Release);
         }
-        let result = self.run_prompt(&runtime, id, &active, model, text, options).await;
+        let request = StartRunRequest {
+            session_id: id.into(),
+            request_id: run.clone(),
+            parent_id: None,
+            message: RunMessage { id: uuid::Uuid::new_v4().to_string(), text },
+            model,
+            options,
+        };
+        let checkout_lease = lease.map(|lease| Arc::new(lease) as Arc<dyn CheckoutWriteLease>);
+        let mut result = self.run_prompt(&runtime, &active, request, checkout_lease).await;
         if result.is_err() {
             let _ = runtime.cancel_run(id, &run);
         }
         self.runs.lock().remove(id);
         if runtime.get_run(id, &run).is_ok_and(|snapshot| snapshot.status == "cancelled") {
-            return Ok(json!({"stopReason":"cancelled"}));
+            result = Ok(json!({"stopReason":"cancelled"}));
         }
-        result
+        let mut reply = match result {
+            Ok(reply) => reply,
+            Err(message) => json!({"_meta":{"openidea":{"turnError":message}}}),
+        };
+        let (revision, tasks, _) = jobs::snapshot(&runtime, id)?;
+        reply["_meta"]["openidea"]["backgroundTasks"] = json!(tasks);
+        reply["_meta"]["openidea"]["backgroundRevision"] = json!(revision);
+        Ok(reply)
     }
 
     async fn run_prompt(
         &self,
         runtime: &Arc<Runtime>,
-        id: &str,
         active: &ActiveRun,
-        model: String,
-        text: String,
-        options: Value,
+        mut request: StartRunRequest,
+        checkout_lease: Option<Arc<dyn CheckoutWriteLease>>,
     ) -> Result<Value, String> {
         if active.cancelled.load(Ordering::Acquire) || self.client.get().is_none_or(Peer::is_closed) {
             return Ok(json!({"stopReason":"cancelled"}));
         }
+        let id = request.session_id.clone();
+        let id = id.as_str();
         let run = active.id.as_str();
         let baseline = runtime.sessions.baseline(id)?;
-        runtime
-            .start_native_api_run(StartRunRequest {
-                session_id: id.into(),
-                request_id: run.into(),
-                parent_id: baseline.messages.last().map(|m| m.id.clone()),
-                message: RunMessage { id: uuid::Uuid::new_v4().to_string(), text },
-                model,
-                options,
-            })
-            .await?;
+        request.parent_id = baseline.messages.last().map(|m| m.id.clone());
+        runtime.start_native_api_run(request, checkout_lease).await?;
         let mut rendered = HashMap::<usize, String>::new();
         let mut tools = HashMap::<String, Value>::new();
         loop {
@@ -379,15 +533,40 @@ impl Engine {
             }
             let interactions = runtime.harness_call("interactions.list", json!({"sessionId":id})).await?;
             for pending in interactions.as_array().into_iter().flatten() {
-                self.interaction(runtime, id, pending).await?;
+                self.interaction(runtime, id, id, pending).await?;
+            }
+            if let Some((child, activation)) =
+                self.service.native_run_lease(id, run).and_then(|lease| lease.active_child())
+            {
+                for pending in runtime.plugins.harness.interactions.list(&child) {
+                    if pending.run_id == activation && pending.kind == "approval" {
+                        let pending = serde_json::to_value(pending).map_err(|error| error.to_string())?;
+                        self.interaction(runtime, id, &child, &pending).await?;
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
-    async fn interaction(&self, runtime: &Arc<Runtime>, id: &str, pending: &Value) -> Result<(), String> {
+    async fn interaction(&self, runtime: &Arc<Runtime>, id: &str, owner: &str, pending: &Value) -> Result<(), String> {
+        let scoped_approval = pending["kind"] == "approval"
+            && (owner != id || pending["callId"].as_str().is_some_and(|call| call.starts_with("delegation:")));
         let mut tool =
             json!({"toolCallId":pending["callId"],"title":pending["prompt"],"kind":"other","status":"pending"});
+        if owner != id {
+            tool["toolCallId"] = json!(format!("{owner}:{}", string(pending, "callId")?));
+            let model = runtime.sessions.get(owner)?.model;
+            let model = model.as_deref().and_then(|route| route.strip_prefix("api:")).unwrap_or("Minerva");
+            tool["title"] = json!(format!("Subagent ({model}): {}", string(pending, "prompt")?));
+        } else if scoped_approval {
+            let agent = delegation::approval_agent(runtime, id, pending);
+            let prompt = string(pending, "prompt")?;
+            tool["title"] = json!(match agent.as_deref() {
+                Some(agent) => format!("Subagent ({agent}): {prompt}"),
+                None => format!("Subagent: {prompt}"),
+            });
+        }
         let question = pending["kind"] == "question";
         let options = if question {
             tool["_meta"] = json!({"questions":[{"answerKey":"answer","header":pending["title"],"question":pending["prompt"],"multiSelect":false,"options":pending["options"].as_array().into_iter().flatten().map(|label|json!({"label":label})).collect::<Vec<_>>()}]});
@@ -396,13 +575,17 @@ impl Engine {
             json!([{"optionId":"allow","name":"Allow once","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}])
         };
         let peer = self.client.get().ok_or("Connection closed")?;
-        let request = peer.request::<_, Value>(
-            "session/request_permission",
-            json!({"sessionId":id,"toolCall":tool,"options":options}),
-            None,
-        );
+        let mut params = json!({"sessionId":id,"toolCall":tool,"options":options});
+        if scoped_approval {
+            params["_meta"]["openidea"]["childApproval"] = json!({
+                "sessionId": owner,
+                "runId": pending["runId"],
+                "id": pending["id"],
+            });
+        }
+        let request = peer.request::<_, Value>("session/request_permission", params, None);
         tokio::pin!(request);
-        let deadline = tokio::time::sleep(Duration::from_secs(600));
+        let deadline = tokio::time::sleep(ide_minerva::minerva_runtime::tools::INTERACTION_TIMEOUT);
         tokio::pin!(deadline);
         let response: Value = loop {
             tokio::select! {
@@ -410,7 +593,15 @@ impl Engine {
                 _ = &mut deadline => return Err("Minerva interaction timed out".into()),
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     let run = pending["runId"].as_str().ok_or("Interaction has no run ID")?;
-                    if runtime.get_run(id,run)?.status != "running" { return Err("Minerva turn stopped".into()); }
+                    if scoped_approval && !runtime.plugins.harness.interactions.list(owner).iter()
+                        .any(|item| item.run_id == run && pending["id"].as_str() == Some(&item.id))
+                    {
+                        return Ok(());
+                    }
+                    if runtime.get_run(owner,run)?.status != "running" {
+                        if scoped_approval { return Ok(()); }
+                        return Err("Minerva turn stopped".into());
+                    }
                 }
             }
         };
@@ -422,14 +613,41 @@ impl Engine {
         };
         if question && answer.is_none() {
             let run = string(pending, "runId")?;
-            let _ = runtime.cancel_run(id, run);
+            let _ = runtime.cancel_run(owner, run);
             return Err("Minerva question cancelled".into());
         }
-        let accepted = runtime.harness_call("interactions.answer",json!({"sessionId":id,"id":pending["id"],"decision":if question{"answer"}else if choice=="allow"{"allow"}else{"deny"},"answer":answer})).await?;
-        if accepted != true {
+        let accepted = runtime.harness_call("interactions.answer",json!({"sessionId":owner,"id":pending["id"],"decision":if question{"answer"}else if choice=="allow"{"allow"}else{"deny"},"answer":answer})).await?;
+        if accepted != true && !scoped_approval {
             return Err("Minerva interaction is no longer pending".into());
         }
         Ok(())
+    }
+}
+
+pub(crate) struct ChildApproval<'a> {
+    session: &'a str,
+    run: &'a str,
+    id: &'a str,
+}
+
+impl<'a> ChildApproval<'a> {
+    pub(crate) fn from_permission(params: &'a Value) -> Option<Self> {
+        let owner = params.pointer("/_meta/openidea/childApproval")?;
+        Some(Self { session: owner["sessionId"].as_str()?, run: owner["runId"].as_str()?, id: owner["id"].as_str()? })
+    }
+
+    pub(crate) fn is_pending(&self, shared: &crate::Shared) -> bool {
+        let Some(service) = shared.minerva.get() else { return false };
+        shared.runtime.block_on(async {
+            let Ok(runtime) = service.runtime().await else { return false };
+            runtime
+                .plugins
+                .harness
+                .interactions
+                .list(self.session)
+                .iter()
+                .any(|pending| pending.run_id == self.run && pending.id == self.id && pending.kind == "approval")
+        })
     }
 }
 
@@ -448,10 +666,14 @@ impl Handler for Engine {
                 let service = self.service.clone();
                 let id = id.to_owned();
                 self.runtime.spawn(async move {
-                    if let Ok(runtime) = service.runtime().await {
-                        let _ = runtime.cancel_run(&id, &run.id);
+                    if let Ok(runtime) = service.runtime().await
+                        && let Err(error) = runtime.stop_native_run(&id, &run.id)
+                    {
+                        tracing::warn!(%error, "Could not persist Minerva user stop");
                     }
                 });
+            } else if self.cancel_delegated(id) {
+                // Child controls are addressed through the backend-owned projection.
             } else {
                 let mut cancelled = self.early_cancel.lock();
                 cancelled.retain(|_, time| time.elapsed() < Duration::from_secs(2));
@@ -586,6 +808,16 @@ mod tests {
         assert!(service.runtime().await.unwrap().sessions.list().unwrap().is_empty());
         let new: Value = peer.request("session/new", json!({}), None).await.unwrap();
         let id = new["sessionId"].as_str().unwrap();
+        let _: Value = peer.request("_openidea/prepare_task_removal", json!({"sessionId":id}), None).await.unwrap();
+        assert!(
+            peer.request::<_, Value>(
+                "_openidea/delegation_prefer_followup",
+                json!({"sessionId":id,"childId":"missing","workItemId":"work","expectedRunId":"run"}),
+                None,
+            )
+            .await
+            .is_err()
+        );
         assert_eq!(new["configOptions"][1]["currentValue"], "ask");
         let runtime = service.runtime().await.unwrap();
         let settings = runtime.harness_call("workspace.get", json!({"sessionId":id})).await.unwrap();
@@ -609,6 +841,19 @@ mod tests {
             .is_err()
         );
         let other = connect(service.clone(), &b, Arc::new(Client(seen.clone())), None);
+        assert!(
+            other.request::<_, Value>("_openidea/prepare_task_removal", json!({"sessionId":id}), None).await.is_err()
+        );
+        assert!(
+            other
+                .request::<_, Value>(
+                    "_openidea/delegation_prefer_followup",
+                    json!({"sessionId":id,"childId":"missing","workItemId":"work","expectedRunId":"run"}),
+                    None,
+                )
+                .await
+                .is_err()
+        );
         assert!(other.request::<_, Value>("session/load", json!({"sessionId":id}), None).await.is_err());
         let _: Value = peer.request("session/load", json!({"sessionId":id}), None).await.unwrap();
         let _: Value = peer
@@ -639,6 +884,41 @@ mod tests {
         );
         peer.kill();
         other.kill();
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_removal_is_blocked_by_an_unreconciled_child() {
+        use ide_minerva::minerva_runtime::delegation_contract::{StartRequest, Target};
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(Service::new(dir.path().join("data"), dir.path().join("config")));
+        let peer = connect(service.clone(), dir.path(), Arc::new(Client(Arc::default())), None);
+        let new: Value = peer.request("session/new", json!({}), None).await.unwrap();
+        let id = new["sessionId"].as_str().unwrap();
+        let runtime = service.runtime().await.unwrap();
+        let workspace = service.workspace(dir.path()).await.unwrap();
+        let settings = runtime.plugins.harness.context.workspace_get(id).unwrap();
+        let caller = runtime.sessions.delegation_caller(id, &workspace.id, settings.cwd.as_deref().unwrap()).unwrap();
+        let repository = runtime.sessions.delegation_repository();
+        let child = repository
+            .admit(
+                &caller,
+                &StartRequest {
+                    origin_run: None,
+                    tool_registrations: Default::default(),
+                    operation_id: "unreconciled-child".into(),
+                    target: Target::Minerva { route: "api:fixture/model".into(), effort: None },
+                    prompt: "Inspect files".into(),
+                },
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot;
+        repository.mark_unknown(&child.id, &child.activation_id, "Lost execution receipt").unwrap();
+        let result = peer.request::<_, Value>("_openidea/prepare_task_removal", json!({"sessionId":id}), None).await;
+        assert!(result.unwrap_err().to_string().contains("reconciled"));
+        assert!(runtime.sessions.get(id).is_ok());
+        peer.kill();
         service.shutdown().await.unwrap();
     }
 
