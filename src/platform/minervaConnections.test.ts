@@ -6,25 +6,25 @@ import {
   trackMinervaConnectionOperation,
 } from "./minervaConnections";
 
-it("publishes catalog changes for models and names without a credential boundary", async () => {
-  const events = vi.fn();
-  minervaConnectionEvents.addEventListener("change", events);
-  const provider = { id: "opencode-go", baseUrl: "https://opencode.ai/inference/go", protocol: "openai-chat" };
-  try {
-    await trackMinervaConnectionOperation("providers.list", {}, async () => [provider]);
-    for (const method of ["codex.configure", "providers.save"]) {
-      events.mockClear();
+it.each(["codex.configure", "providers.save"])(
+  "publishes %s catalog changes without a credential boundary",
+  async (method) => {
+    const events = vi.fn();
+    minervaConnectionEvents.addEventListener("change", events);
+    const provider = { id: "opencode-go", baseUrl: "https://opencode.ai/inference/go", protocol: "openai-chat" };
+    try {
+      await trackMinervaConnectionOperation("providers.list", {}, async () => [provider]);
       await trackMinervaConnectionOperation(method, { ...provider, apiKey: null, models: ["new"] }, async () => [
         provider,
       ]);
       expect(events).toHaveBeenCalledTimes(1);
       expect(events.mock.calls[0]![0].detail).toEqual({ kind: "catalog", phase: "end" });
       expect(minervaConnectionsMutating()).toBe(false);
+    } finally {
+      minervaConnectionEvents.removeEventListener("change", events);
     }
-  } finally {
-    minervaConnectionEvents.removeEventListener("change", events);
-  }
-});
+  },
+);
 
 it("holds the credential boundary through key writes and releases it on failure", async () => {
   const events = vi.fn();

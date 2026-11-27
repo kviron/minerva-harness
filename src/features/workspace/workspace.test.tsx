@@ -95,8 +95,9 @@ it("opens every contributed tool in a workspace tab regardless of its dock ancho
   ] as const)
     cleanups.push(registerToolWindow({ id, anchor, title: id, icon: "plugin", component: () => null }));
   cleanups.push(activate());
-  for (const id of ["commit-fixture", "graphql-fixture", "plugin-fixture"])
-    await executeActionOrThrow("workspace.tool", id);
+  await executeActionOrThrow("workspace.tool", "commit-fixture");
+  await executeActionOrThrow("workspace.tool", "graphql-fixture");
+  await executeActionOrThrow("workspace.tool", "plugin-fixture");
   expect(openInput.mock.calls.map(([input]) => input)).toEqual([
     { kind: "workspace.tool", key: "workspace.tool.commit-fixture", data: { tool: "commit-fixture" } },
     { kind: "workspace.tool", key: "workspace.tool.graphql-fixture", data: { tool: "graphql-fixture" } },

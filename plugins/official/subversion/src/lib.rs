@@ -78,7 +78,7 @@ fn execute(project: &Project, request: Value) -> Result<Value, Error> {
     }
     let root = relative(field(&request, "root")?)?;
     if op == "connect" {
-        let wc_root = svn(project, "info", &["--show-item", "wc-root"], &[root.clone()])?;
+        let wc_root = svn(project, "info", &["--show-item", "wc-root"], std::slice::from_ref(&root))?;
         let project_root = project.root()?.replace('\\', "/");
         let expected = if root == "." {
             project_root.trim_end_matches('/').to_owned()
