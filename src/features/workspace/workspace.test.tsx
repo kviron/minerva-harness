@@ -108,20 +108,13 @@ it("opens the active task's terminal in the native editor and stops if session c
   setContext("projectOpen", true);
   provideEditorService({ onActiveInputChange: () => () => {} } as never);
   const open = vi.fn();
-  const move = vi.fn();
   cleanups.push(
-    registerActions([
-      { id: "terminal.openAt", title: "Terminal", run: ({ arg }) => open(arg) },
-      { id: "terminal.moveToEditor", title: "Move", run: move },
-    ]),
+    registerActions([{ id: "terminal.openAt", title: "Terminal", run: ({ arg }) => open(arg) }]),
     activate(),
   );
   useWorkbenchChrome.setState({ primary: () => null, workspaceCwd: "/project/worktree" });
   await executeActionOrThrow("workspace.terminal");
-  expect(open).toHaveBeenCalledWith("/project/worktree");
-  expect(move).toHaveBeenCalledOnce();
-  move.mockClear();
+  expect(open).toHaveBeenCalledWith({ cwd: "/project/worktree", inEditor: true });
   open.mockRejectedValueOnce(Error("PTY unavailable"));
   await expect(executeActionOrThrow("workspace.terminal")).rejects.toThrow("PTY unavailable");
-  expect(move).not.toHaveBeenCalled();
 });

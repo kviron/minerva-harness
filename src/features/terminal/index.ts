@@ -44,13 +44,13 @@ function shellName(path: string): string {
   );
 }
 
-async function openNewTab(dir?: string) {
+async function openNewTab(dir?: string, inEditor = false) {
   const root = projectRoot();
   const cwd = dir || root;
   if (!cwd) return;
   const rt = await loadTerminalRuntime();
-  if (dir) rt.newTabAt(dir);
-  else rt.newTab(rt.startDirectory(cwd));
+  const tab = dir ? rt.newTabAt(dir) : rt.newTab(rt.startDirectory(cwd));
+  if (inEditor) return moveTerminalToEditor(tab.id);
   toolWindowService().show(WINDOW, true);
   focusActiveSoon();
 }
@@ -184,7 +184,11 @@ export function activate(): () => void {
         icon: "terminal",
         when: "projectOpen",
         hidden: true,
-        run: ({ arg }) => openNewTab(typeof arg === "string" && arg ? arg : undefined),
+        run: ({ arg }) => {
+          if (arg && typeof arg === "object" && "inEditor" in arg && arg.inEditor === true)
+            return openNewTab("cwd" in arg && typeof arg.cwd === "string" ? arg.cwd : undefined, true);
+          return openNewTab(typeof arg === "string" && arg ? arg : undefined);
+        },
       },
       {
         id: "terminal.pluginSession",

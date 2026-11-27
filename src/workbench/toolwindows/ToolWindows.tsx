@@ -106,6 +106,7 @@ export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotReco
   const visible = useToolWindowLayout((s) => s.visible);
   const effectiveMaximized = useEffectiveMaximized(windows);
   const sidesShown = useWorkbenchChrome((s) => anchorShown("left", s));
+  const bottomShown = useWorkbenchChrome((s) => anchorShown("bottom", s));
   return useMemo(() => {
     const out = {} as SlotRecord;
     for (const slot of SLOTS) {
@@ -116,14 +117,14 @@ export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotReco
           (w) =>
             w.id === id &&
             slotOf(w) === slot &&
-            (sidesShown || w.anchor === "bottom") &&
+            (w.anchor === "bottom" ? bottomShown : sidesShown) &&
             (!effectiveMaximized || w.anchor === effectiveMaximized),
         )
           ? id
           : null;
     }
     return out;
-  }, [visible, windows, effectiveMaximized, sidesShown]);
+  }, [visible, windows, effectiveMaximized, sidesShown, bottomShown]);
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +565,8 @@ export function ToolWindowStripe({
   buttonWidth?: number;
   navigation?: NonNullable<ReturnType<typeof useWorkbenchChrome.getState>["navigation"]>;
 }) {
-  const isActive = (w: ToolWindowContribution) => visible[slotOf(w)] === w.id;
+  const activeTab = useWorkbenchChrome((s) => (s.primary && s.workspaceOpen ? s.activeWorkspaceTool : null));
+  const isActive = (w: ToolWindowContribution) => visible[slotOf(w)] === w.id || activeTab === w.id;
   const stripeButtons = useToolWindowLayout((s) => s.stripeButtons);
   const onStripe = windows.filter((w) => hasStripeButton(w, stripeButtons) || isActive(w));
   const inSlot = (slot: ToolWindowSlot) => onStripe.filter((w) => slotOf(w) === slot);

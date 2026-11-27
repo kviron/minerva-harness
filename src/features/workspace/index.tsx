@@ -32,17 +32,17 @@ export function activate() {
         .map(({ input }) => input.key),
     );
     for (const key of keys) if ((await editor?.closeInput?.(key)) === false) return false;
-    useWorkbenchChrome.setState({ workspaceOpen: false, workspaceMaximized: false });
+    useWorkbenchChrome.setState({ workspaceOpen: false, workspaceMaximized: false, workspaceTabsOnly: false });
     return true;
   }
   useWorkbenchChrome.setState({ headerActions: WorkspaceControls, closeWorkspace });
   const reveal = () => useWorkbenchChrome.setState({ workspaceOpen: true });
-  const openTool = async (id: string) => {
+  const openTool = async (id: string, focus = true) => {
     if (!useContributions.getState().toolWindows.has(id)) return;
-    reveal();
+    useWorkbenchChrome.setState({ workspaceOpen: true, workspaceTabsOnly: true });
     await editorService().openInput(
       { kind: "workspace.tool", key: `workspace.tool.${id}`, data: { tool: id } },
-      { focus: true },
+      { focus },
     );
   };
   const disposers = [
@@ -122,8 +122,10 @@ export function activate() {
         run: async () => {
           reveal();
           const chrome = useWorkbenchChrome.getState();
-          await executeActionOrThrow("terminal.openAt", chrome.primary ? chrome.workspaceCwd : undefined);
-          await executeActionOrThrow("terminal.moveToEditor");
+          await executeActionOrThrow("terminal.openAt", {
+            cwd: chrome.primary ? chrome.workspaceCwd : undefined,
+            inEditor: true,
+          });
         },
       },
       {
@@ -134,6 +136,8 @@ export function activate() {
         hidden: true,
         run: async ({ arg }) => {
           if (typeof arg === "string") await openTool(arg);
+          else if (arg && typeof arg === "object" && "id" in arg && typeof arg.id === "string")
+            await openTool(arg.id, !("focus" in arg) || arg.focus !== false);
         },
       },
       {
@@ -148,6 +152,9 @@ export function activate() {
       },
     ]),
     maybeEditorService()?.onActiveInputChange?.((input) => {
+      useWorkbenchChrome.setState({
+        activeWorkspaceTool: input?.kind === "workspace.tool" ? (input.data as { tool: string }).tool : null,
+      });
       if (!useWorkbenchChrome.getState().primary) return;
       if (!input) {
         if (!(editorService().openTabs?.() ?? []).length)

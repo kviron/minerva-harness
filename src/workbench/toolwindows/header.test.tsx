@@ -52,7 +52,8 @@ afterEach(() => disposers.forEach((d) => d()));
 
 const header = (id: string) => document.querySelector<HTMLElement>(`[data-toolwindow="${id}"] header`)!;
 
-it("opens and toggles bottom tools below the agent with the workspace folded", () => {
+it("hides the saved bottom dock in Agent and restores it in Development", () => {
+  showToolWindow("run");
   render(<ToolWindowLayout editor={<input aria-label="Editor draft" defaultValue="Keep me" />} />);
   const editor = screen.getByRole("textbox", { name: "Editor draft" });
   act(() =>
@@ -64,17 +65,9 @@ it("opens and toggles bottom tools below the agent with the workspace folded", (
   );
   expect(screen.getByRole("navigation", { name: "Agent navigation" })).toBeVisible();
   expect(editor).not.toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Run" }));
-  expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
-  expect(screen.getByRole("main")).toBeVisible();
-  expect(editor).not.toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Problems" }));
-  expect(screen.getByRole("region", { name: "Problems" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Problems" })).toHaveAttribute("aria-pressed", "true");
-  fireEvent.click(screen.getByRole("button", { name: "Problems" }));
-  expect(isToolWindowVisible("problems")).toBe(false);
-  expect(useWorkbenchChrome.getState().workspaceOpen).toBe(false);
+  expect(screen.queryByRole("region", { name: "Run" })).toBeNull();
   act(() => useWorkbenchChrome.setState({ primary: null }));
+  expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
   expect(screen.getByRole("textbox", { name: "Editor draft" })).toBe(editor);
   expect(screen.getByRole("textbox", { name: "Editor draft" })).toHaveValue("Keep me");
 });

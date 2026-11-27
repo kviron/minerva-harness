@@ -4,28 +4,43 @@ import { expect, openFromTree, test } from "./fixtures";
 const project = (page: Page) => page.locator('[data-toolwindow="project"]');
 const editorArea = (page: Page) => page.locator("[data-editor-area]");
 
-test("bottom stripe tools dock below the agent conversation", async ({ workbench: page }) => {
-  await page.getByRole("button", { name: "Workspace mode" }).click();
+test("bottom stripe tools reuse workspace tabs beside the full-height agent conversation", async ({
+  workbench: page,
+}) => {
+  const mode = page.getByRole("button", { name: "Workspace mode" });
+  const dock = page.locator('[data-anchor="bottom"]');
+  await page.locator('[data-stripe-button="problems"]').click();
+  await expect(dock).toBeVisible();
+  await mode.click();
   await page.getByRole("option", { name: "Agent", exact: true }).click();
   const chat = page.getByRole("region", { name: "Agent conversation" });
   await expect(chat).toBeVisible();
+  await expect(dock).toBeHidden();
   const full = (await chat.boundingBox())!;
-  for (const id of ["todo", "terminal", "git", "problems"]) {
+  const tabs = page.getByRole("tablist", { name: "Editor tabs" });
+  for (const [id, title] of [
+    ["todo", "TODO"],
+    ["terminal", "Terminal"],
+    ["git", "Git"],
+    ["problems", "Problems"],
+    ["terminal", "Terminal"],
+  ]) {
     const button = page.locator(`[data-stripe-button="${id}"]`);
-    const panel = page.locator(`[data-toolwindow="${id}"]`);
     await button.click();
+    const panel = page.locator(`[data-workspace-tool="${id}"]`);
     await expect(panel).toBeVisible();
-    await expect(editorArea(page)).toBeHidden();
-    const dock = (await panel.boundingBox())!;
-    const upper = (await chat.boundingBox())!;
-    expect(upper.width).toBe(full.width);
-    expect(dock.x).toBe(upper.x);
-    expect(dock.width).toBe(upper.width);
-    expect(dock.y).toBeGreaterThanOrEqual(upper.y + upper.height);
-    await button.click();
-    await expect(panel).toBeHidden();
-    expect(await chat.boundingBox()).toEqual(full);
+    await expect(tabs.getByRole("tab", { name: title, exact: true })).toHaveAttribute("aria-selected", "true");
+    await expect(button).toHaveAttribute("aria-pressed", "true");
+    await expect(dock).toBeHidden();
+    const current = (await chat.boundingBox())!;
+    expect(current.height).toBe(full.height);
+    expect((await panel.boundingBox())!.x).toBeGreaterThanOrEqual(current.x + current.width - 1);
   }
+  await mode.click();
+  await page.getByRole("option", { name: "Development", exact: true }).click();
+  await expect(page.locator('[data-toolwindow="problems"]')).toBeVisible();
+  await page.locator('[data-stripe-button="terminal"]').click();
+  await expect(page.locator('[data-toolwindow="terminal"]')).toBeVisible();
 });
 
 async function setViewMode(page: Page, mode: "Dock Pinned" | "Dock Unpinned" | "Undock") {

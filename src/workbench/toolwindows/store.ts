@@ -5,9 +5,11 @@
  * sizes, split ratios, placements) is persisted per project root in localStorage.
  */
 import { create } from "zustand";
+import { executeAction } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import { useProject } from "@/platform/project";
 import {
+  maybeEditorService,
   useContributions,
   useWorkbenchChrome,
   type ToolWindowAnchor,
@@ -159,9 +161,13 @@ export function anchorOf(id: string): ToolWindowAnchor | undefined {
   return slot && slotAnchor(slot);
 }
 
-/** Side tools belong to the optional agent workspace. The bottom dock is shared with the conversation. */
+/** Agent presents bottom tools as editor tabs. Side docks can still be opened explicitly. */
 export function anchorShown(anchor: ToolWindowAnchor, chrome: ReturnType<typeof useWorkbenchChrome.getState>): boolean {
-  return anchor === "bottom" || !chrome.primary || !!chrome.workspaceOpen;
+  return !chrome.primary || (anchor !== "bottom" && !!chrome.workspaceOpen && !chrome.workspaceTabsOnly);
+}
+
+function opensInWorkspace(id: string): boolean {
+  return !!useWorkbenchChrome.getState().primary && anchorOf(id) === "bottom";
 }
 
 /** The other area of the same side. */
@@ -443,7 +449,13 @@ function hasRegisteredVisibleOn(
  */
 export function installToolWindowLayoutSync(): () => void {
   const stopChrome = useWorkbenchChrome.subscribe((chrome, prev) => {
-    if (anchorShown("left", chrome) !== anchorShown("left", prev)) publishVisibility();
+    if (
+      chrome.primary !== prev.primary ||
+      chrome.workspaceOpen !== prev.workspaceOpen ||
+      chrome.activeWorkspaceTool !== prev.activeWorkspaceTool ||
+      chrome.workspaceTabsOnly !== prev.workspaceTabsOnly
+    )
+      publishVisibility();
   });
   const stopContributions = useContributions.subscribe((c, prev) => {
     if (c.toolWindows === prev.toolWindows) return;
@@ -516,6 +528,7 @@ function update(patch: Partial<ToolWindowLayoutState>, save = true) {
 export function isToolWindowVisible(id: string): boolean {
   const slot = slotOfId(id);
   const chrome = useWorkbenchChrome.getState();
+  if (chrome.primary && chrome.workspaceOpen && chrome.activeWorkspaceTool === id) return true;
   if (!slot || !anchorShown(slotAnchor(slot), chrome)) return false;
   const { visible, placements, maximized } = useToolWindowLayout.getState();
   return (
@@ -544,14 +557,21 @@ export function showToolWindow(id: string, focus = false) {
   const slot = slotOfId(id);
   if (!slot) return;
   const a = slotAnchor(slot);
-  if (focus && !anchorShown(a, useWorkbenchChrome.getState())) useWorkbenchChrome.setState({ workspaceOpen: true });
+  const chrome = useWorkbenchChrome.getState();
   lastUsed = id;
   const s = useToolWindowLayout.getState();
+  const stripeButtons = s.stripeButtons[id] ? s.stripeButtons : { ...s.stripeButtons, [id]: true };
+  if (chrome.primary && a === "bottom") {
+    if (stripeButtons !== s.stripeButtons) update({ stripeButtons });
+    void executeAction("workspace.tool", { id, focus });
+    return;
+  }
+  if (focus && !anchorShown(a, chrome)) useWorkbenchChrome.setState({ workspaceOpen: true, workspaceTabsOnly: false });
   const mounted = s.mounted.has(id) ? s.mounted : new Set(s.mounted).add(id);
   update({
     visible: { ...s.visible, [slot]: id },
     // Opening a window puts its button on the stripe (IDEA).
-    stripeButtons: s.stripeButtons[id] ? s.stripeButtons : { ...s.stripeButtons, [id]: true },
+    stripeButtons,
     mounted,
     lastActive: id,
     stashed: null,
@@ -561,6 +581,10 @@ export function showToolWindow(id: string, focus = false) {
 }
 
 export function hideToolWindow(id: string) {
+  if (opensInWorkspace(id)) {
+    void maybeEditorService()?.closeInput?.(`workspace.tool.${id}`);
+    return;
+  }
   const slot = slotOfId(id);
   const s = useToolWindowLayout.getState();
   if (!slot || s.visible[slot] !== id) return;
@@ -593,7 +617,7 @@ export function removeFromStripe(id: string) {
 }
 
 export function toggleToolWindow(id: string) {
-  if (isToolWindowVisible(id)) hideToolWindow(id);
+  if (!opensInWorkspace(id) && isToolWindowVisible(id)) hideToolWindow(id);
   else showToolWindow(id, true);
 }
 
@@ -602,13 +626,13 @@ export function toggleToolWindow(id: string) {
  * → focus; visible and focused → hide (IDEA behaviour).
  */
 export function activateToolWindow(id: string) {
-  if (!isToolWindowVisible(id)) showToolWindow(id, true);
+  if (opensInWorkspace(id) || !isToolWindowVisible(id)) showToolWindow(id, true);
   else if (useToolWindowLayout.getState().focused !== id && !isFocusWithinToolWindow(id)) focusToolWindow(id);
   else hideToolWindow(id);
 }
 
 export function focusToolWindow(id: string) {
-  if (!isToolWindowVisible(id)) return showToolWindow(id, true);
+  if (opensInWorkspace(id) || !isToolWindowVisible(id)) return showToolWindow(id, true);
   update({ focusRequest: { id, seq: ++focusSeq }, lastActive: id }, false);
 }
 

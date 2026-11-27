@@ -383,6 +383,8 @@ export const useWorkbenchChrome = create<{
   sidebar: ComponentType | null;
   primary?: ComponentType | null;
   workspaceOpen?: boolean;
+  workspaceTabsOnly?: boolean;
+  activeWorkspaceTool?: string | null;
   workspaceMaximized?: boolean;
   headerActions?: ComponentType | null;
   /** Close Agent-only views through the editor's guarded lifecycle before switching layouts. */
