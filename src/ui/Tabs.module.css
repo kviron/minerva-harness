@@ -175,6 +175,14 @@
   align-self: center;
   margin: 0 4px;
 }
+.newTab {
+  flex: none;
+  align-self: center;
+  margin-inline-start: var(--space-1);
+}
+.wrap:has(> .newTab) .scroller {
+  flex: 0 1 auto;
+}
 .trailing {
   flex: 1 0 auto;
   min-width: 0;

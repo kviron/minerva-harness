@@ -1577,7 +1577,7 @@ export class EditorController implements SlotHost {
             preview,
             pinned: o.pinned,
             activate,
-            preservePreview: !activate,
+            preservePreview: !activate || kind?.replaceOnOpen,
             keepPreview: (t) => !isTextInput(t.input),
             ...(o.index !== undefined
               ? { index: o.index }
@@ -1589,6 +1589,18 @@ export class EditorController implements SlotHost {
           tabId = r.tabId;
           if (tabs.sortAlphabetically && o.index === undefined) s = sortTabs(s, paneId, (t) => tabSortKey(t.input));
         }
+      }
+      const previous = this.activeTabOf(before);
+      if (
+        activate &&
+        paneId === before.activePane &&
+        previous &&
+        !previous.pinned &&
+        kinds.get(previous.input.kind)?.replaceOnOpen &&
+        !kind?.replaceOnOpen &&
+        !documentLifecycle(previous.input, kinds)
+      ) {
+        s = closeTab(s, paneId, previous.id);
       }
       if (o.selection)
         this.selectionRequests.set(tabId, Math.max(generation.sequence, this.selectionRequests.get(tabId) ?? 0));

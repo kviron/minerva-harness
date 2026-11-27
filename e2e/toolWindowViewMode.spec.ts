@@ -4,6 +4,44 @@ import { expect, openFromTree, test } from "./fixtures";
 const project = (page: Page) => page.locator('[data-toolwindow="project"]');
 const editorArea = (page: Page) => page.locator("[data-editor-area]");
 
+test("the Agent workspace adds a tab beside Problems and opens the chosen tool in its place", async ({
+  workbench: page,
+}) => {
+  const area = editorArea(page);
+  const add = area.getByRole("button", { name: "New Tab", exact: true });
+  const mode = page.getByRole("button", { name: "Workspace mode" });
+  await expect(add).toHaveCount(0);
+  await mode.click();
+  await page.getByRole("option", { name: "Agent", exact: true }).click();
+  await page.locator('[data-stripe-button="problems"]').click();
+  const tabs = area.getByRole("tablist", { name: "Editor tabs" });
+  const problems = tabs.getByRole("tab", { name: "Problems", exact: true });
+  await expect(problems).toBeVisible();
+  const last = (await problems.boundingBox())!;
+  const plus = (await add.boundingBox())!;
+  expect(plus.x).toBeGreaterThanOrEqual(last.x + last.width - 1);
+  expect(plus.x - last.x - last.width).toBeLessThan(12);
+  const chooser = tabs.getByRole("tab", { name: "New Tab", exact: true });
+  await add.focus();
+  await page.keyboard.press("Enter");
+  await expect(chooser).toHaveAttribute("aria-selected", "true");
+  await expect(area.getByRole("button", { name: "Files", exact: true })).toBeFocused();
+  await add.click();
+  await expect(chooser).toHaveCount(2);
+  await area.getByRole("button", { name: "TODO", exact: true }).click();
+  await expect(tabs.getByRole("tab", { name: "TODO", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(chooser).toHaveCount(1);
+  await chooser.click();
+  await area.getByRole("button", { name: "TODO", exact: true }).click();
+  await expect(chooser).toHaveCount(0);
+  await expect(tabs.getByRole("tab")).toHaveCount(2);
+  await problems.click();
+  await expect(area.locator('[data-workspace-tool="problems"]')).toBeVisible();
+  await mode.click();
+  await page.getByRole("option", { name: "Development", exact: true }).click();
+  await expect(add).toHaveCount(0);
+});
+
 test("bottom stripe tools reuse workspace tabs beside the full-height agent conversation", async ({
   workbench: page,
 }) => {

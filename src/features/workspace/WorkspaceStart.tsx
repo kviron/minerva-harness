@@ -1,23 +1,35 @@
 import { executeAction } from "@/platform/actions";
 import { Button, T, showContextMenu } from "@/ui";
-import { editorService, useWorkspaceItems, useContributions } from "@/workbench/contributions";
+import { editorService, useWorkspaceItems, useContributions, type EditorInput } from "@/workbench/contributions";
 import styles from "./Workspace.module.css";
 
-export function WorkspaceStart() {
+export function WorkspaceStart({ input }: { input: EditorInput }) {
   const tools = useContributions((s) => s.toolWindows);
   const items = useWorkspaceItems((s) => s.items);
+  const newTab = input.kind === "workspace.newTab";
+  const shortcuts = newTab ? ["todo", "git"] : [];
   return (
     <section className={styles.start} aria-label="Workspace">
       <h2>
-        <T>Workspace</T>
+        <T>{newTab ? "New Tab" : "Workspace"}</T>
       </h2>
       <div className={styles.tiles}>
-        <Button icon="folder" onClick={() => void executeAction("workspace.files")}>
+        <Button icon="folder" autoFocus={newTab} onClick={() => void executeAction("workspace.files")}>
           <T>Files</T>
         </Button>
         <Button icon="terminal" onClick={() => void executeAction("workspace.terminal")}>
           <T>New terminal</T>
         </Button>
+        {shortcuts.map((id) => {
+          const tool = tools.get(id);
+          return (
+            tool && (
+              <Button key={id} icon={tool.icon} onClick={() => void executeAction("workspace.tool", id)}>
+                {tool.verbatim ? tool.title : <T>{tool.title}</T>}
+              </Button>
+            )
+          );
+        })}
         <Button icon="web" onClick={() => void executeAction("workspace.browser")}>
           <T>Browser</T>
         </Button>
@@ -31,7 +43,7 @@ export function WorkspaceStart() {
             showContextMenu(
               { x: rect.left, y: rect.bottom },
               [...tools.values()]
-                .filter((tool) => !["agents", "project", "terminal"].includes(tool.id))
+                .filter((tool) => !["agents", "project", "terminal", ...shortcuts].includes(tool.id))
                 .map((tool) => ({
                   label: tool.title,
                   icon: tool.icon,

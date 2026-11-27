@@ -34,6 +34,7 @@ import {
   EditorShownProvider,
   EditorTabIdProvider,
   useContributions,
+  useWorkbenchChrome,
   useEditorGroupPanels,
   useFileDecorations,
   useEditorDocumentRevision,
@@ -184,6 +185,7 @@ const virtualData = (input: EditorInput) => input.data as VirtualInputData | und
 
 function PaneView({ paneId }: { paneId: string }) {
   const ctrl = editorController();
+  const agentWorkspace = useWorkbenchChrome((s) => !!s.primary && !!s.workspaceOpen);
   const pane = useTabs((s) => s.panes[paneId]);
   const isActivePane = useTabs((s) => s.activePane === paneId);
   const multiPane = useTabs((s) => s.layout.kind === "split");
@@ -368,7 +370,7 @@ function PaneView({ paneId }: { paneId: string }) {
   };
 
   const hidden = tabPrefs.placement === "none" || distractionFree;
-  const strip = (stripItems: TabItem[], stripDnd: TabsDnd, trailing: ReactNode) => (
+  const strip = (stripItems: TabItem[], stripDnd: TabsDnd, trailing: ReactNode, lastRow = true) => (
     <Tabs
       className={clsx(styles.tabs, !pinnedRow && hidden && styles.tabsHidden)}
       variant="editor"
@@ -404,6 +406,7 @@ function PaneView({ paneId }: { paneId: string }) {
         );
       }}
       trailing={trailing}
+      onNewTab={agentWorkspace && lastRow ? () => void executeAction("workspace.newTab", paneId) : undefined}
     />
   );
   const actions = active && !hidden ? <EditorTabActions paneId={paneId} tab={active} /> : undefined;
@@ -427,7 +430,7 @@ function PaneView({ paneId }: { paneId: string }) {
       {pinnedRow ? (
         // Settings › Editor Tabs › Show pinned tabs in a separate row.
         <div className={clsx(styles.tabRows, hidden && styles.tabsHidden)}>
-          {strip(items.slice(0, pinnedCount), dnd.pinned, vertical ? actions : undefined)}
+          {strip(items.slice(0, pinnedCount), dnd.pinned, vertical ? actions : undefined, false)}
           {strip(items.slice(pinnedCount), dnd.rest, vertical ? undefined : actions)}
         </div>
       ) : (

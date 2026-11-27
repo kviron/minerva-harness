@@ -141,6 +141,8 @@ export interface TabsProps {
   variant?: "editor" | "compact";
   /** Content after the tabs (breadcrumbs, actions). */
   trailing?: ReactNode;
+  /** Opens a new tab from the button beside the last tab. */
+  onNewTab?: () => void;
   className?: string;
   "aria-label"?: string;
   /** Tabpanel id prefix for `aria-controls`. */
@@ -179,6 +181,7 @@ export function Tabs({
   onContextMenu,
   variant = "editor",
   trailing,
+  onNewTab,
   className,
   panelIdPrefix,
   focusContent,
@@ -572,6 +575,7 @@ export function Tabs({
           );
         })}
       </div>
+      {onNewTab && <IconButton icon="plus" title="New Tab" className={styles.newTab} onClick={onNewTab} />}
       {overflow && (
         <>
           <IconButton

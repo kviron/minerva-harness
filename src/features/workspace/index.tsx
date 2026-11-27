@@ -1,11 +1,10 @@
 import { WorkspaceControls } from "./WorkspaceControls";
 import { registerActions } from "@/platform/actions";
-import { IconButton, lazyComponent } from "@/ui";
+import { lazyComponent } from "@/ui";
 import {
   editorService,
   maybeEditorService,
   registerEditorKind,
-  registerTitleItem,
   useWorkbenchChrome,
   useContributions,
 } from "@/workbench/contributions";
@@ -13,11 +12,8 @@ import { executeActionOrThrow } from "@/platform/actions";
 import { requestToolWindowFocus } from "@/workbench/toolwindows/store";
 
 const START = { kind: "workspace.start", key: "workspace.start", data: {} };
-function WorkspaceButton() {
-  const primary = useWorkbenchChrome((s) => s.primary);
-  const open = useWorkbenchChrome((s) => s.workspaceOpen);
-  return primary && open ? <IconButton icon="plus" title="Open workspace" action="workspace.start" /> : null;
-}
+const NEW_TAB = "workspace.newTab";
+const StartPage = lazyComponent(() => import("./WorkspaceStart").then((m) => m.WorkspaceStart));
 
 export function activate() {
   async function closeWorkspace() {
@@ -64,7 +60,14 @@ export function activate() {
       title: () => "Workspace",
       icon: () => "split",
       restorable: true,
-      component: lazyComponent(() => import("./WorkspaceStart").then((m) => m.WorkspaceStart)),
+      component: StartPage,
+    }),
+    registerEditorKind({
+      kind: NEW_TAB,
+      title: () => "New Tab",
+      icon: () => "plus",
+      replaceOnOpen: true,
+      component: StartPage,
     }),
     registerEditorKind({
       kind: "workspace.browser",
@@ -73,8 +76,23 @@ export function activate() {
       keepAlive: true,
       component: lazyComponent(() => import("./BrowserEditor").then((m) => m.BrowserEditor)),
     }),
-    registerTitleItem({ id: "workspace.toggle", align: "right", priority: 5, component: WorkspaceButton }),
     registerActions([
+      {
+        id: NEW_TAB,
+        title: "New Tab",
+        category: "Window",
+        when: "projectOpen",
+        hidden: true,
+        run: async ({ arg }) => {
+          if (!useWorkbenchChrome.getState().primary) return;
+          const editor = editorService();
+          reveal();
+          await editor.openInput(
+            { kind: NEW_TAB, key: crypto.randomUUID(), data: {} },
+            { pane: typeof arg === "string" ? arg : undefined, index: editor.openTabs?.().length, focus: true },
+          );
+        },
+      },
       {
         id: "workspace.maximize",
         title: "Maximize workspace",

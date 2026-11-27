@@ -140,6 +140,8 @@ export interface OverlayContribution {
 /** Editor tab types other than text files: diff viewer, settings, welcome… */
 export interface EditorKindContribution {
   kind: string;
+  /** A blank launcher tab gives its place to the next input opened in its pane. */
+  replaceOnOpen?: boolean;
   component: ComponentType<{ input: EditorInput }>;
   title: (input: EditorInput) => string;
   icon?: (input: EditorInput) => string;
