@@ -4,6 +4,39 @@ import { expect, openFromTree, test } from "./fixtures";
 const project = (page: Page) => page.locator('[data-toolwindow="project"]');
 const editorArea = (page: Page) => page.locator("[data-editor-area]");
 
+test("the Agent rail can collapse and reopen chat history beside a workspace tab", async ({ workbench: page }) => {
+  const mode = page.getByRole("button", { name: "Workspace mode" });
+  const history = page.getByRole("complementary", { name: "Chat history" });
+  const hide = page.getByRole("button", { name: "Hide Chat History", exact: true });
+  const show = page.getByRole("button", { name: "Show Chat History", exact: true });
+  await expect(hide.or(show)).toHaveCount(0);
+  await mode.click();
+  await page.getByRole("option", { name: "Agent", exact: true }).click();
+  await expect(history).toBeVisible();
+  const rail = page.getByRole("navigation", { name: "Agent navigation" });
+  await expect(rail.getByRole("button", { name: "Settings…", exact: true })).toHaveCount(0);
+  await page.locator('[data-stripe-button="problems"]').click();
+  const problems = editorArea(page).locator('[data-workspace-tool="problems"]');
+  await expect(problems).toBeVisible();
+  const chat = page.getByRole("region", { name: "Agent conversation" });
+  const before = (await chat.boundingBox())!;
+  await hide.click();
+  await expect(show).toHaveAttribute("aria-expanded", "false");
+  await expect(history).toBeHidden();
+  await expect(problems).toBeVisible();
+  const expanded = (await chat.boundingBox())!;
+  expect(expanded.x).toBeLessThan(before.x);
+  expect(expanded.height).toBe(before.height);
+  await expect(show).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(history).toBeVisible();
+  await expect(hide).toHaveAttribute("aria-expanded", "true");
+  await expect(problems).toBeVisible();
+  await mode.click();
+  await page.getByRole("option", { name: "Development", exact: true }).click();
+  await expect(hide.or(show)).toHaveCount(0);
+});
+
 test("Notifications opens as one workspace tab in Agent and as a dock in Development", async ({ workbench: page }) => {
   const bell = page.locator('[data-stripe-button="notifications"]');
   const dock = page.locator('[data-toolwindow="notifications"]');

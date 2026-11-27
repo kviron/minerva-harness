@@ -1,5 +1,7 @@
 import { auxiliaryWindow } from "@/platform/auxWindow";
 import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { create } from "zustand";
+import { registerAction } from "@/platform/actions";
 import { Button, IconButton, T, lockDragCursor } from "@/ui";
 import { useChromeIconSize } from "@/ui/density";
 import { maybeEditorService, useWorkbenchChrome } from "@/workbench/contributions";
@@ -8,14 +10,26 @@ import { AgentsView } from "./AgentsView";
 import { openHome, useAgents } from "./store";
 import styles from "./AgentNavigation.module.css";
 
+const historyPanelId = "agent-chat-history";
+const useChatHistory = create<{ open: boolean }>(() => ({ open: true }));
+
 export function AgentNavigation({ children }: { children?: ReactNode }) {
   const iconSize = useChromeIconSize();
+  const historyOpen = useChatHistory((s) => s.open);
   return (
     <nav className={children ? styles.embeddedRail : styles.rail} aria-label="Agent navigation">
       <IconButton icon="home" iconSize={iconSize} title="Chats" pressed onClick={() => openHome()} />
       <IconButton icon="plugin" iconSize={iconSize} title="Plugins" action="plugins.settings" />
       {children ?? <div className={styles.spacer} />}
-      <IconButton icon="settings" iconSize={iconSize} title="Settings…" action="file.settings" />
+      <IconButton
+        icon="history"
+        iconSize={iconSize}
+        title={historyOpen ? "Hide Chat History" : "Show Chat History"}
+        action="agent.toggleChatHistory"
+        pressed={historyOpen}
+        aria-expanded={historyOpen}
+        aria-controls={historyPanelId}
+      />
     </nav>
   );
 }
@@ -24,6 +38,7 @@ export function AgentHistory() {
   const pane = useRef<HTMLElement>(null);
   const drag = useRef<(() => void) | null>(null);
   const workspaceOpen = useWorkbenchChrome((s) => s.workspaceOpen);
+  const historyOpen = useChatHistory((s) => s.open);
   const maximum = () =>
     Math.max(200, Math.min(workspaceOpen ? 320 : 600, window.innerWidth - (workspaceOpen ? 900 : 360)));
   const clamp = (value: number) => Math.round(Math.max(200, Math.min(maximum(), value)));
@@ -80,9 +95,11 @@ export function AgentHistory() {
   };
   return (
     <aside
+      id={historyPanelId}
       ref={pane}
       className={styles.history}
       aria-label="Chat history"
+      hidden={!historyOpen}
       data-workspace-open={workspaceOpen || undefined}
       style={{ width: clamp(width) }}
     >
@@ -117,6 +134,15 @@ export function AgentHistory() {
 
 export function activateAgentNavigation() {
   if (auxiliaryWindow()) return () => {};
+  const unregisterToggle = registerAction({
+    id: "agent.toggleChatHistory",
+    title: "Toggle Chat History",
+    category: "Agents",
+    icon: "history",
+    when: "projectOpen",
+    enabled: () => useAgents.getState().sessionLocation === "editor",
+    run: () => useChatHistory.setState((s) => ({ open: !s.open })),
+  });
   const sync = () => {
     const mainAgent = useAgents.getState().sessionLocation === "editor";
     useAgents.setState({ mainAgent });
@@ -138,6 +164,8 @@ export function activateAgentNavigation() {
   });
   return () => {
     stop();
+    unregisterToggle();
+    useChatHistory.setState({ open: true });
     useAgents.setState({ mainAgent: false });
     useWorkbenchChrome.setState({ navigation: null, sidebar: null, primary: null });
   };
