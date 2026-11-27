@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useTxTemplate, VerbatimTextContext } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
 import { EmptyState, Toast, T } from "@/ui";
+import { useWorkbenchChrome } from "./contributions";
 import {
   balloonTimeout,
   canSuppress,
@@ -125,7 +126,11 @@ export const NOTIFICATIONS_TOOL_WINDOW = "notifications";
 function useListVisible() {
   const hasProject = useProject((s) => !!s.project);
   const visible = useEffectiveVisible(useToolWindows());
-  return hasProject && Object.values(visible).includes(NOTIFICATIONS_TOOL_WINDOW);
+  const activeTab = useWorkbenchChrome((s) => (s.primary && s.workspaceOpen ? s.activeWorkspaceTool : null));
+  return (
+    hasProject &&
+    (activeTab === NOTIFICATIONS_TOOL_WINDOW || Object.values(visible).includes(NOTIFICATIONS_TOOL_WINDOW))
+  );
 }
 
 /** The Notifications tool window (right stripe, as in IDEA): history, newest first. */

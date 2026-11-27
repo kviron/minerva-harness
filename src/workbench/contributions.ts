@@ -48,6 +48,8 @@ export interface ToolWindowContribution {
   /** Icon name from `ui/icons`. */
   icon: string;
   anchor: ToolWindowAnchor;
+  /** Present this tool as a workspace tab in Agent mode even when docked at the side. */
+  workspaceTabInAgent?: boolean;
   /** Order within its stripe group; lower first. */
   order?: number;
   /**

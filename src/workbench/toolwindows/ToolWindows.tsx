@@ -94,14 +94,15 @@ export function useEffectiveMaximized(windows: ToolWindowContribution[]): ToolWi
   const visible = useToolWindowLayout((s) => s.visible);
   const maximized = useToolWindowLayout((s) => s.maximized);
   const shown = useWorkbenchChrome((s) => !maximized || anchorShown(maximized, s));
+  const agentMode = useWorkbenchChrome((s) => !!s.primary);
   return useMemo(() => {
     if (!maximized || !shown) return null;
     const hasVisible = ([maximized, `${maximized}-split`] as const).some((slot) => {
       const id = visible[slot];
-      return !!id && windows.some((w) => w.id === id && slotOf(w) === slot);
+      return !!id && windows.some((w) => w.id === id && slotOf(w) === slot && !(agentMode && w.workspaceTabInAgent));
     });
     return hasVisible ? maximized : null;
-  }, [visible, windows, maximized, shown]);
+  }, [visible, windows, maximized, shown, agentMode]);
 }
 
 export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotRecord {
@@ -109,6 +110,7 @@ export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotReco
   const effectiveMaximized = useEffectiveMaximized(windows);
   const sidesShown = useWorkbenchChrome((s) => anchorShown("left", s));
   const bottomShown = useWorkbenchChrome((s) => anchorShown("bottom", s));
+  const agentMode = useWorkbenchChrome((s) => !!s.primary);
   return useMemo(() => {
     const out = {} as SlotRecord;
     for (const slot of SLOTS) {
@@ -119,6 +121,7 @@ export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotReco
           (w) =>
             w.id === id &&
             slotOf(w) === slot &&
+            !(agentMode && w.workspaceTabInAgent) &&
             (w.anchor === "bottom" ? bottomShown : sidesShown) &&
             (!effectiveMaximized || w.anchor === effectiveMaximized),
         )
@@ -126,7 +129,7 @@ export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotReco
           : null;
     }
     return out;
-  }, [visible, windows, effectiveMaximized, sidesShown, bottomShown]);
+  }, [visible, windows, effectiveMaximized, sidesShown, bottomShown, agentMode]);
 }
 
 // ---------------------------------------------------------------------------

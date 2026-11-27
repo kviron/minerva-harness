@@ -170,8 +170,11 @@ export function anchorShown(anchor: ToolWindowAnchor, chrome: ReturnType<typeof 
   return !chrome.primary || (anchor !== "bottom" && !!chrome.workspaceOpen && !chrome.workspaceTabsOnly);
 }
 
-function opensInWorkspace(id: string): boolean {
-  return !!useWorkbenchChrome.getState().primary && anchorOf(id) === "bottom";
+export function opensInWorkspace(id: string, chrome = useWorkbenchChrome.getState()): boolean {
+  return (
+    !!chrome.primary &&
+    (anchorOf(id) === "bottom" || useContributions.getState().toolWindows.get(id)?.workspaceTabInAgent === true)
+  );
 }
 
 /** The other area of the same side. */
@@ -561,6 +564,7 @@ export function isToolWindowVisible(id: string): boolean {
   const slot = slotOfId(id);
   const chrome = useWorkbenchChrome.getState();
   if (chrome.primary && chrome.workspaceOpen && chrome.activeWorkspaceTool === id) return true;
+  if (opensInWorkspace(id, chrome)) return false;
   if (!slot || !anchorShown(slotAnchor(slot), chrome)) return false;
   const { visible, placements, maximized } = useToolWindowLayout.getState();
   return (
@@ -600,7 +604,7 @@ export function showToolWindow(id: string, focus = false) {
   lastUsed = id;
   const s = useToolWindowLayout.getState();
   const stripeButtons = s.stripeButtons[id] ? s.stripeButtons : { ...s.stripeButtons, [id]: true };
-  if (chrome.primary && a === "bottom") {
+  if (opensInWorkspace(id, chrome)) {
     if (stripeButtons !== s.stripeButtons) update({ stripeButtons });
     void executeAction("workspace.tool", { id, focus });
     return;

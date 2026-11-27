@@ -4,6 +4,44 @@ import { expect, openFromTree, test } from "./fixtures";
 const project = (page: Page) => page.locator('[data-toolwindow="project"]');
 const editorArea = (page: Page) => page.locator("[data-editor-area]");
 
+test("Notifications opens as one workspace tab in Agent and as a dock in Development", async ({ workbench: page }) => {
+  const bell = page.locator('[data-stripe-button="notifications"]');
+  const dock = page.locator('[data-toolwindow="notifications"]');
+  const mode = page.getByRole("button", { name: "Workspace mode" });
+  await bell.click();
+  await expect(dock).toBeVisible();
+  await mode.click();
+  await page.getByRole("option", { name: "Agent", exact: true }).click();
+  await expect(dock).toBeHidden();
+  const chat = page.getByRole("region", { name: "Agent conversation" });
+  await expect(chat).toBeVisible();
+  const height = (await chat.boundingBox())!.height;
+  await page.evaluate(async () => {
+    const servicePath = "/src/workbench/contributions.ts";
+    const { notifications } = await import(/* @vite-ignore */ servicePath);
+    notifications().notify({ level: "warning", title: "Workspace import warning" });
+  });
+  await bell.click();
+  const area = editorArea(page);
+  const tabs = area.getByRole("tablist", { name: "Editor tabs" });
+  const panel = area.locator('[data-workspace-tool="notifications"]');
+  await expect(panel.getByText("Workspace import warning")).toBeVisible();
+  await expect(panel.locator("[data-autofocus]")).toBeFocused();
+  await expect(page.locator('[data-anchor="right"]')).toBeHidden();
+  await expect(project(page)).toBeHidden();
+  await expect(bell).toHaveAttribute("aria-pressed", "true");
+  expect((await chat.boundingBox())!.height).toBe(height);
+  await bell.click();
+  await expect(tabs.getByRole("tab", { name: "Notifications", exact: true })).toHaveCount(1);
+  await panel.getByRole("button", { name: "Clear All", exact: true }).click();
+  await expect(panel.getByText("No notifications", { exact: true })).toBeVisible();
+  await mode.click();
+  await page.getByRole("option", { name: "Development", exact: true }).click();
+  await expect(panel).toHaveCount(0);
+  await bell.click();
+  await expect(dock).toBeVisible();
+});
+
 test("the Agent workspace adds a tab beside Problems and opens the chosen tool in its place", async ({
   workbench: page,
 }) => {
