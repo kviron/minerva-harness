@@ -42,7 +42,6 @@ import {
 } from "../contributions";
 import { useDistractionFree } from "../distractionFree";
 import {
-  anchorShown,
   hideToolWindow,
   MAX_SPLIT,
   MIN_SPLIT,
@@ -93,43 +92,36 @@ export function useToolWindows(): ToolWindowContribution[] {
 export function useEffectiveMaximized(windows: ToolWindowContribution[]): ToolWindowAnchor | null {
   const visible = useToolWindowLayout((s) => s.visible);
   const maximized = useToolWindowLayout((s) => s.maximized);
-  const shown = useWorkbenchChrome((s) => !maximized || anchorShown(maximized, s));
-  const agentMode = useWorkbenchChrome((s) => !!s.primary);
+  const hosted = useWorkbenchChrome((s) => !!s.toolWindowHost);
   return useMemo(() => {
-    if (!maximized || !shown) return null;
+    if (!maximized || hosted) return null;
     const hasVisible = ([maximized, `${maximized}-split`] as const).some((slot) => {
       const id = visible[slot];
-      return !!id && windows.some((w) => w.id === id && slotOf(w) === slot && !(agentMode && w.workspaceTabInAgent));
+      return !!id && windows.some((w) => w.id === id && slotOf(w) === slot);
     });
     return hasVisible ? maximized : null;
-  }, [visible, windows, maximized, shown, agentMode]);
+  }, [visible, windows, maximized, hosted]);
 }
 
 export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotRecord {
   const visible = useToolWindowLayout((s) => s.visible);
   const effectiveMaximized = useEffectiveMaximized(windows);
-  const sidesShown = useWorkbenchChrome((s) => anchorShown("left", s));
-  const bottomShown = useWorkbenchChrome((s) => anchorShown("bottom", s));
-  const agentMode = useWorkbenchChrome((s) => !!s.primary);
+  const hosted = useWorkbenchChrome((s) => !!s.toolWindowHost);
   return useMemo(() => {
     const out = {} as SlotRecord;
     for (const slot of SLOTS) {
       const id = visible[slot];
       out[slot] =
+        !hosted &&
         id &&
         windows.some(
-          (w) =>
-            w.id === id &&
-            slotOf(w) === slot &&
-            !(agentMode && w.workspaceTabInAgent) &&
-            (w.anchor === "bottom" ? bottomShown : sidesShown) &&
-            (!effectiveMaximized || w.anchor === effectiveMaximized),
+          (w) => w.id === id && slotOf(w) === slot && (!effectiveMaximized || w.anchor === effectiveMaximized),
         )
           ? id
           : null;
     }
     return out;
-  }, [visible, windows, effectiveMaximized, sidesShown, bottomShown, agentMode]);
+  }, [visible, windows, effectiveMaximized, hosted]);
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +544,7 @@ export function ToolWindowStripe({
   buttonWidth?: number;
   navigation?: NonNullable<ReturnType<typeof useWorkbenchChrome.getState>["navigation"]>;
 }) {
-  const activeTab = useWorkbenchChrome((s) => (s.primary && s.workspaceOpen ? s.activeWorkspaceTool : null));
+  const activeTab = useWorkbenchChrome((s) => (s.toolWindowHost && s.workspaceOpen ? s.activeWorkspaceTool : null));
   const isActive = (w: ToolWindowContribution) => visible[slotOf(w)] === w.id || activeTab === w.id;
   const stripeButtons = useToolWindowLayout((s) => s.stripeButtons);
   const onStripe = windows.filter((w) => hasStripeButton(w, stripeButtons) || isActive(w));

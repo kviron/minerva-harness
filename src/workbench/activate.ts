@@ -99,7 +99,6 @@ export function activateWorkbench(): () => void {
       title: "Notifications",
       icon: "bell",
       anchor: "right",
-      workspaceTabInAgent: true,
       order: 0,
       component: NotificationsToolWindow,
       useBadge: useUnreadNotifications,

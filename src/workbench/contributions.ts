@@ -48,8 +48,6 @@ export interface ToolWindowContribution {
   /** Icon name from `ui/icons`. */
   icon: string;
   anchor: ToolWindowAnchor;
-  /** Present this tool as a workspace tab in Agent mode even when docked at the side. */
-  workspaceTabInAgent?: boolean;
   /** Order within its stripe group; lower first. */
   order?: number;
   /**
@@ -450,7 +448,8 @@ export const useWorkbenchChrome = create<{
   sidebar: ComponentType | null;
   primary?: ComponentType | null;
   workspaceOpen?: boolean;
-  workspaceTabsOnly?: boolean;
+  /** Alternate host for the window's tools. Contributions and stripe actions use the same host. */
+  toolWindowHost?: { show(id: string, focus: boolean): void; hide(id: string): void };
   activeWorkspaceTool?: string | null;
   workspaceMaximized?: boolean;
   headerActions?: ComponentType | null;
@@ -891,6 +890,8 @@ export interface EditorService {
   activeInput?(options?: { previewOnly?: boolean }): EditorInput | null;
   /** Calls `fn` whenever the active tab changes; returns the unsubscribe. */
   onActiveInputChange?(fn: (input: EditorInput | null) => void): () => void;
+  /** Called when an open request selects an input, including a tab already selected. */
+  onInputOpened?(fn: (input: EditorInput) => void): () => void;
   /**
    * Closes every tab showing `path`. Tabs without a custom document close at
    * once; unsaved custom documents are asked about first. Resolves false when

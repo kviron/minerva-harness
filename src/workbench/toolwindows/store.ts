@@ -5,12 +5,10 @@
  * sizes, split ratios, placements) is persisted per project root in localStorage.
  */
 import { create } from "zustand";
-import { executeAction } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import { useProject } from "@/platform/project";
 import { parseRemoteLocation } from "@/platform/remote";
 import {
-  maybeEditorService,
   useContributions,
   useWorkbenchChrome,
   type ToolWindowAnchor,
@@ -163,18 +161,6 @@ export function slotOfId(id: string): ToolWindowSlot | undefined {
 export function anchorOf(id: string): ToolWindowAnchor | undefined {
   const slot = slotOfId(id);
   return slot && slotAnchor(slot);
-}
-
-/** Agent presents bottom tools as editor tabs. Side docks can still be opened explicitly. */
-export function anchorShown(anchor: ToolWindowAnchor, chrome: ReturnType<typeof useWorkbenchChrome.getState>): boolean {
-  return !chrome.primary || (anchor !== "bottom" && !!chrome.workspaceOpen && !chrome.workspaceTabsOnly);
-}
-
-export function opensInWorkspace(id: string, chrome = useWorkbenchChrome.getState()): boolean {
-  return (
-    !!chrome.primary &&
-    (anchorOf(id) === "bottom" || useContributions.getState().toolWindows.get(id)?.workspaceTabInAgent === true)
-  );
 }
 
 /** The other area of the same side. */
@@ -485,10 +471,9 @@ function hasRegisteredVisibleOn(
 export function installToolWindowLayoutSync(): () => void {
   const stopChrome = useWorkbenchChrome.subscribe((chrome, prev) => {
     if (
-      chrome.primary !== prev.primary ||
+      chrome.toolWindowHost !== prev.toolWindowHost ||
       chrome.workspaceOpen !== prev.workspaceOpen ||
-      chrome.activeWorkspaceTool !== prev.activeWorkspaceTool ||
-      chrome.workspaceTabsOnly !== prev.workspaceTabsOnly
+      chrome.activeWorkspaceTool !== prev.activeWorkspaceTool
     )
       publishVisibility();
   });
@@ -563,16 +548,12 @@ function update(patch: Partial<ToolWindowLayoutState>, save = true) {
 export function isToolWindowVisible(id: string): boolean {
   const slot = slotOfId(id);
   const chrome = useWorkbenchChrome.getState();
-  if (chrome.primary && chrome.workspaceOpen && chrome.activeWorkspaceTool === id) return true;
-  if (opensInWorkspace(id, chrome)) return false;
-  if (!slot || !anchorShown(slotAnchor(slot), chrome)) return false;
+  if (chrome.toolWindowHost) return !!chrome.workspaceOpen && chrome.activeWorkspaceTool === id;
+  if (!slot) return false;
   const { visible, placements, maximized } = useToolWindowLayout.getState();
   return (
     visible[slot] === id &&
-    (!maximized ||
-      maximized === slotAnchor(slot) ||
-      !anchorShown(maximized, chrome) ||
-      !hasRegisteredVisibleOn(maximized, visible, placements))
+    (!maximized || maximized === slotAnchor(slot) || !hasRegisteredVisibleOn(maximized, visible, placements))
   );
 }
 
@@ -604,12 +585,11 @@ export function showToolWindow(id: string, focus = false) {
   lastUsed = id;
   const s = useToolWindowLayout.getState();
   const stripeButtons = s.stripeButtons[id] ? s.stripeButtons : { ...s.stripeButtons, [id]: true };
-  if (opensInWorkspace(id, chrome)) {
+  if (chrome.toolWindowHost) {
     if (stripeButtons !== s.stripeButtons) update({ stripeButtons });
-    void executeAction("workspace.tool", { id, focus });
+    chrome.toolWindowHost.show(id, focus);
     return;
   }
-  if (focus && !anchorShown(a, chrome)) useWorkbenchChrome.setState({ workspaceOpen: true, workspaceTabsOnly: false });
   const wasVisible = isToolWindowVisible(id);
   const nextVisible = { ...s.visible, [slot]: id };
   const mounted = s.mounted.has(id) ? s.mounted : new Set(s.mounted).add(id);
@@ -632,8 +612,9 @@ export function showToolWindow(id: string, focus = false) {
 }
 
 export function hideToolWindow(id: string) {
-  if (opensInWorkspace(id)) {
-    void maybeEditorService()?.closeInput?.(`workspace.tool.${id}`);
+  const host = useWorkbenchChrome.getState().toolWindowHost;
+  if (host) {
+    host.hide(id);
     return;
   }
   const slot = slotOfId(id);
@@ -669,7 +650,7 @@ export function removeFromStripe(id: string) {
 }
 
 export function toggleToolWindow(id: string) {
-  if (!opensInWorkspace(id) && isToolWindowVisible(id)) hideToolWindow(id);
+  if (!useWorkbenchChrome.getState().toolWindowHost && isToolWindowVisible(id)) hideToolWindow(id);
   else showToolWindow(id, true);
 }
 
@@ -678,13 +659,13 @@ export function toggleToolWindow(id: string) {
  * → focus; visible and focused → hide (IDEA behaviour).
  */
 export function activateToolWindow(id: string) {
-  if (opensInWorkspace(id) || !isToolWindowVisible(id)) showToolWindow(id, true);
+  if (useWorkbenchChrome.getState().toolWindowHost || !isToolWindowVisible(id)) showToolWindow(id, true);
   else if (useToolWindowLayout.getState().focused !== id && !isFocusWithinToolWindow(id)) focusToolWindow(id);
   else hideToolWindow(id);
 }
 
 export function focusToolWindow(id: string) {
-  if (opensInWorkspace(id) || !isToolWindowVisible(id)) return showToolWindow(id, true);
+  if (useWorkbenchChrome.getState().toolWindowHost || !isToolWindowVisible(id)) return showToolWindow(id, true);
   requestToolWindowFocus(id);
 }
 
@@ -889,6 +870,7 @@ export function toggleMaximizeToolWindow(id: string) {
 
 /** Reveals the editor when navigation opens or focuses an editor tab. */
 export function restoreMaximizedToolWindow() {
+  if (useWorkbenchChrome.getState().toolWindowHost) return false;
   const maximized = !!useToolWindowLayout.getState().maximized;
   if (maximized) update({ maximized: null }, false);
   return maximized;

@@ -4,6 +4,49 @@ import { expect, openFromTree, test } from "./fixtures";
 const project = (page: Page) => page.locator('[data-toolwindow="project"]');
 const editorArea = (page: Page) => page.locator("[data-editor-area]");
 
+test("Agent opens the Project tree and its files in the same workspace as other tools", async ({ workbench: page }) => {
+  const mode = page.getByRole("button", { name: "Workspace mode" });
+  await mode.click();
+  await page.getByRole("option", { name: "Agent", exact: true }).click();
+  const area = editorArea(page);
+  const chat = page.getByRole("region", { name: "Agent conversation" });
+  await expect(chat).toBeVisible();
+  const height = (await chat.boundingBox())!.height;
+  const stripe = (id: string) => page.locator(`[data-stripe-button="${id}"]`);
+  const tabs = area.getByRole("tablist", { name: "Editor tabs" });
+  await stripe("project").click();
+  await expect(area.locator('[data-workspace-tool="project"]').getByRole("tree", { name: "Project" })).toBeVisible();
+  await openFromTree(page, "build.gradle.kts");
+  const file = tabs.getByRole("tab", { name: "build.gradle.kts" });
+  await expect(file).toHaveAttribute("aria-selected", "true");
+  await expect(tabs.getByRole("tab", { name: "Project", exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Toggle workspace", exact: true }).click();
+  await expect(file).toBeHidden();
+  await page.evaluate(async () => {
+    const servicePath = "/src/workbench/contributions.ts";
+    const { editorService } = await import(/* @vite-ignore */ servicePath);
+    const editor = editorService();
+    await editor.openFile(editor.activeInput()!.path!, { focus: true });
+  });
+  await expect(file).toBeVisible();
+
+  await stripe("notifications").click();
+  await expect(area.locator('[data-workspace-tool="notifications"]')).toBeVisible();
+  await stripe("terminal").click();
+  await expect(area.locator('[data-workspace-tool="terminal"]')).toBeVisible();
+  await stripe("project").click();
+  await expect(tabs.getByRole("tab", { name: "Project", exact: true })).toHaveCount(1);
+  for (const side of ["left", "right", "bottom"]) await expect(page.locator(`[data-anchor="${side}"]`)).toBeHidden();
+  expect((await chat.boundingBox())!.height).toBe(height);
+
+  await mode.click();
+  await page.getByRole("option", { name: "Development", exact: true }).click();
+  await expect(project(page)).toBeVisible();
+  await expect(file).toBeVisible();
+  await expect(tabs.getByRole("tab", { name: "Project", exact: true })).toHaveCount(0);
+});
+
 test("the Agent rail can collapse and reopen chat history beside a workspace tab", async ({ workbench: page }) => {
   const mode = page.getByRole("button", { name: "Workspace mode" });
   const history = page.getByRole("complementary", { name: "Chat history" });

@@ -57,6 +57,7 @@ export function activate(): void | (() => void) {
     focus: () => ctrl.focus(),
     openPaths: () => ctrl.openPaths(),
     onOpenTabsChange: (fn) => useTabs.subscribe(fn),
+    onInputOpened: (fn) => ctrl.onInputOpened(fn),
     openTabs: () => ctrl.openTabs(),
     tabInput: (paneId, tabId) => ctrl.tabInput(paneId, tabId),
     activeInput: (options) => ctrl.activeInput(options),

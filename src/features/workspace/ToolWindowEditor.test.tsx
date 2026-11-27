@@ -6,9 +6,9 @@ import {
   useContributions,
   useToolWindowShown,
   useWorkbenchChrome,
-} from "../contributions";
+} from "@/workbench/contributions";
 import { ToolWindowEditor } from "./ToolWindowEditor";
-import { ToolWindowView, ToolWindowHeader, useOwnToolWindowHeader } from "./ToolWindows";
+import { ToolWindowView, ToolWindowHeader, useOwnToolWindowHeader } from "@/workbench/toolwindows/ToolWindows";
 
 afterEach(() => useWorkbenchChrome.setState({ primary: null }));
 

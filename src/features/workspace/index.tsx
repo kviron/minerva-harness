@@ -1,5 +1,5 @@
 import { WorkspaceControls } from "./WorkspaceControls";
-import { registerActions } from "@/platform/actions";
+import { executeAction, executeActionOrThrow, registerActions } from "@/platform/actions";
 import { lazyComponent } from "@/ui";
 import {
   editorService,
@@ -8,11 +8,12 @@ import {
   useWorkbenchChrome,
   useContributions,
 } from "@/workbench/contributions";
-import { executeActionOrThrow } from "@/platform/actions";
 import { requestToolWindowFocus } from "@/workbench/toolwindows/store";
 
 const START = { kind: "workspace.start", key: "workspace.start", data: {} };
 const NEW_TAB = "workspace.newTab";
+const TOOL_TAB = "workspace.tool";
+const toolTabKey = (id: string) => `${TOOL_TAB}.${id}`;
 const StartPage = lazyComponent(() => import("./WorkspaceStart").then((m) => m.WorkspaceStart));
 
 export function activate() {
@@ -29,31 +30,30 @@ export function activate() {
         .map(({ input }) => input.key),
     );
     for (const key of keys) if ((await editor?.closeInput?.(key)) === false) return false;
-    useWorkbenchChrome.setState({ workspaceOpen: false, workspaceMaximized: false, workspaceTabsOnly: false });
+    useWorkbenchChrome.setState({ workspaceOpen: false, workspaceMaximized: false });
     return true;
   }
   useWorkbenchChrome.setState({ headerActions: WorkspaceControls, closeWorkspace });
   const reveal = () => useWorkbenchChrome.setState({ workspaceOpen: true });
   const openTool = async (id: string, focus = true) => {
     if (!useContributions.getState().toolWindows.has(id)) return;
-    useWorkbenchChrome.setState({ workspaceOpen: true, workspaceTabsOnly: true });
-    const key = `workspace.tool.${id}`;
+    reveal();
+    const key = toolTabKey(id);
     const editor = editorService();
-    await editor.openInput({ kind: "workspace.tool", key, data: { tool: id } }, { focus: false });
+    await editor.openInput({ kind: TOOL_TAB, key, data: { tool: id } }, { focus: false });
     if (focus && editor.activeInput?.()?.key === key) requestToolWindowFocus(id);
   };
   const disposers = [
-    () => useWorkbenchChrome.setState({ headerActions: null, closeWorkspace: undefined }),
+    () => useWorkbenchChrome.setState({ headerActions: null, closeWorkspace: undefined, toolWindowHost: undefined }),
     registerEditorKind({
-      kind: "workspace.tool",
+      kind: TOOL_TAB,
       title: (input) =>
         useContributions.getState().toolWindows.get((input.data as { tool: string }).tool)?.title ?? "Tool unavailable",
       icon: (input) =>
         useContributions.getState().toolWindows.get((input.data as { tool: string }).tool)?.icon ?? "plugin",
       keepAlive: true,
-      component: lazyComponent(() =>
-        import("@/workbench/toolwindows/ToolWindowEditor").then((m) => m.ToolWindowEditor),
-      ),
+      singleton: true,
+      component: lazyComponent(() => import("./ToolWindowEditor").then((m) => m.ToolWindowEditor)),
     }),
     registerEditorKind({
       kind: START.kind,
@@ -148,7 +148,7 @@ export function activate() {
         },
       },
       {
-        id: "workspace.tool",
+        id: TOOL_TAB,
         title: "More tools",
         category: "Window",
         when: "projectOpen",
@@ -172,7 +172,7 @@ export function activate() {
     ]),
     maybeEditorService()?.onActiveInputChange?.((input) => {
       useWorkbenchChrome.setState({
-        activeWorkspaceTool: input?.kind === "workspace.tool" ? (input.data as { tool: string }).tool : null,
+        activeWorkspaceTool: input?.kind === TOOL_TAB ? (input.data as { tool: string }).tool : null,
       });
       if (!useWorkbenchChrome.getState().primary) return;
       if (!input) {
@@ -184,6 +184,24 @@ export function activate() {
         void editorService().closeInput?.(input.key);
       } else useWorkbenchChrome.setState({ workspaceOpen: true });
     }) ?? (() => {}),
+    maybeEditorService()?.onInputOpened?.((input) => {
+      if (useWorkbenchChrome.getState().primary && input.kind !== "agent-home" && input.kind !== "agent-session")
+        reveal();
+    }) ?? (() => {}),
   ];
+  const host = {
+    show: (id: string, focus: boolean) => void executeAction(TOOL_TAB, { id, focus }),
+    hide: (id: string) => void maybeEditorService()?.closeInput?.(toolTabKey(id)),
+  };
+  const syncHost = () =>
+    useWorkbenchChrome.setState({
+      toolWindowHost: useWorkbenchChrome.getState().primary ? host : undefined,
+    });
+  syncHost();
+  disposers.push(
+    useWorkbenchChrome.subscribe((s, prev) => {
+      if (s.primary !== prev.primary) syncHost();
+    }),
+  );
   return () => disposers.reverse().forEach((dispose) => dispose());
 }

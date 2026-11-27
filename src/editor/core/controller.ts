@@ -293,6 +293,7 @@ function tabModified(tab: Tab): boolean {
 export class EditorController implements SlotHost {
   manager: DocumentManager;
   readonly slots = new Map<string, EditorSlot>();
+  private inputOpened = new Set<(input: EditorInput) => void>();
   private pending = new Map<string, Promise<EditorSlot | null>>();
   readonly nav = new NavigationHistory();
   readonly edits = new EditHistory();
@@ -1611,6 +1612,9 @@ export class EditorController implements SlotHost {
       } finally {
         this.admitting = false;
       }
+      if (activate && this.activeTabOf()?.id === tabId) {
+        for (const listener of this.inputOpened) listener(input);
+      }
       const replaced = preview && closedDocuments(before, s, kinds);
       if (replaced && replaced.length) await this.releaseDocuments(replaced).catch((e) => this.documentError(e));
       const canFocus = () => this.isCurrentOpening(generation) && this.activeTabOf()?.id === tabId;
@@ -2422,6 +2426,11 @@ export class EditorController implements SlotHost {
       prev = input?.key;
       fn(input);
     });
+  }
+
+  onInputOpened(fn: (input: EditorInput) => void): () => void {
+    this.inputOpened.add(fn);
+    return () => void this.inputOpened.delete(fn);
   }
 
   activePath(): string | null {

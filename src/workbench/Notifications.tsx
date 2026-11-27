@@ -126,7 +126,7 @@ export const NOTIFICATIONS_TOOL_WINDOW = "notifications";
 function useListVisible() {
   const hasProject = useProject((s) => !!s.project);
   const visible = useEffectiveVisible(useToolWindows());
-  const activeTab = useWorkbenchChrome((s) => (s.primary && s.workspaceOpen ? s.activeWorkspaceTool : null));
+  const activeTab = useWorkbenchChrome((s) => (s.toolWindowHost && s.workspaceOpen ? s.activeWorkspaceTool : null));
   return (
     hasProject &&
     (activeTab === NOTIFICATIONS_TOOL_WINDOW || Object.values(visible).includes(NOTIFICATIONS_TOOL_WINDOW))

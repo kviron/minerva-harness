@@ -1,6 +1,6 @@
 import { EmptyState } from "@/ui";
-import { useContributions, useEditorShown, useWorkbenchChrome, type EditorInput } from "../contributions";
-import { ToolWindowView } from "./ToolWindows";
+import { useContributions, useEditorShown, useWorkbenchChrome, type EditorInput } from "@/workbench/contributions";
+import { ToolWindowView } from "@/workbench/toolwindows/ToolWindows";
 
 export function ToolWindowEditor({ input }: { input: EditorInput }) {
   const id = (input.data as { tool: string }).tool;
