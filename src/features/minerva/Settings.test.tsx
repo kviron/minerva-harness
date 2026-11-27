@@ -8,6 +8,7 @@ vi.mock("@/platform/minerva", () => ({ minervaCall: rpc }));
 beforeEach(() => {
   rpc.mockReset();
   rpc.mockImplementation(async (method: string) => {
+    if (method === "usage.list") return [];
     if (method === "providers.list" || method === "providers.save") return [];
     if (method === "codex.status") return { state: "signed-out" };
     if (method === "providers.known")
@@ -21,7 +22,8 @@ beforeEach(() => {
           envVar: "DEEPSEEK_API_KEY",
         },
       ];
-    if (method === "providers.discover") return ["one", "two", "three", "one"];
+    if (method === "providers.catalog")
+      return ["one", "two", "three", "one"].map((id) => ({ id, contextWindow: 10_000_000 }));
     throw new Error(method);
   });
 });
@@ -30,6 +32,7 @@ it("sends API configuration through the backend and clears the key after saving"
   render(<MinervaSettings />);
   expect(screen.getByRole("region", { name: "Minerva" })).toBeInTheDocument();
 
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sign in with ChatGPT" })).toBeEnabled());
   await waitFor(() => expect(screen.getByRole("button", { name: "Add model provider…" })).toBeEnabled());
   expect(rpc.mock.calls.filter(([method]) => method === "providers.list")).toHaveLength(1);
   fireEvent.click(screen.getByRole("button", { name: "Add model provider…" }));
@@ -43,8 +46,11 @@ it("sends API configuration through the backend and clears the key after saving"
     }),
   );
   await screen.findByText("three");
+  expect(screen.getByLabelText("Context window · two")).toHaveAttribute("placeholder", "10000000");
   fireEvent.click(screen.getAllByRole("button", { name: "Move model up" })[1]!);
   fireEvent.click(screen.getAllByRole("button", { name: "Remove model" })[2]!);
+  fireEvent.change(screen.getByLabelText("Context window · two"), { target: { value: "98304" } });
+  fireEvent.click(screen.getByRole("checkbox", { name: "Read USD balance via the credit grants API" }));
   fireEvent.change(screen.getByLabelText("API key"), { target: { value: "fixture-key" } });
   fireEvent.click(
     within(screen.getByRole("dialog", { name: "Add model provider…" })).getByRole("button", { name: "Save" }),
@@ -55,7 +61,9 @@ it("sends API configuration through the backend and clears the key after saving"
       name: "Local",
       baseUrl: "https://example.test/v1",
       models: ["two", "one"],
+      modelWindows: { one: { discovered: 10_000_000 }, two: { discovered: 10_000_000, limit: 98304 } },
       apiKey: "fixture-key",
+      creditGrants: true,
       protocol: "openai-chat",
       isNew: true,
     }),

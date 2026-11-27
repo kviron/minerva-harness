@@ -14,10 +14,14 @@ pub(super) fn retain_samples(rows: &mut [UsageProvider], previous: Option<&[Usag
         }
         let Some(sample) = previous.iter().find(|sample| sample.provider_id == row.provider_id) else { continue };
         let Some(updated_at) = sample.updated_at else { continue };
-        if sample.windows.is_empty() || now < updated_at || now - updated_at > MAX_STALE_AGE.as_millis() as u64 {
+        if (sample.windows.is_empty() && sample.balance.is_none())
+            || now < updated_at
+            || now - updated_at > MAX_STALE_AGE.as_millis() as u64
+        {
             continue;
         }
         row.windows = sample.windows.clone();
+        row.balance = sample.balance.clone();
         row.updated_at = Some(updated_at);
     }
 }
@@ -33,7 +37,8 @@ mod tests {
             window_seconds: Some(18000),
             used_percent: 42.0,
             reset_at: None,
-        }]))
+        }]
+        .into()))
     }
     fn failed(id: &str, code: &'static str) -> UsageProvider {
         UsageProvider::empty(id, id).result(Err(code))

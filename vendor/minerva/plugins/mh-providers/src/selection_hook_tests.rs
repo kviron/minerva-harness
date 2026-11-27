@@ -22,6 +22,8 @@ async fn step(preset_id: &str, model: &str, effort: Option<&str>) -> FrozenStep 
     .unwrap();
     service
         .save(ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: "renamed-fixture".into(),
             name: "Fixture".into(),
             base_url: preset.base_url.into(),

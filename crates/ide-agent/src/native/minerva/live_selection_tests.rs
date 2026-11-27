@@ -52,7 +52,7 @@ async fn native_live_selection_changes_provider_on_the_next_model_call_after_a_t
         .save(
             serde_json::from_value(json!({
                 "id":provider,"name":"Live fixture","baseUrl":format!("http://{address}/v1"),
-                "models":["model-a","model-b","model-c"],"apiKey":null,"isNew":true,"protocol":"ollama"
+                "modelWindows":{"model-a":{"discovered":120000},"model-c":{"limit":65536}},"models":["model-a","model-b","model-c"],"apiKey":null,"isNew":true,"protocol":"ollama"
             }))
             .unwrap(),
         )
@@ -100,7 +100,7 @@ async fn native_live_selection_changes_provider_on_the_next_model_call_after_a_t
             let (mut second,_) = listener.accept().await.unwrap();
             let replacement=request(&mut second).await;
             response(&mut second,json!({"role":"assistant","content":"fixture-final"}),"stop").await;
-            (initial,replacement)
+            (initial,replacement,listener)
         }).await.expect("the native run must issue exactly two requests")
     });
     let foreign = format!("foreign-{}", uuid::Uuid::new_v4());
@@ -172,6 +172,9 @@ async fn native_live_selection_changes_provider_on_the_next_model_call_after_a_t
         .await
         .unwrap();
     assert_eq!(latest["configOptions"][0]["currentValue"], format!("api:{provider}/model-c"));
+    let report: Value = peer.request("_openidea/context_usage", json!({"sessionId":session}), None).await.unwrap();
+    assert_eq!(report["maxTokens"], 65536);
+    assert_eq!(report["model"], format!("api:{provider}/model-c"));
     peer.request::<_, Value>(
         "session/set_config_option",
         json!({"sessionId":session,"configId":"model","value":format!("api:{foreign}/other")}),
@@ -182,7 +185,7 @@ async fn native_live_selection_changes_provider_on_the_next_model_call_after_a_t
     release.notify_one();
     let result = tokio::time::timeout(Duration::from_secs(20), running).await.unwrap().unwrap().unwrap();
     assert_eq!(result["stopReason"], "end_turn");
-    let (initial, replacement) = server.await.unwrap();
+    let (initial, replacement, listener) = server.await.unwrap();
     assert_eq!(initial["model"], "model-a");
     assert_eq!(replacement["model"], "other");
     assert_eq!(executions.load(Ordering::SeqCst), 1);
@@ -204,6 +207,24 @@ async fn native_live_selection_changes_provider_on_the_next_model_call_after_a_t
         .count();
     assert_eq!(notices, 1);
     assert!(!replacement.to_string().contains("Next model request:"));
+    let before = runtime.sessions.load(&session).unwrap().len();
+    let summary_server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let body = request(&mut socket).await;
+        assert!(body.to_string().contains("Summarize"));
+        assert!(body.to_string().contains("fixture-result"));
+        let response = json!({"id":"summary","object":"chat.completion","created":1,"model":"other",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Completed an inspection."},"finish_reason":"stop"}]}).to_string();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+    });
+    let reply: Value = peer
+        .request("session/prompt", json!({"sessionId":session,"prompt":[{"type":"text","text":"/compact"}]}), None)
+        .await
+        .unwrap();
+    assert_eq!(reply["stopReason"], "end_turn", "{reply}");
+    summary_server.await.unwrap();
+    assert_eq!(runtime.sessions.load(&session).unwrap().len(), before);
+    assert!(runtime.plugins.harness.context.anchored_summary(&session, &history).unwrap().is_some());
     peer.kill();
     service.shutdown().await.unwrap();
 }

@@ -1,7 +1,9 @@
+mod compaction;
 pub mod engine;
 pub mod harness;
 pub mod optional;
 pub mod plugins;
+mod summary_input;
 pub use mh_context as context;
 pub use mh_mcp as mcp;
 pub use mh_providers as providers;

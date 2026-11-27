@@ -160,12 +160,15 @@ pub(crate) async fn run_inner(
         } else {
             (None, request.model.clone(), requested_effort)
         };
-        let mut prepared = manager.harness.context.prepare_enriched(id, &messages).await?;
-        if prepared.budget.should_compact && !crate::context::compact_prefix(&messages, 4).is_empty() {
+        let route_window = if effective_model.starts_with("api:") {
+            manager.providers()?.route_window(&effective_model).await
+        } else { None };
+        let mut prepared = manager.harness.context.prepare_for_model(id, &messages, route_window).await?;
+        if prepared.budget.should_compact && !crate::context::summary_prefix(&messages, prepared.budget.context_window).is_empty() {
             manager
                 .compact_messages_cancellable(id, &effective_model, &messages, &mut guard.cancel)
                 .await?;
-            prepared = manager.harness.context.prepare_enriched(id, &messages).await?;
+            prepared = manager.harness.context.prepare_for_model(id, &messages, route_window).await?;
         }
         let mut turns = prepared.turns;
         let mut image_bytes = 0usize;
@@ -367,6 +370,8 @@ mod tests {
             .providers()
             .unwrap()
             .save(ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: provider.clone(),
                 name: "fixture".into(),
                 base_url: format!("http://{address}/v1"),
@@ -510,6 +515,8 @@ mod tests {
             .providers()
             .unwrap()
             .save(ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: provider.clone(),
                 name: "Test".into(),
                 base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
@@ -606,6 +613,8 @@ mod tests {
             .providers()
             .unwrap()
             .save(ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: pid.clone(),
                 name: "Test".into(),
                 base_url: format!("http://{address}/v1"),

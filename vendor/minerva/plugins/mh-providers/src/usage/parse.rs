@@ -43,6 +43,21 @@ pub(super) fn go(v: &Value) -> Result<Vec<UsageWindow>, &'static str> {
         Ok(rows)
     }
 }
+pub(super) fn token_harbor(v: &Value) -> Result<Vec<UsageWindow>, &'static str> {
+    let mut rows = Vec::new();
+    for (id, enabled, percent) in [("pass", "on_plan", "plan_used_pct"), ("free", "models_enabled", "used_pct")] {
+        if v[enabled].as_bool().ok_or("invalid-response")? {
+            let used = v[percent].as_f64().filter(|n| (0.0..=100.0).contains(n)).ok_or("invalid-response")?;
+            rows.push(UsageWindow {
+                id: id.into(),
+                used_percent: used,
+                reset_at: timestamp(&v["reset_at"]),
+                window_seconds: Some(604800),
+            });
+        }
+    }
+    Ok(rows)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

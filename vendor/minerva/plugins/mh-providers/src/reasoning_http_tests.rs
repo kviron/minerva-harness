@@ -77,6 +77,8 @@ fn endpoint() -> (String, std::thread::JoinHandle<CapturedRequest>) {
 async fn send(id: &str, model: &str, effort: &str) -> CapturedRequest {
     let preset = preset(id).unwrap();
     let provider = Provider {
+        credit_grants: None,
+        model_windows: Default::default(),
         id: id.into(),
         name: preset.name.into(),
         base_url: preset.base_url.into(),

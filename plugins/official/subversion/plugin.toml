@@ -1,0 +1,22 @@
+id = "minerva.subversion"
+name = "Subversion"
+version = "0.1.0"
+description = "Work with multiple Subversion working copies in one project."
+engines.openidea = "^1.10"
+wasm = "dist/plugin.wasm"
+activation = ["on-view:svn", "on-command:open"]
+
+[capabilities]
+required = ["project.read", "storage", "process:svn"]
+
+[[contributes.views]]
+id = "svn"
+title = "Subversion"
+icon = "icons/subversion.svg"
+location = "bottom"
+
+
+[[contributes.commands]]
+id = "open"
+title = "Open Subversion"
+category = "Subversion"

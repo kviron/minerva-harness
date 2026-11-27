@@ -437,7 +437,14 @@ impl Runtime {
             "context.status" => {
                 let a: Session = args(params)?;
                 let messages = self.current_branch(&a.session_id)?;
-                encoded(harness.context.prepare(&a.session_id, &messages)?.budget)
+                let report = self.context_measure(&a.session_id).await?;
+                encoded(ContextBudget {
+                    estimated_tokens: report.used(),
+                    context_window: report.window,
+                    available_tokens: report.window.saturating_sub(report.used()),
+                    should_compact: report.auto && report.used() >= report.threshold,
+                    usage: crate::context::latest_usage(&messages),
+                })
             }
             "context.compact" => {
                 let a: Session = args(params)?;
@@ -478,10 +485,5 @@ impl Runtime {
             Some(last) => self.sessions.branch(session, &last.id),
             None => Ok(Vec::new()),
         }
-    }
-    pub async fn compact_context(&self, session: &str) -> Result<ContextSummary, String> {
-        let selected = self.sessions.get(session)?.model.ok_or("Select a model before compacting history")?;
-        let messages = self.current_branch(session)?;
-        self.plugins.compact_messages(session, &selected, &messages).await
     }
 }

@@ -24,6 +24,8 @@ pub(super) struct Model {
     #[serde(default)]
     pub max_context_window: Option<u32>,
     #[serde(default)]
+    pub effective_context_window_percent: Option<u32>,
+    #[serde(default)]
     pub input_modalities: Vec<String>,
     #[serde(default)]
     pub supported_reasoning_levels: Vec<Level>,
@@ -114,7 +116,13 @@ impl Models {
         let row = rows.as_ref()?.iter().find(|row| row.slug == id)?;
         let mut spec =
             ModelSpec::new(ProviderId::catalog("chatgpt")?, id).with_display_name(&row.display_name).with_tools(true);
-        spec.context_window = row.context_window.or(row.max_context_window).filter(|n| *n > 0);
+        spec.context_window =
+            row.context_window.filter(|n| *n > 0).or(row.max_context_window).filter(|n| *n > 0).map(|n| {
+                ((u64::from(n)
+                    * u64::from(row.effective_context_window_percent.filter(|p| (1..=100).contains(p)).unwrap_or(100)))
+                    / 100)
+                    .max(1) as u32
+            });
         spec.input.image = row.input_modalities.iter().any(|value| value == "image");
         spec.reasoning = ReasoningSupport::Listed {
             levels: row
@@ -152,6 +160,14 @@ mod tests {
         assert_eq!(spec.context_window, Some(400000));
         assert!(spec.input.image);
         assert_eq!(levels, vec!["high", "ultra"]);
+    }
+    #[test]
+    fn effective_capacity_uses_the_advertised_percentage_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Models::new(dir.path().join("models.json"));
+        let bytes = br#"{"models":[{"slug":"fixture","context_window":500000,"max_context_window":872000,"effective_context_window_percent":95}]}"#;
+        models.publish(Models::parse(bytes).unwrap()).unwrap();
+        assert_eq!(models.snapshot("fixture").unwrap().0.context_window, Some(475000));
     }
     #[test]
     fn duplicate_catalog_is_rejected_without_replacing_cache() {

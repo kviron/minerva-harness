@@ -1,4 +1,11 @@
 {
+  "Provider limits": "Лимиты провайдера",
+  "Remaining balance": "Остаток баланса",
+  "{0}% remaining": "Осталось {0}%",
+  "{0} balance tokens": "{0} токенов баланса",
+  "Weekly Pass allowance": "Недельная квота подписки",
+  "Weekly free allowance": "Недельная бесплатная квота",
+  "Read USD balance via the credit grants API": "Получать остаток в USD через API credit grants",
   "Create function '{name}'": "Создать функцию '{name}'",
   "Create class '{name}'": "Создать класс '{name}'",
   "Create method '{name}' in '{owner}'": "Создать метод '{name}' в '{owner}'",

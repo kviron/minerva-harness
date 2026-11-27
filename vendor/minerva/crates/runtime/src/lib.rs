@@ -16,6 +16,7 @@ pub mod runs;
 mod runtime_services;
 pub use run_supervisor::{RunHandle, RunMessage, RunSnapshot, StartRunRequest};
 pub mod context;
+mod context_api;
 pub mod harness;
 mod harness_api;
 mod learning;

@@ -1,11 +1,14 @@
 //! Read-only subscription metering. Credentials never enter the returned DTOs.
+mod adapter;
 mod cache;
 mod parse;
 mod snapshot;
 mod transport;
-use crate::{codex, ProviderService};
+#[cfg(test)]
+use crate::codex;
+use crate::ProviderService;
 use serde::Serialize;
-use snapshot::{GoSource, UsageIdentity};
+use snapshot::UsageIdentity;
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -14,6 +17,24 @@ use tokio::sync::Mutex;
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const MANUAL_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "unit", content = "amount", rename_all = "camelCase")]
+pub enum Balance {
+    Tokens(u64),
+    Usd(f64),
+    Unlimited,
+}
+#[derive(Default)]
+pub(crate) struct Reading {
+    windows: Vec<UsageWindow>,
+    balance: Option<Balance>,
+}
+impl From<Vec<UsageWindow>> for Reading {
+    fn from(windows: Vec<UsageWindow>) -> Self {
+        Self { windows, balance: None }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +51,7 @@ pub struct UsageProvider {
     pub provider_name: String,
     pub status: String,
     pub windows: Vec<UsageWindow>,
+    pub balance: Option<Balance>,
     pub updated_at: Option<u64>,
     pub error_code: Option<String>,
 }
@@ -40,15 +62,17 @@ impl UsageProvider {
             provider_name: name.into(),
             status: "not-configured".into(),
             windows: vec![],
+            balance: None,
             updated_at: None,
             error_code: None,
         }
     }
-    pub(crate) fn result(mut self, result: Result<Vec<UsageWindow>, &'static str>) -> Self {
+    pub(crate) fn result(mut self, result: Result<Reading, &'static str>) -> Self {
         match result {
-            Ok(windows) => {
+            Ok(reading) => {
                 self.status = "ok".into();
-                self.windows = windows;
+                self.windows = reading.windows;
+                self.balance = reading.balance;
                 self.updated_at = Some(now());
             }
             Err(code) => {
@@ -86,7 +110,7 @@ impl ProviderService {
                 return rows;
             }
         }
-        let mut rows = self.fetch_usage_rows(&snapshot.go).await;
+        let mut rows = futures_util::future::join_all(snapshot.sources.iter().map(|source| source.fetch(self))).await;
         // A changed account/config may never publish an older snapshot.
         let current = self.usage_snapshot().await;
         if snapshot.identity != current.identity {
@@ -96,29 +120,6 @@ impl ProviderService {
         cache::retain_samples(&mut rows, previous, now());
         current.apply_names(&mut rows);
         *cache = Some(Entry { key: snapshot.identity, at: Instant::now(), rows: rows.clone() });
-        rows
-    }
-    async fn fetch_usage_rows(&self, go: &[GoSource]) -> Vec<UsageProvider> {
-        let codex_work = async {
-            let row = UsageProvider::empty(codex::ID, "Codex");
-            if self.codex.has_session().unwrap_or(false) {
-                row.result(self.codex.subscription_usage().await)
-            } else {
-                row
-            }
-        };
-        let go_work = futures_util::future::join_all(go.iter().map(|source| async move {
-            let row = UsageProvider::empty(&source.id, &source.name);
-            match source.key.as_deref().filter(|k| !k.trim().is_empty()) {
-                Some(key) => row.result(
-                    transport::get("https://opencode.ai/zen/go/v1/usage", key, None).await.and_then(|v| parse::go(&v)),
-                ),
-                None => row,
-            }
-        }));
-        let (codex_row, go_rows) = tokio::join!(codex_work, go_work);
-        let mut rows = vec![codex_row];
-        rows.extend(go_rows);
         rows
     }
 }
@@ -150,6 +151,8 @@ mod tests {
         assert_eq!(rows[0].status, "not-configured");
         assert!(service.usage_cache.0.lock().await.is_some());
         service.providers.lock().await.push(Provider {
+            credit_grants: None,
+            model_windows: Default::default(),
             id: "opencode-go".into(),
             name: "Go".into(),
             base_url: "https://opencode.ai/inference/go".into(),
@@ -167,6 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service(dir.path());
         service.providers.lock().await.push(Provider {
+            credit_grants: None,
+            model_windows: Default::default(),
             id: "opencode-go".into(),
             name: "Original".into(),
             base_url: "https://opencode.ai/inference/go".into(),
@@ -179,7 +184,8 @@ mod tests {
             window_seconds: Some(18000),
             used_percent: 42.0,
             reset_at: None,
-        }]));
+        }]
+        .into()));
         let observed = row.updated_at;
         *service.usage_cache.0.lock().await =
             Some(Entry { key: snapshot.identity, at: Instant::now(), rows: vec![row] });
@@ -188,6 +194,8 @@ mod tests {
             providers[0].name = "Renamed".into();
             providers[0].models.reverse();
             providers.push(Provider {
+                credit_grants: None,
+                model_windows: Default::default(),
                 id: "unrelated".into(),
                 name: "Other".into(),
                 base_url: "https://example.com".into(),
@@ -206,6 +214,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service(dir.path());
         service.providers.lock().await.push(Provider {
+            credit_grants: None,
+            model_windows: Default::default(),
             id: "opencode-go".into(),
             name: "Go".into(),
             base_url: "https://opencode.ai/inference/go".into(),
@@ -240,6 +250,46 @@ mod tests {
             assert_eq!(rows.iter().find(|r| r.provider_id == codex::ID).unwrap().status, "ok");
         }
     }
+    #[tokio::test]
+    async fn custom_credit_grants_is_opt_in_and_uses_the_configured_path_and_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/tenant/v1", listener.local_addr().unwrap());
+        let mut input = serde_json::json!({
+            "id":"custom", "name":"Custom", "baseUrl":base, "protocol":"openai-chat",
+            "models":[], "apiKey":"fixture", "isNew":true
+        });
+        service.save(serde_json::from_value(input.clone()).unwrap()).await.unwrap();
+        assert!(service.usage(false).await.iter().all(|row| row.provider_id != "custom"));
+
+        input["isNew"] = false.into();
+        input["apiKey"] = serde_json::Value::Null;
+        input["creditGrants"] = true.into();
+        service.save(serde_json::from_value(input.clone()).unwrap()).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = vec![0; 4096];
+            let size = socket.read(&mut req).await.unwrap();
+            let req = String::from_utf8_lossy(&req[..size]).to_ascii_lowercase();
+            assert!(req.starts_with("get /tenant/v1/dashboard/billing/credit_grants "));
+            assert!(req.contains("authorization: bearer fixture"));
+            let body = r#"{"total_available":0}"#;
+            socket
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+        let rows = service.usage(false).await;
+        assert!(matches!(rows.iter().find(|r| r.provider_id == "custom").unwrap().balance, Some(Balance::Usd(0.0))));
+        server.await.unwrap();
+        input["creditGrants"] = false.into();
+        service.save(serde_json::from_value(input).unwrap()).await.unwrap();
+        assert!(service.usage(false).await.iter().all(|row| row.provider_id != "custom"));
+    }
+
     #[tokio::test]
     async fn hosted_usage_never_reads_local_accounts() {
         let dir = tempfile::tempdir().unwrap();

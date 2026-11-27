@@ -100,6 +100,8 @@ async fn provider_ownership_case(fail_commit: bool) {
         .providers()
         .unwrap()
         .save(ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: provider.clone(),
             name: "Test".into(),
             base_url: format!("http://{address}/v1"),

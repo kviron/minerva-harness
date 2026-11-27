@@ -305,6 +305,8 @@ mod integration_tests {
                 .providers()
                 .unwrap()
                 .save(crate::providers::ProviderInput {
+                    credit_grants: None,
+                    model_windows: None,
                     id: provider.clone(),
                     name: provider.clone(),
                     base_url: format!("http://{addr}/v1"),

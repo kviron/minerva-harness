@@ -25,10 +25,11 @@ for (const theme of ["dark", "light"] as const) {
             {
               providerId: "opencode-go",
               providerName: "OpenCode Go",
-              status: phase >= 2 ? "unavailable" : "ok",
-              windows: phase === 2 ? [] : [{ id: "weekly", windowSeconds: null, usedPercent: 82, resetAt: null }],
-              updatedAt: phase === 2 ? null : Date.now(),
-              errorCode: phase === 2 ? "auth" : phase === 3 ? "network" : null,
+              status: phase === 2 ? "unavailable" : "ok",
+              windows: phase === 3 ? [] : [{ id: "weekly", windowSeconds: null, usedPercent: 82, resetAt: null }],
+              updatedAt: Date.now(),
+              balance: phase === 3 ? { unit: "usd", amount: 0 } : null,
+              errorCode: phase === 2 ? "network" : null,
             },
           ]);
         }
@@ -50,11 +51,11 @@ for (const theme of ["dark", "light"] as const) {
       const settingsPath = "/src/features/settings/model/staging.ts";
       (await import(settingsPath)).openSettings("agents.minerva");
     }, theme);
-    await page.getByRole("tab", { name: "Subscription limits", exact: true }).click();
-    const region = page.getByRole("region", { name: "Subscription limits", exact: true });
+    await page.getByRole("tab", { name: "Provider limits", exact: true }).click();
+    const region = page.getByRole("region", { name: "Provider limits", exact: true });
     const codex = region.getByRole("article", { name: "Codex", exact: true });
     const go = region.getByRole("article", { name: "OpenCode Go", exact: true });
-    await expect(codex.getByText("37% used")).toBeVisible();
+    await expect(codex.getByText("63% remaining")).toBeVisible();
     await expect(codex.getByText("2 hours", { exact: true })).toBeVisible();
     await expect(go).toHaveCount(0);
     await page.screenshot({ path: `output/minerva-usage-review/limits-${theme}.png`, animations: "disabled" });
@@ -62,7 +63,7 @@ for (const theme of ["dark", "light"] as const) {
     await page.screenshot({ path: `output/minerva-usage-review/limits-narrow-${theme}.png`, animations: "disabled" });
     await page.evaluate(() => document.dispatchEvent(new Event("test:usage-next")));
     await region.getByRole("button", { name: "Refresh limits" }).click();
-    await expect(codex.getByText("Connect this provider to see subscription limits.")).toBeVisible();
+    await expect(page.getByRole("tab", { name: "Provider limits" })).toHaveCount(0);
     await expect(codex.getByRole("progressbar")).toHaveCount(0);
     await page
       .getByRole("listbox", { name: "Model providers" })
@@ -70,15 +71,13 @@ for (const theme of ["dark", "light"] as const) {
       .filter({ hasText: "OpenCode Go" })
       .click();
     await expect(codex).toHaveCount(0);
-    await expect(go.getByText("82% used")).toBeVisible();
+    await expect(go.getByText("18% remaining")).toBeVisible();
     await page.evaluate(() => document.dispatchEvent(new Event("test:usage-next")));
     await region.getByRole("button", { name: "Refresh limits" }).click();
-    await expect(go.getByText("Authorization expired. Check the provider connection.")).toBeVisible();
-    await expect(go.getByRole("progressbar")).toHaveCount(0);
-    await page.evaluate(() => document.dispatchEvent(new Event("test:usage-next")));
-    await region.getByRole("button", { name: "Refresh limits" }).click();
-    await expect(go.getByText("82% used")).toBeVisible();
     await expect(go.getByText(/last.*known/i)).toBeVisible();
-    await page.screenshot({ path: `output/minerva-usage-review/limits-stale-${theme}.png`, animations: "disabled" });
+    await page.evaluate(() => document.dispatchEvent(new Event("test:usage-next")));
+    await region.getByRole("button", { name: "Refresh limits" }).click();
+    await expect(go.getByText("$0.00", { exact: true })).toBeVisible();
+    await page.screenshot({ path: `output/minerva-usage-review/limits-balance-${theme}.png`, animations: "disabled" });
   });
 }

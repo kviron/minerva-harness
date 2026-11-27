@@ -1,5 +1,8 @@
 //! Only subscription identity participates in cache admission; catalog metadata does not.
-use super::UsageProvider;
+use super::{
+    adapter::{Adapter, Source},
+    UsageProvider,
+};
 use crate::ProviderService;
 
 #[derive(PartialEq)]
@@ -18,21 +21,15 @@ struct SourceIdentity {
     key: Option<String>,
 }
 
-pub(super) struct GoSource {
-    pub id: String,
-    pub name: String,
-    pub key: Option<String>,
-}
-
 pub(super) struct Snapshot {
     pub identity: UsageIdentity,
-    pub go: Vec<GoSource>,
+    pub sources: Vec<Source>,
 }
 
 impl Snapshot {
     pub fn apply_names(&self, rows: &mut [UsageProvider]) {
         for row in rows {
-            if let Some(source) = self.go.iter().find(|source| source.id == row.provider_id) {
+            if let Some(source) = self.sources.iter().find(|source| source.id == row.provider_id) {
                 row.provider_name.clone_from(&source.name);
             }
         }
@@ -43,13 +40,11 @@ impl ProviderService {
     pub(super) async fn usage_snapshot(&self) -> Snapshot {
         let providers = self.providers.lock().await.clone();
         let mut sources = Vec::new();
-        let mut go = Vec::new();
+        let mut configured = vec![Source::codex()];
         for provider in providers {
             let endpoint = provider.base_url.trim_end_matches('/');
-            if provider.id != "opencode-go"
-                || endpoint != "https://opencode.ai/inference/go"
-                || provider.protocol != "openai-chat"
-            {
+            let Some(adapter) = Adapter::for_provider(&provider) else { continue };
+            if self.endpoint_policy.require_safe_transport(endpoint).is_err() {
                 continue;
             }
             let key = self
@@ -64,7 +59,7 @@ impl ProviderService {
                 protocol: provider.protocol,
                 key: key.clone(),
             });
-            go.push(GoSource { id: provider.id, name: provider.name, key });
+            configured.push(Source { adapter, id: provider.id, name: provider.name, key });
         }
         Snapshot {
             identity: UsageIdentity {
@@ -72,7 +67,7 @@ impl ProviderService {
                 signed_in: self.codex.has_session().unwrap_or(false),
                 sources,
             },
-            go,
+            sources: configured,
         }
     }
 }

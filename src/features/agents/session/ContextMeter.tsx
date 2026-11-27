@@ -102,13 +102,25 @@ export function ContextMeter({ task, usage }: { task: AgentTask; usage: AgentUsa
         aria-label={tx("Context window")}
         className={phase === "closing" ? styles.contextClosing : styles.contextPopover}
       >
-        <ContextDetails task={task} onClose={close} closing={!open} />
+        <ContextDetails task={task} used={usage.used} size={usage.size} onClose={close} closing={!open} />
       </Popup>
     </>
   );
 }
 
-function ContextDetails({ task, onClose, closing }: { task: AgentTask; onClose: () => void; closing: boolean }) {
+function ContextDetails({
+  task,
+  used,
+  size,
+  onClose,
+  closing,
+}: {
+  task: AgentTask;
+  used: number;
+  size: number;
+  onClose: () => void;
+  closing: boolean;
+}) {
   const [report, setReport] = useState<AgentContextUsage | null>(null);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
@@ -117,7 +129,10 @@ function ContextDetails({ task, onClose, closing }: { task: AgentTask; onClose: 
     let current = true;
     call(commands.agentContextUsage(task.id)).then(
       (value) => {
-        if (current) setReport(value);
+        if (current) {
+          setError("");
+          setReport(value);
+        }
       },
       (e) => {
         if (current) setError(String(e));
@@ -126,9 +141,15 @@ function ContextDetails({ task, onClose, closing }: { task: AgentTask; onClose: 
     return () => {
       current = false;
     };
-  }, [task.id]);
+  }, [task.id, used, size]);
   const summary = report && usageLabel({ used: report.totalTokens, size: report.maxTokens, cost: null });
   const categories = report?.categories ?? [];
+  // Provider input usage can differ from the estimated category breakdown.
+  const estimatedTotal = categories.reduce(
+    (total, category) => total + (category.kind === "estimate" ? category.tokens : 0),
+    0,
+  );
+  const occupiedScale = estimatedTotal && report ? report.totalTokens / estimatedTotal : 1;
   const compact = async () => {
     setSending(true);
     try {
@@ -164,7 +185,15 @@ function ContextDetails({ task, onClose, closing }: { task: AgentTask; onClose: 
             {categories.map(
               (c) =>
                 c.kind !== "deferred" &&
-                c.tokens > 0 && <span key={c.name} style={{ flexGrow: c.tokens, background: tone(c.name) }} />,
+                c.tokens > 0 && (
+                  <span
+                    key={c.name}
+                    style={{
+                      flexGrow: c.tokens * (c.kind === "estimate" ? occupiedScale : 1),
+                      background: tone(c.name),
+                    }}
+                  />
+                ),
             )}
           </div>
           <span>{report.model}</span>
@@ -182,7 +211,10 @@ function ContextDetails({ task, onClose, closing }: { task: AgentTask; onClose: 
                 <li key={c.name}>
                   <i aria-hidden style={{ background: tone(c.name) }} />
                   <span>{tx(c.name)}</span>
-                  <span>{c.tokens.toLocaleString()}</span>
+                  <span>
+                    {c.kind === "estimate" ? "~" : ""}
+                    {c.tokens.toLocaleString()}
+                  </span>
                 </li>
               ))}
             </ul>

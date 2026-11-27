@@ -319,6 +319,7 @@ fn permission_update_preserves_settings_and_does_not_revalidate_the_folder() {
                 cwd: Some(folder.to_str().unwrap().into()),
                 permission_policy: tools::PermissionPolicy::Ask,
                 context_window: 8192,
+                context_window_explicit: Some(true),
                 auto_compact: false,
                 model_effort: Some(("model".into(), "high".into())),
             },

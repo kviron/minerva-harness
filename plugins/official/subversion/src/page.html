@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      color: var(--openidea-fg);
+    }
+    .toolbar,
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+      padding: 6px 8px;
+    }
+    .toolbar,
+    header,
+    #url {
+      border-bottom: 1px solid var(--openidea-border);
+    }
+    button,
+    select,
+    input,
+    textarea {
+      font: inherit;
+      color: inherit;
+      background: var(--openidea-bg-input);
+      border: 1px solid var(--openidea-border);
+      border-radius: 4px;
+      padding: 4px 8px;
+    }
+    button:not(:disabled):hover {
+      background: var(--openidea-bg-hover);
+    }
+    button:disabled {
+      opacity: 0.5;
+    }
+    button[aria-pressed="true"] {
+      border-bottom: 2px solid var(--openidea-accent);
+      background: var(--openidea-bg-selected);
+    }
+    .primary {
+      background: var(--openidea-accent);
+      color: var(--openidea-fg-on-accent);
+    }
+    select {
+      max-width: 35vw;
+    }
+    #url,
+    #feedback {
+      padding: 4px 8px;
+      overflow-wrap: anywhere;
+    }
+    #url {
+      color: var(--openidea-fg-muted);
+    }
+    #feedback:empty,
+    #url:empty,
+    [hidden] {
+      display: none !important;
+    }
+    .error {
+      color: var(--openidea-danger);
+      white-space: pre-wrap;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) minmax(220px, 32%);
+      min-height: 160px;
+    }
+    aside {
+      border-left: 1px solid var(--openidea-border);
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 64px;
+      resize: vertical;
+    }
+    header {
+      padding: 6px 8px;
+      background: var(--openidea-bg-elevated);
+    }
+    #files {
+      overflow: auto;
+      max-height: 52vh;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 2px 8px;
+    }
+    .row:hover {
+      background: var(--openidea-bg-hover);
+    }
+    .row button {
+      border: 0;
+      background: transparent;
+      padding: 2px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: left;
+    }
+    .status {
+      width: 1em;
+      color: var(--openidea-change-modified);
+    }
+    .conflict {
+      color: var(--openidea-danger);
+    }
+    .added {
+      color: var(--openidea-change-added);
+    }
+    .deleted {
+      color: var(--openidea-change-deleted);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th,
+    td {
+      text-align: left;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--openidea-border);
+    }
+    @media (max-width: 490px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+      aside {
+        border-left: 0;
+        border-top: 1px solid var(--openidea-border);
+      }
+    }
+  </style>
+  <div class="toolbar">
+    <button id="changesTab" aria-pressed="true">Changes</button>
+    <button id="historyTab" aria-pressed="false">Log</button>
+    <select id="root" aria-label="Working copy"></select>
+    <button id="map">Add working copy</button>
+    <button id="unmap" data-root>Remove mapping</button>
+    <button id="refresh" data-root>Refresh</button>
+    <button id="update" data-root>Update</button>
+    <button id="switch" data-root>Switch</button>
+    <button id="merge" data-root>Merge</button>
+  </div>
+  <form id="form" class="controls" hidden>
+    <label id="targetLabel" for="target"></label><input id="target" required />
+    <button type="submit" id="submit"></button><button type="button" id="cancel">Cancel</button>
+  </form>
+  <div id="url"></div>
+  <div id="feedback" role="status"></div>
+  <main id="changes">
+    <section>
+      <header>
+        <label><input id="all" type="checkbox" /> Local Changes</label>
+      </header>
+      <div id="files"></div>
+    </section>
+    <aside>
+      <textarea id="message" aria-label="Commit message" placeholder="Commit message"></textarea>
+      <div>
+        <button id="commit" class="primary" data-selection>Commit</button>
+        <button id="add" data-selection>Add</button>
+        <button id="revert" data-selection>Revert</button>
+      </div>
+    </aside>
+  </main>
+  <section id="history" hidden>
+    <table>
+      <thead>
+        <tr>
+          <th>Revision</th>
+          <th>Message</th>
+          <th>Author</th>
+          <th>Date</th>
+        </tr>
+      </thead>
+      <tbody id="revisions"></tbody>
+    </table>
+  </section>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let pending = "",
+      mode = "status",
+      formAction = "";
+    const drafts = new Map();
+    const selected = () => [...$("files").querySelectorAll(":checked")];
+    const paths = () => selected().map((input) => input.value);
+    function controls() {
+      $("root").disabled = Boolean(pending) || !$("root").value;
+      for (const button of document.querySelectorAll("[data-root]"))
+        button.disabled = Boolean(pending) || !$("root").value;
+      for (const button of document.querySelectorAll("[data-selection]"))
+        button.disabled = Boolean(pending) || !paths().length;
+      $("commit").disabled ||=
+        !$("message").value.trim() ||
+        selected().some(
+          (input) =>
+            input.dataset.conflict === "true" ||
+            ["unversioned", "external", "ignored", "missing"].includes(input.dataset.status),
+        );
+      $("add").disabled ||= selected().some((input) => input.dataset.status !== "unversioned");
+      $("revert").disabled ||= selected().some((input) => input.dataset.status === "unversioned");
+      $("submit").disabled = Boolean(pending);
+      const boxes = $("files").querySelectorAll("input");
+      $("all").checked = boxes.length > 0 && paths().length === boxes.length;
+      $("all").indeterminate = paths().length > 0 && paths().length < boxes.length;
+    }
+    function send(op, args = {}) {
+      if (pending) return;
+      pending = op;
+      $("feedback").className = "";
+      $("feedback").textContent = "Working…";
+      controls();
+      openidea.postMessage(JSON.stringify({ op, root: $("root").value, ...args }));
+    }
+    function tab(op) {
+      if (pending) return;
+      mode = op;
+      $("changes").hidden = op === "history";
+      $("history").hidden = op !== "history";
+      $("changesTab").setAttribute("aria-pressed", op === "status");
+      $("historyTab").setAttribute("aria-pressed", op === "history");
+      if ($("root").value) send(op);
+    }
+    function renderChanges(rows) {
+      const selected = new Set(paths());
+      $("files").replaceChildren();
+      for (const row of rows) {
+        const line = document.createElement("div");
+        line.className = "row";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = row.path;
+        box.dataset.status = row.status;
+        box.dataset.conflict = row.conflict;
+        box.checked = selected.has(row.path);
+        box.setAttribute("aria-label", "Include " + row.path);
+        box.onchange = controls;
+        const status = document.createElement("span");
+        status.className = "status " + (row.conflict ? "conflict" : row.status);
+        status.textContent = row.conflict
+          ? "C"
+          : { unversioned: "?", added: "A", deleted: "D", missing: "!", modified: "M", replaced: "R" }[row.status] ||
+            "M";
+        status.title = row.conflict ? "Conflict" : row.status;
+        const name = document.createElement("button");
+        name.textContent = row.path.replaceAll(String.fromCharCode(92), "/").split("/").pop();
+        const directory = document.createElement("small");
+        directory.textContent = row.path.slice(0, -name.textContent.length).slice(0, -1);
+        directory.style.color = "var(--openidea-fg-muted)";
+        name.title = "Show Diff — " + row.path;
+        name.onclick = () => send("diff", { paths: [row.path] });
+        line.append(box, status, name, directory);
+        $("files").append(line);
+      }
+    }
+    openidea.onMessage((raw) => {
+      const res = JSON.parse(raw);
+      const completed = pending;
+      pending = "";
+      $("feedback").textContent = res.error || "";
+      $("feedback").className = res.error ? "error" : "";
+      if (res.roots) {
+        const previous = $("root").value;
+        $("root").replaceChildren(...res.roots.map((root) => new Option(root, root)));
+        $("root").value = res.current || (res.roots.includes(previous) ? previous : res.roots[0] || "");
+        $("url").textContent = "";
+        renderChanges([]);
+        $("revisions").replaceChildren();
+        if ($("root").value) send(mode);
+        else $("feedback").textContent = "Add a Subversion working copy from this project.";
+      }
+      if (res.changes) {
+        if (completed === "commit") drafts.delete($("root").value);
+        $("message").value = drafts.get($("root").value) || "";
+        renderChanges(res.changes);
+        $("url").textContent = res.url;
+        if (mode === "history" && completed !== "status") send("history");
+      }
+      if (res.history) {
+        $("revisions").replaceChildren();
+        for (const entry of res.history) {
+          const row = $("revisions").insertRow();
+          for (const value of [
+            "r" + entry.revision,
+            entry.message,
+            entry.author,
+            entry.date ? new Date(entry.date).toLocaleString() : "",
+          ])
+            row.insertCell().textContent = value;
+        }
+      }
+      if (!res.error && ["connect", "switch", "merge"].includes(completed)) $("form").hidden = true;
+      controls();
+    });
+    $("changesTab").onclick = () => tab("status");
+    $("historyTab").onclick = () => tab("history");
+    $("refresh").onclick = () => tab(mode);
+    $("message").oninput = () => {
+      drafts.set($("root").value, $("message").value);
+      controls();
+    };
+    $("root").onchange = () => {
+      $("message").value = drafts.get($("root").value) || "";
+      $("form").hidden = true;
+      $("url").textContent = "";
+      renderChanges([]);
+      $("revisions").replaceChildren();
+      tab(mode);
+    };
+    $("all").onchange = (event) => {
+      for (const box of $("files").querySelectorAll("input")) box.checked = event.target.checked;
+      controls();
+    };
+    $("unmap").onclick = () => send("disconnect");
+    $("update").onclick = () => send("update");
+    $("commit").onclick = () => send("commit", { paths: paths(), message: $("message").value });
+    $("add").onclick = () => send("add", { paths: paths() });
+    $("revert").onclick = () => {
+      if (formAction === "revert" && !$("form").hidden) {
+        $("form").hidden = true;
+        send("revert", { paths: paths() });
+      } else show("revert", "Discard the selected local changes?", "Revert");
+    };
+    function show(op, label, button) {
+      if (pending) return;
+      formAction = op;
+      $("targetLabel").textContent = label;
+      $("target").hidden = op === "revert";
+      $("target").required = op !== "revert";
+      $("target").value = "";
+      $("submit").textContent = button;
+      $("form").hidden = false;
+      (op === "revert" ? $("submit") : $("target")).focus();
+    }
+    $("map").onclick = () => show("connect", "Project-relative folder (. for project root)", "Add");
+    $("switch").onclick = () => show("switch", "Branch URL", "Switch");
+    $("merge").onclick = () => show("merge", "Source URL", "Merge");
+    $("cancel").onclick = () => {
+      $("form").hidden = true;
+    };
+    $("form").onsubmit = (event) => {
+      event.preventDefault();
+      if (formAction === "revert") {
+        $("form").hidden = true;
+        send("revert", { paths: paths() });
+      } else send(formAction, formAction === "connect" ? { root: $("target").value } : { url: $("target").value });
+    };
+    send("roots");
+  </script>
+</html>

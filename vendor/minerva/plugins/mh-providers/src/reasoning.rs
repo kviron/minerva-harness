@@ -187,6 +187,8 @@ mod tests {
         let catalog = rig_core::catalog::Catalog::builtin();
         for preset in super::super::PRESETS {
             let provider = Provider {
+                credit_grants: None,
+                model_windows: Default::default(),
                 id: format!("fixture-{}", preset.id),
                 name: preset.name.into(),
                 base_url: preset.base_url.into(),
@@ -228,6 +230,8 @@ mod tests {
         for id in ["openai", "anthropic", "deepseek", "zai-coding"] {
             let preset = super::super::PRESETS.iter().find(|preset| preset.id == id).unwrap();
             let provider = Provider {
+                credit_grants: None,
+                model_windows: Default::default(),
                 id: "renamed-provider".into(),
                 name: "Fixture".into(),
                 base_url: preset.base_url.into(),
@@ -250,6 +254,8 @@ mod tests {
         }
         let preset = super::super::PRESETS.iter().find(|preset| preset.id == "opencode-go").unwrap();
         let mut provider = Provider {
+            credit_grants: None,
+            model_windows: Default::default(),
             id: "renamed-gateway".into(),
             name: "Fixture".into(),
             base_url: preset.base_url.into(),
@@ -269,6 +275,8 @@ mod tests {
             ["https://evil.test/path/deepseek", "https://api.deepseek.com.evil.test", "http://127.0.0.1:12345/v1"]
         {
             let provider = Provider {
+                credit_grants: None,
+                model_windows: Default::default(),
                 id: "deepseek".into(),
                 name: "Custom".into(),
                 base_url: base.into(),

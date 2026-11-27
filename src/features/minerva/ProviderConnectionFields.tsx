@@ -1,4 +1,4 @@
-import { Input, Select, T } from "@/ui";
+import { Checkbox, Input, Select, T } from "@/ui";
 import { tx } from "@/platform/i18n";
 import type { MinervaKnownProvider } from "@/platform/minerva";
 import type { ProviderDraft } from "./providerDraft";
@@ -36,15 +36,27 @@ export function ProviderConnectionFields({
             if (preset) {
               onChange({
                 ...draft,
+                creditGrants: undefined,
                 apiKey: "",
                 id: preset.id,
                 name: preset.name,
                 baseUrl: preset.baseUrl,
                 protocol: preset.protocol,
                 models: preset.models,
+                modelWindows: {},
               });
             } else {
-              onChange({ ...draft, id: "", name: "", baseUrl: "", models: [], apiKey: "", protocol: "openai-chat" });
+              onChange({
+                ...draft,
+                id: "",
+                name: "",
+                baseUrl: "",
+                models: [],
+                modelWindows: {},
+                creditGrants: undefined,
+                apiKey: "",
+                protocol: "openai-chat",
+              });
             }
           }}
         />
@@ -82,7 +94,7 @@ export function ProviderConnectionFields({
           required
           disabled={busy}
           value={draft.baseUrl}
-          onChange={(e) => onChange({ ...draft, baseUrl: e.target.value })}
+          onChange={(e) => onChange({ ...draft, baseUrl: e.target.value, modelWindows: {}, creditGrants: undefined })}
         />
       </label>
       <label className={styles.field}>
@@ -99,9 +111,18 @@ export function ProviderConnectionFields({
             { value: "anthropic-messages", label: "Anthropic Messages" },
             { value: "ollama", label: "Ollama" },
           ]}
-          onChange={(protocol) => onChange({ ...draft, protocol })}
+          onChange={(protocol) => onChange({ ...draft, protocol, modelWindows: {} })}
         />
       </label>
+      {(draft.protocol === "openai-chat" || draft.protocol === "openai-responses") &&
+        !known.some((preset) => preset.baseUrl === draft.baseUrl.replace(/\/+$/, "")) && (
+          <Checkbox
+            label={tx("Read USD balance via the credit grants API")}
+            disabled={busy}
+            checked={draft.creditGrants ?? false}
+            onChange={(creditGrants) => onChange({ ...draft, creditGrants })}
+          />
+        )}
       <label className={styles.field}>
         <span>
           <T>API key</T>

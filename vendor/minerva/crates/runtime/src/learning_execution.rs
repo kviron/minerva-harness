@@ -797,6 +797,8 @@ mod tests {
             .providers()
             .unwrap()
             .save(crate::providers::ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: provider_id.clone(),
                 name: "mock".into(),
                 base_url: format!("http://{address}/v1"),
@@ -1289,6 +1291,8 @@ mod improvement_http_test {
             .providers()
             .unwrap()
             .save(crate::providers::ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: provider_id.clone(),
                 name: "mock".into(),
                 base_url: format!("http://{address}/v1"),
@@ -1587,6 +1591,8 @@ mod cancellation_http_test {
             .providers()
             .unwrap()
             .save(crate::providers::ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: provider_id.clone(),
                 name: "mock".into(),
                 base_url: format!("http://{addr}/v1"),

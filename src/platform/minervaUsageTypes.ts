@@ -10,6 +10,7 @@ export interface MinervaUsageProvider {
   providerId: string;
   providerName: string;
   status: "ok" | "not-configured" | "unavailable" | "unsupported";
+  balance?: { unit: "tokens" | "usd"; amount: number } | { unit: "unlimited" } | null;
   windows: MinervaUsageWindow[];
   updatedAt: number | null;
   errorCode: null | "auth" | "timeout" | "rate-limited" | "network" | "invalid-response";

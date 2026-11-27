@@ -1,8 +1,8 @@
 //! One frozen selection binds preparation, Rig selection, and dispatch for a step.
 use super::{
-    estimate_message, prepare_step_history, project_message, reasoning,
+    project_message, reasoning,
     routes::{Route, Routes},
-    AgentRunContext, ProviderService, PREAMBLE,
+    step_context, AgentRunContext, ProviderService, PREAMBLE,
 };
 use mh_sessions::RouteSelection;
 use rig_agent::agent::hook::{
@@ -29,6 +29,7 @@ pub(crate) struct FrozenStep {
 pub(crate) type StepState = Arc<Mutex<Option<FrozenStep>>>;
 
 pub(crate) struct SelectionHook {
+    pub compactor: super::step_compaction::StepCompactor,
     pub run: AgentRunContext,
     pub source: ProviderService,
     pub routes: Routes,
@@ -68,32 +69,33 @@ impl AgentHook for SelectionHook {
                 reasoning::validate_target(&route.provider, &route.model)?;
                 reasoning::prepare(&route.provider, &route.model, selection.reasoning_effort.as_deref())?
             };
-            let prepared = self.run.context.prepare_enriched(&self.run.session_id, &self.run.messages).await?;
+            let declared = self.source.declared_window(&route.provider, &route.model);
+            let prepared =
+                self.run.context.prepare_for_model(&self.run.session_id, &self.run.messages, declared).await?;
             let preamble = format!("{}\n{}", PREAMBLE, prepared.system_prompt);
-            let (history, estimated) = prepare_step_history(event.history, event.prompt, &preamble, self.schema_tokens);
-            let spec = route.spec.as_ref();
-            let context_window = spec
-                .as_ref()
-                .and_then(|spec| spec.context_window)
-                .map(|v| v as usize)
-                .map_or(prepared.budget.context_window, |limit| limit.min(prepared.budget.context_window));
-            let input_limit = spec.as_ref().and_then(|spec| spec.input_limit()).map(|limit| limit as usize);
-            if input_limit.is_some_and(|limit| estimated > limit) {
-                return Err("Input exceeds the destination model limit".into());
-            }
-            let available = context_window.saturating_sub(estimated);
-            let output_limit = spec.as_ref().and_then(|spec| spec.max_output_tokens).map(u64::from).unwrap_or(u64::MAX);
-            let output_cap = if let Some(required) = plan.output_cap {
-                if required > available as u64 || required > output_limit {
-                    return Err("Selected reasoning budget does not fit the destination model".into());
-                }
-                required
-            } else {
-                (available as u64).min(super::budget::DEFAULT_OUTPUT_CAP).min(output_limit)
-            };
-            if output_cap < 256 {
-                return Err("Context budget exhausted; compact the conversation".into());
-            }
+            let context_window = prepared.budget.context_window;
+            let input_limit = route.spec.as_ref().and_then(|s| s.input_limit()).map(|n| n as usize);
+            let output_limit = route.spec.as_ref().and_then(|s| s.max_output_tokens).map(u64::from);
+            let view = step_context::project(
+                &self.compactor,
+                &self.source,
+                &self.run,
+                &selection.model,
+                step_context::StepInput {
+                    history: event.history,
+                    prompt: event.prompt,
+                    preamble: &preamble,
+                    tools: self.schema_tokens,
+                },
+                step_context::StepLimits {
+                    window: context_window,
+                    input_limit,
+                    required_output: plan.output_cap,
+                    output_limit,
+                },
+            )
+            .await?;
+            let output_cap = view.output;
             if self.stopped() {
                 return Err("Run cancelled".into());
             }
@@ -106,12 +108,23 @@ impl AgentHook for SelectionHook {
                 input_limit,
                 output_cap,
             });
-            Ok(RequestPatch::new().preamble(preamble).history(history).max_tokens(output_cap))
+            Ok(RequestPatch::new().preamble(preamble).history(view.history).max_tokens(output_cap))
         }
         .await;
         match result {
             Ok(patch) => CompletionCallAction::Patch(patch),
             Err(error) => CompletionCallAction::Stop(error),
+        }
+    }
+    async fn on_model_turn_finished(
+        &self,
+        _: &HookContext,
+        event: rig_agent::agent::hook::ModelTurnFinished<'_>,
+    ) -> rig_agent::agent::hook::ModelTurnAction {
+        use rig_agent::agent::hook::ModelTurnAction;
+        match self.run.context.confirm_request(&self.run.session_id, &self.run.run_id, event.usage.input_tokens) {
+            Ok(()) => ModelTurnAction::Continue,
+            Err(error) => ModelTurnAction::Stop(error),
         }
     }
     fn on_model_select(&self, _: &HookContext, _: ModelSelection<'_>) -> ModelSelectionAction {
@@ -134,7 +147,12 @@ impl AgentHook for SelectionHook {
                 return Err("Route selection belongs to another step".into());
             }
             self.source.validate_route(&step.route).await?;
-            let projected = project_request(request, &step)?;
+            let mut step = step;
+            let mut projected = build_request(request, &step);
+            step.output_cap =
+                step_context::finalize(&self.run, &mut projected, step.input_limit, step.plan.output_cap)?;
+            validate_request(&projected, &step)?;
+            *self.step.lock().map_err(|e| e.to_string())? = Some(step);
             Ok(EffectKind::Completion { request: Arc::new(projected), stream: *stream })
         }
         .await;
@@ -145,15 +163,21 @@ impl AgentHook for SelectionHook {
     }
 }
 
+#[cfg(test)]
 fn project_request(request: &CompletionRequest, step: &FrozenStep) -> Result<CompletionRequest, String> {
+    let projected = build_request(request, step);
+    validate_request(&projected, step)?;
+    Ok(projected)
+}
+
+fn build_request(request: &CompletionRequest, step: &FrozenStep) -> CompletionRequest {
     let mut projected = request.clone();
     projected.chat_history = request.chat_history.iter().map(|message| Arc::new(project_message(message))).collect();
     projected.model = Some(step.route.model.clone());
     projected.options.reasoning = step.plan.typed;
     projected.additional_params = step.plan.additional_params.clone();
     projected.max_tokens = Some(step.output_cap);
-    validate_request(&projected, step)?;
-    Ok(projected)
+    projected
 }
 
 pub(crate) fn validate_request(request: &CompletionRequest, step: &FrozenStep) -> Result<(), String> {
@@ -174,14 +198,8 @@ pub(crate) fn validate_request(request: &CompletionRequest, step: &FrozenStep) -
 }
 
 fn check_budget(request: &CompletionRequest, step: &FrozenStep) -> Result<(), String> {
-    let tokens = request
-        .chat_history
-        .iter()
-        .map(|m| estimate_message(m))
-        .sum::<usize>()
-        .saturating_add(serde_json::to_string(&request.tools).map_err(|e| e.to_string())?.len().div_ceil(3));
-    let tokens =
-        tokens.saturating_add(serde_json::to_string(&request.documents).map_err(|e| e.to_string())?.len().div_ceil(3));
+    let (system, tools, messages) = step_context::wire_counts(request)?;
+    let tokens = system + tools + messages;
     if step.input_limit.is_some_and(|limit| tokens > limit) {
         return Err("Input exceeds the destination model limit".into());
     }

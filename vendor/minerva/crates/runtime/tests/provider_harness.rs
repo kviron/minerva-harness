@@ -23,6 +23,9 @@ fn request(socket: &mut TcpStream) -> Value {
         bytes.extend_from_slice(&buf[..n]);
         if let Some(pos) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
             let header = String::from_utf8_lossy(&bytes[..pos]);
+            if header.starts_with("GET ") {
+                return Value::String(header.lines().next().unwrap().to_owned());
+            }
             let length = header
                 .lines()
                 .find_map(|l| {
@@ -65,6 +68,8 @@ async fn setup(dir: &std::path::Path, address: std::net::SocketAddr) -> Provider
     .unwrap();
     service
         .save(ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: "fixture".into(),
             name: "fixture".into(),
             base_url: format!("http://{address}/v1"),
@@ -350,4 +355,106 @@ async fn cancellation_after_host_tool_return_keeps_actual_result() {
     let native = last.replay["rig-v1"].to_string();
     assert!(native.contains("observed"), "actual host result must survive before Rig settles its batch: {native}");
     assert!(native.contains("effect_1"));
+}
+
+#[tokio::test]
+async fn custom_window_compacts_completed_exchanges_without_repeating_tools() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let wire = std::thread::spawn(move || {
+        let mut steps = 0;
+        let mut summaries = 0;
+        let (mut catalog, _) = listener.accept().unwrap();
+        assert_eq!(request(&mut catalog), "GET /v1/models HTTP/1.1");
+        let metadata = json!({"object":"list","data":[{"id":"test","context_length":3000}]}).to_string();
+        write!(
+            catalog,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            metadata.len(),
+            metadata
+        )
+        .unwrap();
+        drop(catalog);
+        // In-process model with a small window. Long call arguments and modest
+        // results force compaction beyond simply shortening one tool response.
+        loop {
+            let (mut socket, _) = listener.accept().unwrap();
+            let body = request(&mut socket);
+            if body["stream"] != true {
+                assert!(body["tools"].as_array().is_none_or(|tools| tools.is_empty()));
+                assert!(body.to_string().contains("Summarize"));
+                let response = json!({"id":"sum","object":"chat.completion","created":1,"model":"test",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"Completed earlier lookups."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":200,"completion_tokens":5,"total_tokens":205}}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+                summaries += 1;
+                assert!(summaries < 25);
+                continue;
+            }
+            assert!(body.to_string().contains("remember-original-request"));
+            if steps == 6 {
+                assert!(body.to_string().contains("Completed earlier lookups."));
+                sse(&mut socket, vec![chunk(json!({"role":"assistant","content":"finished"}), json!("stop"))]);
+                return summaries;
+            }
+            let args = json!({"key":format!("{}-{steps}", "x".repeat(1550))});
+            sse(
+                &mut socket,
+                vec![chunk(
+                    json!({"role":"assistant","tool_calls":[{"index":0,
+                "id":format!("call-{steps}"),"type":"function","function":{"name":"inspect","arguments":args.to_string()}}]}),
+                    json!("tool_calls"),
+                )],
+            );
+            steps += 1;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let service = setup(dir.path(), address).await;
+    let mut config = json!({"id":"fixture","name":"test","baseUrl":format!("http://{address}/v1"),
+        "protocol":"openai-chat","models":["test"],"isNew":false});
+    let catalog = service.discover_catalog(serde_json::from_value(config.clone()).unwrap()).await.unwrap();
+    assert_eq!(serde_json::to_value(&catalog).unwrap(), json!([{"id":"test", "contextWindow":3000}]));
+    config["modelWindows"] = json!({"test":{"discovered":catalog[0].context_window}});
+    service.save(serde_json::from_value(config).unwrap()).await.unwrap();
+    let context = Arc::new(ContextService::open(&dir.path().join("budget.sqlite")).unwrap());
+    let tools = ToolRegistry::default();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executed = count.clone();
+    tools
+        .register(
+            "test",
+            ToolDefinition {
+                name: "inspect".into(),
+                description: "Inspect fixture".into(),
+                input_schema: json!({"type":"object","properties":{"key":{"type":"string"}}}),
+                output_schema: json!({}),
+                side_effect: false,
+            },
+            move |_, _| {
+                executed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(json!({"value":"verified"})) })
+            },
+        )
+        .unwrap();
+    let transcript = tokio::time::timeout(
+        Duration::from_secs(20),
+        service.chat_agent(
+            "fixture",
+            "test",
+            vec![Turn::plain("user", "remember-original-request")],
+            Arc::new(|_| Ok(())),
+            run(context.clone(), &tools, Cancellation::default()),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(wire.join().unwrap() > 0);
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert_eq!(transcript.parts.iter().filter(|p| p.kind == "tool-call").count(), 6);
+    assert!(transcript.text().contains("finished"));
+    let meter = context.last_request("session").unwrap().unwrap();
+    assert_eq!(meter.window, 3000);
+    assert!(meter.used() < meter.window);
 }

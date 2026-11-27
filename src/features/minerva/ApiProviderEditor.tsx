@@ -58,9 +58,23 @@ export function ApiProviderEditor({
       {error && <p role="alert">{error}</p>}
       <ProviderModels
         models={draft.models}
+        windows={draft.modelWindows}
+        onWindowChange={(model, size) => {
+          const modelWindows = { ...draft.modelWindows };
+          const next = { ...modelWindows[model] };
+          if (size === undefined) delete next.limit;
+          else next.limit = size;
+          if (Object.keys(next).length) modelWindows[model] = next;
+          else delete modelWindows[model];
+          setDraft({ ...draft, modelWindows });
+        }}
         busy={busy}
         onMove={moveModel}
-        onRemove={(index) => setDraft({ ...draft, models: draft.models.filter((_, i) => i !== index) })}
+        onRemove={(index) => {
+          const modelWindows = { ...draft.modelWindows };
+          delete modelWindows[draft.models[index]!];
+          setDraft({ ...draft, modelWindows, models: draft.models.filter((_, i) => i !== index) });
+        }}
       />
       <div className={styles.row}>
         <Input

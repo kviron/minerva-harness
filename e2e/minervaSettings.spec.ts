@@ -91,8 +91,7 @@ for (const theme of ["dark", "light"] as const) {
       .filter({ hasText: "A very long configured" })
       .click();
     await settings.getByRole("textbox", { name: "Provider name", exact: true }).fill("Renamed gateway");
-    await settings.getByRole("tab", { name: "Subscription limits", exact: true }).click();
-    await settings.getByRole("tab", { name: "Settings", exact: true }).click();
+    await expect(settings.getByRole("tab", { name: "Provider limits" })).toHaveCount(0);
     await expect(settings.getByRole("textbox", { name: "Provider name", exact: true })).toHaveValue("Renamed gateway");
     await settings.getByRole("button", { name: "Save", exact: true }).first().click();
     const apiSaves = (await ipcCalls(page, "minerva_call")).filter((call) => call.method === "providers.save");

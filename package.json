@@ -30,6 +30,8 @@
     "dev:app": "node scripts/tauri.ts dev --config src-tauri/tauri.dev.conf.json",
     "dev:status": "node scripts/dev-status.ts",
     "e2e": "playwright test",
+    "verify:delegation": "node scripts/verify-delegation.ts",
+    "preview:windows": "pwsh -NoProfile -File scripts/preview-windows.ps1",
     "perf": "node perf/run.ts",
     "perf:rust": "node perf/rust.ts",
     "eval": "node evals/run.ts",

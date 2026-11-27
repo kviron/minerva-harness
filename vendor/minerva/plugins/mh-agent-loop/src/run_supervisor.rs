@@ -156,6 +156,9 @@ impl AgentLoopService {
         let mut tasks = self.tasks.lock().await;
         tasks.retain(|task| !task.is_finished());
         let created_at = self.sessions.server_timestamp()?;
+        if self.runs.is_compacting(&request.session_id)? {
+            return Err("A context compaction is already running".into());
+        }
         let accepted = match origin {
             RunOrigin::Existing => self.sessions.accept_run(&request, &created_at),
             RunOrigin::User => self.sessions.accept_user_run(&request, &created_at),
@@ -201,6 +204,13 @@ impl AgentLoopService {
             }
         }));
         Ok(handle)
+    }
+    pub async fn reserve_compaction(&self, session: &str, operation: &str) -> Result<crate::runs::RunGuard, String> {
+        let stopped = self.stopped.lock().await;
+        if *stopped {
+            return Err("runtime is stopped".into());
+        }
+        self.runs.reserve_compaction(session, operation)
     }
     pub fn get_run(&self, session: &str, run_id: &str) -> Result<RunSnapshot, String> {
         self.sessions.run_snapshot(session, run_id)

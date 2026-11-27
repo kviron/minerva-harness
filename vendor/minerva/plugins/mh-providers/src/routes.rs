@@ -118,6 +118,7 @@ impl ProviderService {
             .ok_or("The selected provider was removed")?;
         if current.base_url != route.provider.base_url
             || current.protocol != route.provider.protocol
+            || current.model_windows.get(&route.model) != route.provider.model_windows.get(&route.model)
             || !current.models.contains(&route.model)
         {
             return Err("The selected route changed during this run; start a new turn".into());
@@ -163,6 +164,8 @@ mod tests {
         for id in ["first", "second", "keyless"] {
             service
                 .save(ProviderInput {
+                    credit_grants: None,
+                    model_windows: None,
                     id: id.into(),
                     name: id.into(),
                     base_url: "http://127.0.0.1:12345/v1".into(),

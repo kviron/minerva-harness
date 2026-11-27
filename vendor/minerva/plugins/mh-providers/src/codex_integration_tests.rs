@@ -40,6 +40,8 @@ async fn refreshed_removed_codex_route_does_not_block_other_providers() {
     service.codex.models.publish(Vec::new()).unwrap();
     service
         .save(crate::ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: "other".into(),
             name: "Other".into(),
             base_url: "http://127.0.0.1:12345/v1".into(),
@@ -79,6 +81,8 @@ async fn live_subscription_generates_nonce_without_tools_or_history() {
     );
     assert!(service.codex.models().iter().any(|id| id == "gpt-6.2-sol"));
     service.providers.lock().await.push(crate::Provider {
+        credit_grants: None,
+        model_windows: Default::default(),
         id: ID.into(),
         name: "Codex".into(),
         base_url: BASE_URL.into(),
@@ -202,7 +206,7 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
         }
     }
     let http = SequencedHttpClient::new([
-        MockHttpResponse::success_typed(json!({"models":[{"slug":"gpt-6.2-astra","visibility":"list","context_window":400000,"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]}]}).to_string(), "application/json"),
+        MockHttpResponse::success_typed(json!({"models":[{"slug":"gpt-6.2-astra","visibility":"list","context_window":500000,"effective_context_window_percent":95,"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]}]}).to_string(), "application/json"),
         response(
             json!([{"type":"function_call","id":"fixture-item","call_id":"fixture-call","name":"inspect","arguments":"{}","status":"completed"}]),
         ),
@@ -231,7 +235,7 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
     service.codex.http = DynHttpClient::new(http.clone());
     assert_eq!(service.codex.discover_models().await.unwrap(), vec!["gpt-6.2-astra"]);
     service.codex_configure(vec!["gpt-6.2-astra".into()]).await.unwrap();
-    assert_eq!(service.codex.model_spec("gpt-6.2-astra").unwrap().context_window, Some(400000));
+    assert_eq!(service.codex.model_spec("gpt-6.2-astra").unwrap().context_window, Some(475000));
     let public = serde_json::to_value(service.list().await).unwrap();
     assert!(public[0]["reasoning"]["gpt-6.2-astra"].as_array().unwrap().contains(&json!("ultra")));
     let tools = ToolRegistry::default();
@@ -255,6 +259,7 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
         )
         .unwrap();
     let control = Arc::new(Control(std::sync::Mutex::new(Vec::new())));
+    let context = Arc::new(crate::context::ContextService::open(&dir.path().join("context.sqlite")).unwrap());
     let run = AgentRunContext {
         session_id: "session".into(),
         run_id: "run".into(),
@@ -272,7 +277,7 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
             interactions: Arc::new(InteractionBroker::default()),
             sink: None,
         },
-        context: Arc::new(crate::context::ContextService::open(&dir.path().join("context.sqlite")).unwrap()),
+        context: context.clone(),
         messages: Vec::new(),
         reasoning_effort: Some("ultra".into()),
         selection: Some(control.clone()),
@@ -283,6 +288,9 @@ async fn provider_service_routes_signed_in_calls_through_admission_and_host_tool
         .await
         .unwrap();
     assert!(result.text().contains("done"));
+    let reported = context.last_request("session").unwrap().unwrap();
+    assert_eq!(reported.window, 475000);
+    assert_eq!(reported.observed_input, Some(1));
     assert_eq!(control.0.lock().unwrap().len(), 2);
     let requests = http.requests();
     assert_eq!(requests.len(), 3);

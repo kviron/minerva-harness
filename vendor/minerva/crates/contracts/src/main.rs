@@ -39,6 +39,8 @@ fn main() {
         RunRequest,
         SessionRunResult,
         Provider,
+        model_window::CatalogModel,
+        model_window::ModelWindow,
         ProviderView,
         ProviderInput,
         PluginInfo,

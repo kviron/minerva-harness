@@ -42,6 +42,7 @@ export function SessionPanel({ sessionId }: { sessionId: string }) {
           settings: {
             ...current,
             contextWindow: settings.contextWindow,
+            contextWindowExplicit: settings.contextWindowExplicit,
             autoCompact: settings.autoCompact,
           },
         }),
@@ -74,7 +75,7 @@ export function SessionPanel({ sessionId }: { sessionId: string }) {
               max={2097152}
               disabled={busy}
               value={settings.contextWindow}
-              onChange={(event) => edit({ ...settings, contextWindow: Number(event.target.value) })}
+              onChange={(event) => edit({ ...settings, contextWindow: Number(event.target.value), contextWindowExplicit: true })}
             />
             <span className="ds-field-hint">
               От 1 024 до 2 097 152. Должно соответствовать выбранной модели.

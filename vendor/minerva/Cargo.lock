@@ -2917,6 +2917,7 @@ dependencies = [
  "minerva-plugin-sdk",
  "rig-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

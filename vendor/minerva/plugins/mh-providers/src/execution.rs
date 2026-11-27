@@ -9,6 +9,7 @@ impl ProviderService {
         messages: Vec<Turn>,
         sink: crate::transcript::TranscriptSink,
         run: Option<ProviderRunContext>,
+        response_cap: Option<u64>,
     ) -> Result<crate::transcript::Transcript, String> {
         let (provider, key) = {
             let providers = self.providers.lock().await;
@@ -50,7 +51,15 @@ impl ProviderService {
             run.tool_context.sink = Some(Arc::new(hook.clone()));
             dynamic_tools = run.tools.rig_tools(run.tool_context.clone());
             identity_hook = run.tools.identity_hook();
+            let spec = self.model_spec(&provider, model);
             step_hook = Some(ProviderStepHook {
+                compactor: Default::default(),
+                source: self.clone(),
+                model: format!("api:{id}/{model}"),
+                window: self.declared_window(&provider, model),
+                input_limit: spec.as_ref().and_then(|s| s.input_limit()).map(|v| v as usize),
+                output_limit: spec.as_ref().and_then(|s| s.max_output_tokens).map(u64::from),
+                required_output: None,
                 followups: followups::StepFollowups::new(run.followups.clone()),
                 history: hook.clone(),
                 schema_tokens: serde_json::to_string(&run.tools.definitions())
@@ -67,6 +76,7 @@ impl ProviderService {
         let routing_hook = match (step_hook.take(), routes.as_ref()) {
             (Some(hook), Some(routes)) => Some(selection_hook::SelectionHook {
                 run: hook.run,
+                compactor: hook.compactor,
                 source: self.clone(),
                 routes: routes.clone(),
                 step: step.clone(),
@@ -87,7 +97,10 @@ impl ProviderService {
                 None => reasoning::prepare(&provider, model, reasoning_effort.as_deref())?,
             }
         };
-        let budget_cap = reasoning.output_cap;
+        let budget_cap = response_cap.or(reasoning.output_cap);
+        if let Some(hook) = &mut step_hook {
+            hook.required_output = budget_cap;
+        }
         macro_rules! run_agent {
             ($model:expr) => {{
                 let builder = AgentBuilder::new($model).preamble(PREAMBLE).dynamic_tools(dynamic_tools);

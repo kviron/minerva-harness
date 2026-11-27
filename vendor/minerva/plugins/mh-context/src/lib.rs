@@ -4,6 +4,7 @@ pub use mh_tool_runtime as tools;
 pub mod contributions;
 mod files;
 mod images;
+pub mod meter;
 pub mod skill_provider;
 use crate::sessions::{SessionMessage, Turn};
 pub use minerva_plugin_sdk::context::*;
@@ -56,7 +57,16 @@ impl ContextService {
         session: &str,
         messages: &[SessionMessage],
     ) -> Result<PreparedContext, String> {
-        let mut prepared = self.prepare(session, messages)?;
+        self.prepare_for_model(session, messages, None).await
+    }
+    pub async fn prepare_for_model(
+        &self,
+        session: &str,
+        messages: &[SessionMessage],
+        model_window: Option<usize>,
+    ) -> Result<PreparedContext, String> {
+        let settings = self.workspace_get(session)?;
+        let mut prepared = self.prepare_with_settings(session, messages, &settings, model_window)?;
         if self.frozen_context(session)?.is_some() {
             return Ok(prepared);
         }
@@ -106,6 +116,8 @@ impl ContextService {
             let extra = estimate_tokens(&prepared.system_prompt).saturating_sub(original_tokens);
             prepared.budget.estimated_tokens = prepared.budget.estimated_tokens.saturating_add(extra);
             prepared.budget.available_tokens = prepared.budget.available_tokens.saturating_sub(extra);
+            prepared.budget.should_compact = settings.auto_compact
+                && prepared.budget.estimated_tokens >= meter::pressure_threshold(prepared.budget.context_window);
         }
         Ok(prepared)
     }
@@ -116,6 +128,7 @@ impl ContextService {
         let db = Connection::open(path).map_err(|e| e.to_string())?;
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
         db.execute_batch("PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS request_meter(session TEXT PRIMARY KEY, report TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workspace (session TEXT PRIMARY KEY, settings TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS selected_skills (session TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(session,name));
             CREATE TABLE IF NOT EXISTS image_generator_choice (session TEXT PRIMARY KEY, generator TEXT NOT NULL);
@@ -246,7 +259,16 @@ impl ContextService {
             .map_err(|e| e.to_string())
     }
     pub fn prepare(&self, session: &str, messages: &[SessionMessage]) -> Result<PreparedContext, String> {
-        let settings = self.workspace_get(session)?;
+        self.prepare_with_settings(session, messages, &self.workspace_get(session)?, None)
+    }
+    fn prepare_with_settings(
+        &self,
+        session: &str,
+        messages: &[SessionMessage],
+        settings: &WorkspaceSettings,
+        model_window: Option<usize>,
+    ) -> Result<PreparedContext, String> {
+        let window = settings.effective_window(model_window);
         let frozen = self.frozen_context(session)?;
         let mut system_prompt = frozen.clone().unwrap_or_else(|| {
             "You are Minerva, a helpful assistant. Follow the user request and use the available tools when needed."
@@ -319,22 +341,9 @@ impl ContextService {
             }
         }
         let mut start = 0;
-        let saved: Option<(String, String)> = self
-            .db()?
-            .query_row("SELECT prefix, summary FROM summaries WHERE session=?1", [session], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if let Some((prefix, summary)) = saved {
-            let anchored: Vec<SessionMessage> = serde_json::from_str(&prefix).map_err(|e| e.to_string())?;
-            if anchored.len() <= messages.len()
-                && serde_json::to_string(&messages[..anchored.len()]).map_err(|e| e.to_string())? == prefix
-            {
-                let summary: ContextSummary = serde_json::from_str(&summary).map_err(|e| e.to_string())?;
-                system_prompt.push_str(&format!("\nSummary of earlier conversation:\n{}\n", summary.text));
-                start = anchored.len();
-            }
+        if let Some(summary) = self.anchored_summary(session, messages)? {
+            system_prompt.push_str(&format!("\nSummary of earlier conversation:\n{}\n", summary.text));
+            start = summary.prefix_message_ids.len();
         }
         let mut turns = Vec::new();
         for message in &messages[start..] {
@@ -371,13 +380,36 @@ impl ContextService {
         }
         let estimated_tokens = estimate_tokens(&system_prompt) + turns.iter().map(estimate_turn).sum::<usize>();
         let budget = ContextBudget {
-            context_window: settings.context_window,
+            context_window: window,
             estimated_tokens,
-            available_tokens: settings.context_window.saturating_sub(estimated_tokens),
-            should_compact: settings.auto_compact && estimated_tokens > settings.context_window.saturating_mul(4) / 5,
+            available_tokens: window.saturating_sub(estimated_tokens),
+            should_compact: settings.auto_compact && estimated_tokens >= meter::pressure_threshold(window),
             usage: latest_usage(messages),
         };
         Ok(PreparedContext { system_prompt, turns, budget, skills })
+    }
+    pub fn anchored_summary(
+        &self,
+        session: &str,
+        messages: &[SessionMessage],
+    ) -> Result<Option<ContextSummary>, String> {
+        let saved: Option<(String, String)> = self
+            .db()?
+            .query_row("SELECT prefix, summary FROM summaries WHERE session=?1", [session], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some((prefix, summary)) = saved {
+            let anchored: Vec<SessionMessage> = serde_json::from_str(&prefix).map_err(|e| e.to_string())?;
+            if anchored.len() <= messages.len()
+                && serde_json::to_string(&messages[..anchored.len()]).map_err(|e| e.to_string())? == prefix
+            {
+                let summary: ContextSummary = serde_json::from_str(&summary).map_err(|e| e.to_string())?;
+                return Ok(Some(summary));
+            }
+        }
+        Ok(None)
     }
     pub fn save_summary(&self, session: &str, prefix: &[SessionMessage], text: &str) -> Result<ContextSummary, String> {
         valid_id(session)?;
@@ -393,12 +425,16 @@ impl ContextService {
                 .as_millis()
                 .to_string(),
         };
-        self.db()?.execute("INSERT INTO summaries VALUES (?1,?2,?3) ON CONFLICT(session) DO UPDATE SET prefix=excluded.prefix, summary=excluded.summary",params![session,serde_json::to_string(prefix).map_err(|e|e.to_string())?,serde_json::to_string(&summary).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        let mut db = self.db()?;
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO summaries VALUES (?1,?2,?3) ON CONFLICT(session) DO UPDATE SET prefix=excluded.prefix, summary=excluded.summary",params![session,serde_json::to_string(prefix).map_err(|e|e.to_string())?,serde_json::to_string(&summary).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        tx.execute("DELETE FROM request_meter WHERE session=?1", [session]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(summary)
     }
 }
 
-fn latest_usage(messages: &[SessionMessage]) -> Option<TokenUsage> {
+pub fn latest_usage(messages: &[SessionMessage]) -> Option<TokenUsage> {
     let values = messages
         .iter()
         .rev()
@@ -495,6 +531,25 @@ pub fn compact_prefix(messages: &[SessionMessage], keep_recent: usize) -> Vec<Se
         }
     }
     Vec::new()
+}
+
+/// Choose a complete prefix while retaining roughly a sixth of the model window.
+pub fn summary_prefix(messages: &[SessionMessage], window: usize) -> &[SessionMessage] {
+    let mut tail_tokens = 0;
+    let mut smallest = 0;
+    for end in (1..=messages.len()).rev() {
+        if (end == messages.len() || messages[end].role == "user")
+            && messages[end - 1].role == "assistant"
+            && complete_prefix(&messages[..end])
+        {
+            if tail_tokens >= window / 6 {
+                return &messages[..end];
+            }
+            smallest = end;
+        }
+        tail_tokens += messages[end - 1].parts.iter().map(|p| estimate_tokens(&p.data.to_string())).sum::<usize>();
+    }
+    &messages[..smallest]
 }
 
 fn complete_prefix(messages: &[SessionMessage]) -> bool {

@@ -11,7 +11,7 @@ const channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastCh
 let mutations = 0;
 let generation = 0;
 let accountState: string | undefined;
-const routes = new Map<string, { baseUrl: string; protocol: string }>();
+const routes = new Map<string, { baseUrl: string; protocol: string; creditGrants: boolean }>();
 
 useRemote.subscribe((state, previous) => {
   if (state.session === previous.session && state.lost === previous.lost) return;
@@ -45,6 +45,7 @@ function mutationKind(method: string, params: Record<string, unknown>): MinervaC
     (typeof params.apiKey === "string" && params.apiKey.trim()) ||
     !route ||
     route.baseUrl !== params.baseUrl ||
+    (typeof params.creditGrants === "boolean" && route.creditGrants !== params.creditGrants) ||
     route.protocol !== params.protocol
     ? "credentials"
     : "catalog";
@@ -62,7 +63,11 @@ function observeResult(method: string, result: unknown) {
         typeof provider.baseUrl === "string" &&
         typeof provider.protocol === "string"
       )
-        routes.set(provider.id, { baseUrl: provider.baseUrl, protocol: provider.protocol });
+        routes.set(provider.id, {
+          baseUrl: provider.baseUrl,
+          protocol: provider.protocol,
+          creditGrants: provider.creditGrants === true,
+        });
     }
   }
   if (method === "codex.status" || method === "codex.signIn" || method === "codex.signOut") {

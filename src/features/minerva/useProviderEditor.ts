@@ -1,18 +1,29 @@
 import { useState } from "react";
-import { minervaCall, type MinervaProvider } from "@/platform/minerva";
-const blank = { id: "", name: "", baseUrl: "", protocol: "openai-chat", models: [] as string[], apiKey: "" };
+import { minervaCall, type CatalogModel, type MinervaProvider } from "@/platform/minerva";
+import type { ProviderDraft } from "./providerDraft";
+const blank: ProviderDraft = {
+  id: "",
+  name: "",
+  baseUrl: "",
+  protocol: "openai-chat",
+  models: [],
+  modelWindows: {},
+  apiKey: "",
+};
 export function useProviderEditor(provider: MinervaProvider | null) {
   const initial = provider
     ? {
+        ...(provider.creditGrants ? { creditGrants: true } : {}),
         id: provider.id,
         name: provider.name,
         baseUrl: provider.baseUrl,
         protocol: provider.protocol,
         models: provider.models,
+        modelWindows: provider.modelWindows ?? {},
         apiKey: "",
       }
     : blank;
-  const [draft, setDraft] = useState(initial);
+  const [draft, setDraft] = useState<ProviderDraft>(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [fetching, setFetching] = useState(false);
@@ -38,8 +49,20 @@ export function useProviderEditor(provider: MinervaProvider | null) {
     action(async () => {
       setFetching(true);
       try {
-        const models = await minervaCall<string[]>("providers.discover", input);
-        setDraft({ ...draft, models: [...new Set(models)] });
+        const catalog = await minervaCall<CatalogModel[]>("providers.catalog", input);
+        const models = [...new Set(catalog.map((row) => row.id))];
+        const modelWindows = Object.fromEntries(
+          catalog.flatMap((row) => {
+            const discovered = row.contextWindow;
+            const limit = draft.modelWindows[row.id]?.limit;
+            const window = {
+              ...(discovered ? { discovered } : {}),
+              ...(limit === undefined ? {} : { limit }),
+            };
+            return Object.keys(window).length ? [[row.id, window]] : [];
+          }),
+        );
+        setDraft({ ...draft, models, modelWindows });
       } finally {
         setFetching(false);
       }

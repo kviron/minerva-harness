@@ -1,4 +1,5 @@
 //! Embedded model/API engine. Uses the same in-process event normalization as native drivers.
+mod context;
 mod delegation;
 mod jobs;
 #[cfg(test)]
@@ -94,6 +95,7 @@ struct Engine {
 
 #[derive(Clone)]
 struct ActiveRun {
+    compact: bool,
     id: String,
     cancelled: Arc<AtomicBool>,
 }
@@ -166,11 +168,16 @@ impl Engine {
     async fn handle(&self, method: &str, params: Value) -> Result<Value, String> {
         if method == "initialize" {
             return Ok(
-                json!({"protocolVersion":1,"agentInfo":{"name":"minerva","title":"Minerva","version":env!("CARGO_PKG_VERSION")},"authMethods":[],"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"embeddedContext":true},"_meta":{"openidea":{"backgroundTasks":true}}}}),
+                json!({"protocolVersion":1,"agentInfo":{"name":"minerva","title":"Minerva","version":env!("CARGO_PKG_VERSION")},"authMethods":[],"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"embeddedContext":true},"_meta":{"openidea":{"backgroundTasks":true,"contextUsage":true}}}}),
             );
         }
         let runtime = self.service.runtime().await?;
         match method {
+            "_openidea/context_usage" => {
+                let id = string(&params, "sessionId")?;
+                self.check_session(&runtime, id).await?;
+                self.context_details(&runtime, id).await
+            }
             "_minerva/config" => {
                 let (models, levels) = self.catalog(&runtime).await?;
                 let options = Self::options(models, &levels, params["model"].as_str(), &Value::Null);
@@ -189,6 +196,8 @@ impl Engine {
                 if !model.is_empty() {
                     runtime.sessions.request_selection(&id, model, None)?;
                 }
+                self.compact_command(&id)?;
+                self.publish_context(&runtime, &id).await;
                 self.watch_jobs(&runtime, &id)?;
                 if let Err(error) = self.watch_delegation(&runtime, &id) {
                     tracing::warn!(%error, "Could not observe Minerva delegates");
@@ -227,6 +236,8 @@ impl Engine {
                     }
                 }
                 let options = self.session_options(&runtime, id).await?;
+                self.compact_command(id)?;
+                self.publish_context(&runtime, id).await;
                 self.watch_jobs(&runtime, id)?;
                 if let Err(error) = self.watch_delegation(&runtime, id) {
                     tracing::warn!(%error, "Could not observe Minerva delegates");
@@ -345,7 +356,10 @@ impl Engine {
                 let id = string(&params, "sessionId")?;
                 self.check_session(&runtime, id).await?;
                 match string(&params, "configId")? {
-                    "model" => self.select_model(&runtime, id, string(&params, "value")?).await?,
+                    "model" => {
+                        self.select_model(&runtime, id, string(&params, "value")?).await?;
+                        self.publish_context(&runtime, id).await;
+                    }
                     "reasoning_effort" => self.select_effort(&runtime, id, string(&params, "value")?).await?,
                     "mode" => {
                         let policy = string(&params, "value")?;
@@ -395,6 +409,8 @@ impl Engine {
         }
         let (model, effort) = self.prompt_selection(&runtime, id).await?;
         let content = params["prompt"].as_array().ok_or("Missing prompt")?;
+        let compact = matches!(content.as_slice(), [block] if block["type"] == "text"
+            && block["text"].as_str().is_some_and(|s| s.trim() == "/compact"));
         let mut text = String::new();
         let mut attachments = Vec::new();
         for block in content {
@@ -426,7 +442,7 @@ impl Engine {
         if let Some(effort) = effort {
             options["reasoningEffort"] = effort;
         }
-        let active = ActiveRun { id: run.clone(), cancelled: Arc::new(AtomicBool::new(false)) };
+        let active = ActiveRun { compact, id: run.clone(), cancelled: Arc::new(AtomicBool::new(false)) };
         {
             let mut runs = self.runs.lock();
             if runs.contains_key(id) {
@@ -451,7 +467,11 @@ impl Engine {
             options,
         };
         let checkout_lease = lease.map(|lease| Arc::new(lease) as Arc<dyn CheckoutWriteLease>);
-        let mut result = self.run_prompt(&runtime, &active, request, checkout_lease).await;
+        let mut result = if compact {
+            self.run_compact(&runtime, id, &active).await
+        } else {
+            self.run_prompt(&runtime, &active, request, checkout_lease).await
+        };
         if result.is_err() {
             let _ = runtime.cancel_run(id, &run);
         }
@@ -485,6 +505,7 @@ impl Engine {
         let baseline = runtime.sessions.baseline(id)?;
         request.parent_id = baseline.messages.last().map(|m| m.id.clone());
         runtime.start_native_api_run(request, checkout_lease).await?;
+        let mut last_measure = None;
         let mut rendered = HashMap::<usize, String>::new();
         let mut tools = HashMap::<String, Value>::new();
         loop {
@@ -524,6 +545,15 @@ impl Engine {
                     }
                     _ => {}
                 }
+            }
+            if let Some(report) = runtime.plugins.harness.context.last_request(id)?
+                && report.head == run
+                && last_measure.as_ref() != Some(&report)
+            {
+                if runtime.sessions.selection(id)?.is_none_or(|s| s.model == report.model) {
+                    self.usage_update(id, &report)?;
+                }
+                last_measure = Some(report);
             }
             if snapshot.status != "running" {
                 if let Some(error) = snapshot.error {
@@ -666,10 +696,15 @@ impl Handler for Engine {
                 let service = self.service.clone();
                 let id = id.to_owned();
                 self.runtime.spawn(async move {
-                    if let Ok(runtime) = service.runtime().await
-                        && let Err(error) = runtime.stop_native_run(&id, &run.id)
-                    {
-                        tracing::warn!(%error, "Could not persist Minerva user stop");
+                    if let Ok(runtime) = service.runtime().await {
+                        let stopped = if run.compact {
+                            runtime.cancel_run(&id, &run.id)
+                        } else {
+                            runtime.stop_native_run(&id, &run.id)
+                        };
+                        if let Err(error) = stopped {
+                            tracing::warn!(%error, "Could not persist Minerva user stop");
+                        }
                     }
                 });
             } else if self.cancel_delegated(id) {

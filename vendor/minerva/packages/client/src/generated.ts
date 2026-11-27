@@ -16,19 +16,25 @@ export type RunHandle = { sessionId: string, runId: string, };
 export type RunSnapshot = { sessionId: string, runId: string, status: string, parts: Array<ContentPart>, error: string | null, };
 export type RunRequest = { model: string, lastMessageId: string, responseId: string, createdAt: string, options: JsonValue, };
 export type SessionRunResult = { parts: Array<ContentPart>, };
-export type ProviderConfig = { id: string, name: string, baseUrl: string, models: Array<string>, protocol: string, };
+export type ProviderConfig = { creditGrants?: boolean, modelWindows?: { [key in string]: ModelWindow }, id: string, name: string, baseUrl: string, models: Array<string>, protocol: string, };
+export type CatalogModel = { id: string, contextWindow?: number, };
+export type ModelWindow = { discovered?: number, limit?: number, };
 export type ProviderView = { hasKey: boolean,
 /**
  * Per model, the reasoning settings a picker offers (`default`, `off`, effort levels),
  * as DeepSeek Harness exposes `reasoning.efforts`; absent for models without controls.
  */
-reasoning: { [key in string]: Array<string> }, id: string, name: string, baseUrl: string, models: Array<string>, protocol: string, };
-export type ProviderInput = { id: string, name: string, baseUrl: string, models: Array<string>, apiKey: string | null, isNew: boolean, protocol: string, };
+reasoning: { [key in string]: Array<string> }, creditGrants?: boolean, modelWindows?: { [key in string]: ModelWindow }, id: string, name: string, baseUrl: string, models: Array<string>, protocol: string, };
+export type ProviderInput = { creditGrants?: boolean, modelWindows?: { [key in string]: ModelWindow }, id: string, name: string, baseUrl: string, models: Array<string>, apiKey: string | null, isNew: boolean, protocol: string, };
 export type PluginInfo = { id: string, name: string, description: string, enabled: boolean, requestedEnabled: boolean, optionalEnabled: boolean, canToggle: boolean, origin: string, hasUi: boolean, error: string | null, };
 export type PluginModel = { id: string, name: string, group: string, isDefault: boolean, };
 export type ShellSettings = { timeoutMs: number, maxOutputBytes: number, };
 export type ShellResult = { exitCode: number | null, timedOut: boolean, stdout: string, stderr: string, stdoutFile: string | null, stderrFile: string | null, };
-export type WorkspaceSettings = { cwd: string | null, permissionPolicy: PermissionPolicy, contextWindow: number, autoCompact: boolean, modelEffort?: [string, string], };
+export type WorkspaceSettings = { cwd: string | null, permissionPolicy: PermissionPolicy, contextWindow: number,
+/**
+ * Old profiles stored the default as a number, even when no cap was chosen.
+ */
+contextWindowExplicit?: boolean, autoCompact: boolean, modelEffort?: [string, string], };
 export type WorkspaceInfo = { id: string, title: string, path: string | null, sessionIds: Array<string>, missing: boolean, pinnedSessionIds: Array<string>, archivedSessionIds: Array<string>, };
 export type SkillInfo = { name: string, description: string, };
 export type ContextBudget = { contextWindow: number, estimatedTokens: number, availableTokens: number, shouldCompact: boolean, usage?: TokenUsage, };

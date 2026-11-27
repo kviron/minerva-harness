@@ -1,3 +1,4 @@
+import type { ModelWindow } from "@/platform/minerva";
 import { useState } from "react";
 import { Icon, IconButton } from "@/ui";
 import { tx } from "@/platform/i18n";
@@ -7,9 +8,13 @@ export function ProviderModels({
   busy,
   onMove,
   onRemove,
+  windows,
+  onWindowChange,
   label = "Models",
 }: {
   label?: string;
+  windows?: Record<string, ModelWindow>;
+  onWindowChange?: (model: string, value: number | undefined) => void;
   models: string[];
   busy: boolean;
   onMove: (from: number, to: number) => void;
@@ -45,6 +50,24 @@ export function ProviderModels({
             <Icon name="main-menu" size={14} />
           </span>
           <span className={styles.modelId}>{model}</span>
+          {onWindowChange && (
+            <label className={styles.windowField}>
+              {tx("Context window")}
+              <input
+                aria-label={tx("Context window") + " · " + model}
+                type="number"
+                min={1024}
+                max={4_294_967_295}
+                step={1}
+                disabled={busy}
+                placeholder={String(windows?.[model]?.discovered ?? tx("Auto"))}
+                value={windows?.[model]?.limit ?? ""}
+                onChange={(event) =>
+                  onWindowChange(model, event.target.value === "" ? undefined : event.target.valueAsNumber)
+                }
+              />
+            </label>
+          )}
           <IconButton
             icon="chevron-up"
             title="Move model up"

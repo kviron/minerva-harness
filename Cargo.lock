@@ -6132,6 +6132,7 @@ dependencies = [
  "mh-tool-runtime",
  "minerva-plugin-sdk",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
 ]

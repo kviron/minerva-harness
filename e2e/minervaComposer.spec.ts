@@ -139,8 +139,8 @@ for (const providerId of ["minerva", "minerva.api.old"]) {
     );
     const box = page.getByRole("textbox", { name: "Message", exact: true }).filter({ visible: true });
     await expect(box).toBeVisible();
-    const usageTrigger = page.getByRole("button", { name: "Subscription limits", exact: true });
-    await expect(usageTrigger).toHaveText("0%");
+    const usageTrigger = page.getByRole("button", { name: "Provider limits", exact: true });
+    await expect(usageTrigger).toHaveText("100% remaining");
     expect((await ipcCalls(page, "minerva_call")).filter((call) => call.method === "usage.list")).toHaveLength(1);
     const workTimer = page.locator('[title="Time the agent spent on this task"]');
     await expect(workTimer).toHaveText("56s");
@@ -153,7 +153,7 @@ for (const providerId of ["minerva", "minerva.api.old"]) {
           return range.getBoundingClientRect().top;
         };
         const timer = document.querySelector('[title="Time the agent spent on this task"]')!;
-        const quota = document.querySelector('[aria-label="Subscription limits"][aria-haspopup="dialog"]')!;
+        const quota = document.querySelector('[aria-label="Provider limits"][aria-haspopup="dialog"]')!;
         return Math.abs(top(timer) - top(quota));
       });
       console.log(JSON.stringify({ providerId, width, textBaselineDelta: delta }));
@@ -164,9 +164,9 @@ for (const providerId of ["minerva", "minerva.api.old"]) {
       });
     }
     await page.setViewportSize({ width: 1400, height: 900 });
-    await page.getByRole("button", { name: "Subscription limits", exact: true }).click();
-    const limits = page.getByRole("dialog", { name: "Subscription limits", exact: true });
-    await expect(limits.getByText("0% used", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Provider limits", exact: true }).click();
+    const limits = page.getByRole("dialog", { name: "Provider limits", exact: true });
+    await expect(limits.getByText("100% remaining", { exact: true })).toBeVisible();
     await expect(limits.getByRole("article", { name: "Codex", exact: true })).toHaveCount(0);
     await page.screenshot({
       path: `output/minerva-usage-review/chat-limits-${providerId}.png`,
@@ -182,8 +182,8 @@ for (const providerId of ["minerva", "minerva.api.old"]) {
     const callsBeforeReopen = (await ipcCalls(page, "minerva_call")).filter(
       (call) => call.method === "usage.list",
     ).length;
-    await page.getByRole("button", { name: "Subscription limits", exact: true }).click();
-    await expect(limits.getByText("0% used", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Provider limits", exact: true }).click();
+    await expect(limits.getByText("100% remaining", { exact: true })).toBeVisible();
     await expect(limits.getByRole("article", { name: "Codex", exact: true })).toHaveCount(0);
     expect((await ipcCalls(page, "minerva_call")).filter((call) => call.method === "usage.list")).toHaveLength(
       callsBeforeReopen,
@@ -232,9 +232,9 @@ for (const providerId of ["minerva", "minerva.api.old"]) {
       page.getByRole("listbox", { name: "Model", exact: true }).getByText("Pinned", { exact: true }),
     ).toHaveCount(0);
     await page.getByRole("option", { name: /^Astra(?: Pin model)?$/ }).click();
-    await expect(usageTrigger).toHaveText("56%");
+    await expect(usageTrigger).toHaveText("44% remaining");
     await usageTrigger.click();
-    await expect(limits.getByText("56% used", { exact: true })).toBeVisible();
+    await expect(limits.getByText("44% remaining", { exact: true })).toBeVisible();
     await expect(limits.getByRole("article", { name: "OpenCode Go", exact: true })).toHaveCount(0);
     await page.screenshot({
       path: `output/minerva-usage-review/selected-codex-${providerId}.png`,
@@ -250,7 +250,7 @@ for (const providerId of ["minerva", "minerva.api.old"]) {
     await page.screenshot({ path: info.outputPath("same-chat-codex.png"), animations: "disabled" });
     await page.getByRole("button", { name: "Model", exact: true }).click();
     await page.getByRole("option", { name: /DeepSeek/ }).click();
-    await expect(usageTrigger).toHaveText("0%");
+    await expect(usageTrigger).toHaveText("100% remaining");
     expect(await ipcCalls(page, "agent_set_config")).toEqual([
       { task: task.id, option: "model", value: "api:openai-codex/gpt-6.2-astra" },
       { task: task.id, option: "model", value: "api:gateway/deepseek" },

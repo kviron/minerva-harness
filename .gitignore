@@ -38,6 +38,11 @@ AGENTS.md
 CLAUDE.md
 CLAUDE.local.md
 .agents/
+!/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/minerva-acceptance/
 .claude/
 
 # Local reference screenshots

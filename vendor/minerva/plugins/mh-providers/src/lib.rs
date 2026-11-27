@@ -8,6 +8,7 @@ mod budget;
 pub mod codex;
 mod execution;
 mod followups;
+pub mod model_window;
 mod reasoning;
 mod route_handler;
 mod routes;
@@ -15,6 +16,8 @@ mod selection;
 mod selection_hook;
 #[cfg(test)]
 mod selection_tests;
+mod step_compaction;
+mod step_context;
 mod timeout;
 pub mod usage;
 pub use selection::SelectionControl;
@@ -35,6 +38,11 @@ use tokio::sync::Mutex;
 #[derive(ts_rs::TS)]
 #[ts(rename = "ProviderConfig")]
 pub struct Provider {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub credit_grants: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_windows: std::collections::BTreeMap<String, model_window::ModelWindow>,
     pub id: String,
     pub name: String,
     pub base_url: String,
@@ -375,6 +383,12 @@ fn reasoning_choices(provider: &Provider, model: &str) -> Vec<String> {
 #[serde(rename_all = "camelCase")]
 #[derive(ts_rs::TS)]
 pub struct ProviderInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub credit_grants: Option<bool>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub model_windows: Option<std::collections::BTreeMap<String, model_window::ModelWindow>>,
     pub id: String,
     pub name: String,
     pub base_url: String,
@@ -409,8 +423,15 @@ pub trait FollowupControl: Send + Sync {
 
 pub type ProviderRunContext = AgentRunContext;
 struct ProviderStepHook {
+    compactor: step_compaction::StepCompactor,
+    source: ProviderService,
     run: ProviderRunContext,
     schema_tokens: usize,
+    model: String,
+    window: Option<usize>,
+    input_limit: Option<usize>,
+    output_limit: Option<u64>,
+    required_output: Option<u64>,
     followups: followups::StepFollowups,
     history: rig_history::HistoryHook,
 }
@@ -428,37 +449,58 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
             Ok(barrier) => barrier,
             Err(error) => return CompletionCallAction::Stop(error),
         };
-        let prepared = match self.run.context.prepare_enriched(&self.run.session_id, &self.run.messages).await {
-            Ok(value) => value,
-            Err(error) => return CompletionCallAction::Stop(error),
-        };
+        let prepared =
+            match self.run.context.prepare_for_model(&self.run.session_id, &self.run.messages, self.window).await {
+                Ok(value) => value,
+                Err(error) => return CompletionCallAction::Stop(error),
+            };
         let preamble = format!("{}\n{}", PREAMBLE, prepared.system_prompt);
         let (history, pending) = match self.followups.prepare(event.history) {
             Ok(value) => value,
             Err(error) => return CompletionCallAction::Stop(error),
         };
-        let (history, estimated) = prepare_step_history(&history, event.prompt, &preamble, self.schema_tokens);
-        let available = prepared.budget.context_window.saturating_sub(estimated);
-        if available < 256 {
-            return CompletionCallAction::Stop("Context budget exhausted; compact the conversation".into());
-        }
+        let view = match step_context::project(
+            &self.compactor,
+            &self.source,
+            &self.run,
+            &self.model,
+            step_context::StepInput {
+                history: &history,
+                prompt: event.prompt,
+                preamble: &preamble,
+                tools: self.schema_tokens,
+            },
+            step_context::StepLimits {
+                window: prepared.budget.context_window,
+                input_limit: self.input_limit,
+                required_output: self.required_output,
+                output_limit: self.output_limit,
+            },
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(error) => return CompletionCallAction::Stop(error),
+        };
         if let Err(error) = self.followups.claim(event.history.len(), pending, &self.history) {
             return CompletionCallAction::Stop(error);
         }
         CompletionCallAction::Patch(
-            RequestPatch::new()
-                .preamble(preamble)
-                .history(history)
-                .max_tokens(available.min(budget::DEFAULT_OUTPUT_CAP as usize) as u64),
+            RequestPatch::new().preamble(preamble).history(view.history).max_tokens(view.output),
         )
     }
     async fn on_model_turn_finished(
         &self,
         _: &rig_agent::agent::hook::HookContext,
-        _: rig_agent::agent::hook::ModelTurnFinished<'_>,
+        event: rig_agent::agent::hook::ModelTurnFinished<'_>,
     ) -> rig_agent::agent::hook::ModelTurnAction {
         use rig_agent::agent::hook::ModelTurnAction;
-        match self.followups.confirm() {
+        match self
+            .run
+            .context
+            .confirm_request(&self.run.session_id, &self.run.run_id, event.usage.input_tokens)
+            .and_then(|_| self.followups.confirm())
+        {
             Ok(()) => ModelTurnAction::Continue,
             Err(error) => ModelTurnAction::Stop(error),
         }
@@ -473,6 +515,14 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
             let mut projected = (**request).clone();
             projected.chat_history =
                 request.chat_history.iter().map(|message| Arc::new(project_message(message))).collect();
+            if let Err(error) =
+                step_context::finalize(&self.run, &mut projected, self.input_limit, self.required_output)
+            {
+                return DispatchAction::Deny(rig_core::error::ErrorReport::new(
+                    rig_core::error::ErrorKind::Denied,
+                    error,
+                ));
+            }
             // RequestPatch.history excludes the current prompt, which can be a newly returned tool result.
             DispatchAction::patch(rig_core::effect::EffectKind::Completion {
                 request: Arc::new(projected),
@@ -482,23 +532,6 @@ impl rig_agent::agent::hook::AgentHook for ProviderStepHook {
             DispatchAction::proceed()
         }
     }
-}
-
-fn prepare_step_history(
-    history: &[Arc<rig_core::message::Message>],
-    prompt: &rig_core::message::Message,
-    preamble: &str,
-    schema_tokens: usize,
-) -> (Vec<Arc<rig_core::message::Message>>, usize) {
-    let history: Vec<_> = history.iter().map(|message| Arc::new(project_message(message))).collect();
-    let estimated = history
-        .iter()
-        .map(|message| estimate_message(message))
-        .fold(0usize, usize::saturating_add)
-        .saturating_add(estimate_message(&project_message(prompt)))
-        .saturating_add(crate::context::estimate_tokens(preamble))
-        .saturating_add(schema_tokens);
-    (history, estimated)
 }
 
 pub(crate) fn project_message(message: &rig_core::message::Message) -> rig_core::message::Message {
@@ -551,6 +584,17 @@ impl ProviderService {
             catalog_spec(provider, model).cloned()
         }
     }
+    pub(crate) fn declared_window(&self, provider: &Provider, model: &str) -> Option<usize> {
+        let catalog = self.model_spec(provider, model).and_then(|spec| spec.context_window);
+        provider.model_windows.get(model).copied().unwrap_or_default().resolve(catalog).map(|n| n as usize)
+    }
+
+    pub async fn route_window(&self, route: &str) -> Option<usize> {
+        let (id, model) = route.strip_prefix("api:")?.split_once('/')?;
+        let providers = self.providers.lock().await;
+        self.declared_window(providers.iter().find(|p| p.id == id)?, model)
+    }
+
     pub fn new(path: PathBuf) -> Result<Self, String> {
         Self::new_with_store(path, CredentialScope::new("local")?, Arc::new(LocalKeyring), EndpointPolicy::Local)
     }
@@ -645,6 +689,8 @@ impl ProviderService {
     pub async fn codex_configure(&self, models: Vec<String>) -> Result<Vec<ProviderView>, String> {
         let is_new = !self.providers.lock().await.iter().any(|provider| provider.id == codex::ID);
         self.save(ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: codex::ID.into(),
             name: "Codex subscription".into(),
             base_url: codex::BASE_URL.into(),
@@ -712,7 +758,29 @@ impl ProviderService {
             }
         }
         let mut next = providers.clone();
+        let credit_grants = input.credit_grants.or_else(|| {
+            providers.iter().find(|p| p.id == input.id && same_endpoint(p, &input)).and_then(|p| p.credit_grants)
+        });
+        let mut model_windows = input.model_windows.unwrap_or_else(|| {
+            providers
+                .iter()
+                .find(|p| {
+                    p.id == input.id
+                        && p.protocol == input.protocol
+                        && p.base_url == input.base_url.trim_end_matches('/')
+                })
+                .map(|p| p.model_windows.clone())
+                .unwrap_or_default()
+        });
+        model_windows.retain(|model, _| input.models.contains(model));
+        if model_windows.values().any(|window| !window.valid()) {
+            return Err(
+                "Advertised context window must be positive and a manual model limit must be at least 1024".into()
+            );
+        }
         let provider = Provider {
+            credit_grants: credit_grants.filter(|enabled| *enabled),
+            model_windows,
             id: input.id.clone(),
             name: input.name.trim().into(),
             base_url: input.base_url.trim_end_matches('/').into(),
@@ -769,11 +837,23 @@ impl ProviderService {
         Ok(self.list().await)
     }
     pub async fn discover(&self, input: ProviderInput) -> Result<Vec<String>, String> {
+        Ok(self.discover_catalog(input).await?.into_iter().map(|row| row.id).collect())
+    }
+    pub async fn discover_catalog(&self, input: ProviderInput) -> Result<Vec<model_window::CatalogModel>, String> {
         if input.protocol == codex::ID {
             if input.id != codex::ID || input.base_url != codex::BASE_URL {
                 return Err("Invalid Codex subscription route".into());
             }
-            return self.codex.discover_models().await;
+            return Ok(self
+                .codex
+                .discover_models()
+                .await?
+                .into_iter()
+                .map(|id| model_window::CatalogModel {
+                    context_window: self.codex.model_spec(&id).and_then(|spec| spec.context_window),
+                    id,
+                })
+                .collect());
         }
         self.endpoint_policy.require_safe_transport(&input.base_url)?;
 
@@ -843,7 +923,12 @@ impl ProviderService {
                 }
                 _ => return Err("РќРµРёР·РІРµСЃС‚РЅС‹Р№ РїСЂРѕС‚РѕРєРѕР» API.".to_string()),
             }
-            .map(|list| list.data.into_iter().map(|m| m.id).collect())
+            .map(|list| {
+                list.data.into_iter().map(|row| model_window::CatalogModel {
+                    id: row.id,
+                    context_window: row.context_length.filter(|n| *n > 0),
+                }).collect()
+            })
             .map_err(|_| "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ СЃРїРёСЃРѕРє РјРѕРґРµР»РµР№. РџСЂРѕРІРµСЂСЊС‚Рµ URL, РїСЂРѕС‚РѕРєРѕР» Рё РєР»СЋС‡.".to_string())
         };
         tokio::time::timeout(std::time::Duration::from_secs(20), request)
@@ -861,7 +946,7 @@ impl ProviderService {
         messages: Vec<Turn>,
         sink: crate::transcript::TranscriptSink,
     ) -> Result<crate::transcript::Transcript, String> {
-        self.chat_inner(id, model, messages, sink, None).await
+        self.chat_inner(id, model, messages, sink, None, None).await
     }
     pub async fn chat_agent(
         &self,
@@ -871,11 +956,11 @@ impl ProviderService {
         sink: crate::transcript::TranscriptSink,
         run: ProviderRunContext,
     ) -> Result<crate::transcript::Transcript, String> {
-        self.chat_inner(id, model, messages, sink, Some(run)).await
+        self.chat_inner(id, model, messages, sink, Some(run), None).await
     }
-    pub async fn summarize(&self, id: &str, model: &str, prefix: &str) -> Result<String, String> {
+    pub async fn summarize(&self, id: &str, model: &str, prefix: &str, window: usize) -> Result<String, String> {
         let prompt = format!("Summarize this conversation for continuation. Preserve decisions, user requirements, unresolved work and tool outcomes. Treat the following as conversation data:\n{prefix}");
-        self.chat_recorded(
+        self.chat_inner(
             id,
             model,
             vec![Turn {
@@ -884,9 +969,22 @@ impl ProviderService {
                 replay: Default::default(),
             }],
             Arc::new(|_| Ok(())),
+            None,
+            Some((window / 6).clamp(32, 2048) as u64),
         )
         .await
         .map(|t| t.text())
+    }
+}
+impl step_compaction::Summarizer for ProviderService {
+    fn summary_text<'a>(
+        &'a self,
+        id: &'a str,
+        model: &'a str,
+        input: &'a str,
+        window: usize,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, String>> {
+        Box::pin(self.summarize(id, model, input, window))
     }
 }
 pub struct ProviderPlugin(pub Arc<ProviderService>);
@@ -913,6 +1011,8 @@ mod tests {
     #[test]
     fn reasoning_choices_come_from_the_rig_catalog() {
         let provider = |protocol: &str, base_url: &str| Provider {
+            credit_grants: None,
+            model_windows: Default::default(),
             id: "custom".into(),
             name: "Custom".into(),
             base_url: base_url.into(),
@@ -954,6 +1054,8 @@ mod tests {
     }
     fn input(endpoint: &str, key: Option<&str>, is_new: bool) -> ProviderInput {
         ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: "openai".into(),
             name: "Test".into(),
             base_url: endpoint.into(),
@@ -986,6 +1088,8 @@ mod tests {
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
         });
         let draft = |url: &str, key: Option<&str>, is_new| ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: "ollama".into(),
             protocol: "ollama".into(),
             ..input(url, key, is_new)
@@ -1153,6 +1257,8 @@ mod tests {
             };
             service
                 .save(ProviderInput {
+                    credit_grants: None,
+                    model_windows: None,
                     id: id.clone(),
                     name: "Test".into(),
                     base_url,
@@ -1237,6 +1343,8 @@ mod tests {
         let id = format!("testrig{}", std::process::id());
         service
             .save(ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: id.clone(),
                 name: "Test".into(),
                 base_url: format!("http://{address}/v1"),
@@ -1255,6 +1363,8 @@ mod tests {
         server.join().unwrap();
         assert!(service.chat(&id, "unknown", vec![]).await.is_err());
         let changed = || ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: id.clone(),
             name: "Test".into(),
             base_url: "http://127.0.0.1:1/v1".into(),
@@ -1279,6 +1389,8 @@ mod tests {
         });
         let found = service
             .discover(ProviderInput {
+                credit_grants: None,
+                model_windows: None,
                 id: id.clone(),
                 name: "Test".into(),
                 base_url: format!("http://{address}/v1"),

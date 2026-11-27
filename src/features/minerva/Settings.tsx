@@ -6,7 +6,8 @@ import { ApiProviderEditor } from "./ApiProviderEditor";
 import { AddProviderDialog } from "./AddProviderDialog";
 import { CodexSettings } from "./CodexSettings";
 import { ProviderList } from "./ProviderList";
-import { SubscriptionUsage } from "./SubscriptionUsage";
+import { useMinervaUsage } from "@/platform/minervaUsage";
+import { hasUsage, SubscriptionUsageView } from "@/workbench/SubscriptionUsage";
 import { useProviderConnections } from "./useProviderConnections";
 import styles from "./Settings.module.css";
 const EMPTY_MODELS: string[] = [];
@@ -36,6 +37,10 @@ export function MinervaSettings() {
     setSelected(id);
   };
   const provider = connections.providers.find((p) => p.id === selected) ?? null;
+  const usage = useMinervaUsage();
+  const observations = usage.providers.filter((p) => p.providerId === selected && hasUsage(p));
+  const showLimits = observations.length > 0;
+  const activeTab = showLimits ? tab : "settings";
   const remove = async () => {
     if (
       busy ||
@@ -74,13 +79,13 @@ export function MinervaSettings() {
         <Tabs
           items={[
             { id: "settings", label: tx("Settings") },
-            { id: "limits", label: tx("Subscription limits") },
+            ...(showLimits ? [{ id: "limits", label: tx("Provider limits") }] : []),
           ]}
-          activeId={tab}
+          activeId={activeTab}
           onSelect={setTab}
         />
         {connections.error && <p role="alert">{connections.error}</p>}
-        <div hidden={tab !== "settings"} className={styles.detailBody} key={selected}>
+        <div hidden={activeTab !== "settings"} className={styles.detailBody} key={selected}>
           {!connections.loading &&
             (selected === "openai-codex" ? (
               <CodexSettings
@@ -107,9 +112,9 @@ export function MinervaSettings() {
               )
             ))}
         </div>
-        {tab === "limits" && (
+        {activeTab === "limits" && (
           <div className={styles.detailBody}>
-            <SubscriptionUsage providerId={selected} />
+            <SubscriptionUsageView {...usage} providers={observations} onRefresh={() => void usage.refresh()} />
           </div>
         )}
       </div>

@@ -160,6 +160,8 @@ async fn exercise(
     .unwrap();
     service
         .save(ProviderInput {
+            credit_grants: None,
+            model_windows: None,
             id: id.clone(),
             name: "Fixture".into(),
             base_url: url,
