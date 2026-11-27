@@ -10,6 +10,7 @@ import {
   useContributions,
 } from "@/workbench/contributions";
 import { executeActionOrThrow } from "@/platform/actions";
+import { requestToolWindowFocus } from "@/workbench/toolwindows/store";
 
 const START = { kind: "workspace.start", key: "workspace.start", data: {} };
 function WorkspaceButton() {
@@ -40,10 +41,10 @@ export function activate() {
   const openTool = async (id: string, focus = true) => {
     if (!useContributions.getState().toolWindows.has(id)) return;
     useWorkbenchChrome.setState({ workspaceOpen: true, workspaceTabsOnly: true });
-    await editorService().openInput(
-      { kind: "workspace.tool", key: `workspace.tool.${id}`, data: { tool: id } },
-      { focus },
-    );
+    const key = `workspace.tool.${id}`;
+    const editor = editorService();
+    await editor.openInput({ kind: "workspace.tool", key, data: { tool: id } }, { focus: false });
+    if (focus && editor.activeInput?.()?.key === key) requestToolWindowFocus(id);
   };
   const disposers = [
     () => useWorkbenchChrome.setState({ headerActions: null, closeWorkspace: undefined }),

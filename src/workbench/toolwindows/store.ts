@@ -633,6 +633,10 @@ export function activateToolWindow(id: string) {
 
 export function focusToolWindow(id: string) {
   if (opensInWorkspace(id) || !isToolWindowVisible(id)) return showToolWindow(id, true);
+  requestToolWindowFocus(id);
+}
+
+export function requestToolWindowFocus(id: string) {
   update({ focusRequest: { id, seq: ++focusSeq }, lastActive: id }, false);
 }
 

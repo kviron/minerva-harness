@@ -29,6 +29,7 @@ test("bottom stripe tools reuse workspace tabs beside the full-height agent conv
     await button.click();
     const panel = page.locator(`[data-workspace-tool="${id}"]`);
     await expect(panel).toBeVisible();
+    if (id === "terminal") await expect(panel.getByRole("textbox", { name: "Terminal input" })).toBeFocused();
     await expect(tabs.getByRole("tab", { name: title, exact: true })).toHaveAttribute("aria-selected", "true");
     await expect(button).toHaveAttribute("aria-pressed", "true");
     await expect(dock).toBeHidden();
