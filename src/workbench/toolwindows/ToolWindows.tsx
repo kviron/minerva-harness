@@ -25,6 +25,7 @@ import {
   IconButton,
   lockDragCursor,
   Menu,
+  registerDropTarget,
   showContextMenu,
   tooltipAttrs,
   type MenuItem,
@@ -64,6 +65,7 @@ import {
   type ToolWindowViewMode,
 } from "./store";
 import { contentTabRegistry } from "./content";
+import { resetStripeNames, setStripe, STRIPE_MAX, STRIPE_MIN, useStripes, type StripeSide } from "./stripes";
 import { toolWindowTitle } from "./title";
 import styles from "./ToolWindows.module.css";
 import { tx, useI18n } from "@/platform/i18n";
@@ -196,53 +198,6 @@ function stripeButtonMenu(tw: ToolWindowContribution, showNames: boolean): MenuI
 async function setShowToolWindowNames(on: boolean) {
   const settings = await call(commands.settingsSet("global", "appearance.showToolWindowNames", JSON.stringify(on)));
   useProject.setState({ settings });
-}
-
-/** Stripe button widths with names; icons only follow `--stripe-icon-button` (smaller in compact mode). */
-const STRIPE_MIN = 44;
-const STRIPE_DEFAULT = 56;
-const STRIPE_MAX = 96;
-const STRIPE_KEY = "openidea.stripes.v1";
-
-type StripeSide = "left" | "right";
-/** Per stripe: button width with names, and names shown or hidden by a drag (unset: the setting decides). */
-interface StripeSize {
-  width: number;
-  names?: boolean;
-}
-
-function readStripes(): Record<StripeSide, StripeSize> {
-  const out: Record<StripeSide, StripeSize> = { left: { width: STRIPE_DEFAULT }, right: { width: STRIPE_DEFAULT } };
-  try {
-    const raw = JSON.parse(localStorage.getItem(STRIPE_KEY) ?? "null");
-    for (const side of ["left", "right"] as const) {
-      const v = raw?.[side];
-      if (typeof v?.width === "number") out[side].width = Math.min(STRIPE_MAX, Math.max(STRIPE_MIN, v.width));
-      if (typeof v?.names === "boolean") out[side].names = v.names;
-    }
-  } catch {
-    /* storage unavailable */
-  }
-  return out;
-}
-
-const useStripes = create<Record<StripeSide, StripeSize>>(readStripes);
-
-function setStripe(side: StripeSide, size: StripeSize) {
-  useStripes.setState({ [side]: size });
-  try {
-    localStorage.setItem(STRIPE_KEY, JSON.stringify(useStripes.getState()));
-  } catch {
-    /* storage unavailable */
-  }
-}
-
-/** "Show Tool Window Names" (menu or settings) applies to both stripes again. */
-function resetStripeNames() {
-  const s = useStripes.getState();
-  if (s.left.names === undefined && s.right.names === undefined) return;
-  setStripe("left", { width: s.left.width });
-  setStripe("right", { width: s.right.width });
 }
 
 /**
@@ -455,14 +410,32 @@ function StripeButton({
   const iconSize = useChromeIconSize();
   const shortcut = shortcutLabel(`toolwindow.${tw.id}`);
   const dragged = useStripeDrag((s) => s.id === tw.id);
+  const ref = useRef<HTMLButtonElement>(null);
+  const [dropOver, setDropOver] = useState(false);
+  const stripeDrop = tw.onStripeDrop;
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !stripeDrop) return;
+    return registerDropTarget(el, {
+      accepts: (type, data) => stripeDrop.accepts(type, data),
+      over: () => setDropOver(true),
+      leave: () => setDropOver(false),
+      drop: (data) => {
+        setDropOver(false);
+        stripeDrop.drop(data);
+      },
+    });
+  }, [stripeDrop]);
   return (
     <button
+      ref={ref}
       type="button"
       className={clsx(
         styles.stripeButton,
         showName && styles.stripeNamed,
         active && styles.stripeActive,
         active && focused && styles.stripeFocused,
+        dropOver && styles.stripeDropOver,
         dragged && styles.stripeDragged,
       )}
       aria-label={toolWindowTitle(tw)}
@@ -494,7 +467,7 @@ function StripeButton({
 }
 
 /** Stripe "…": tool windows without a stripe button; opening one adds its button (IDEA). */
-function StripeMore({ windows }: { windows: ToolWindowContribution[] }) {
+function StripeMore({ side, windows }: { side: StripeSide; windows: ToolWindowContribution[] }) {
   const iconSize = useChromeIconSize();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLButtonElement>(null);
@@ -522,7 +495,18 @@ function StripeMore({ windows }: { windows: ToolWindowContribution[] }) {
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
-        data-tooltip-stripe="left"
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setOpen(false);
+          showContextMenu(e, [
+            {
+              kind: "action",
+              action: "toolwindow.moveMore",
+              label: side === "left" ? "Move to Right" : "Move to Left",
+            },
+          ]);
+        }}
+        data-tooltip-stripe={side}
         {...tooltipAttrs("More Tool Windows")}
       >
         <Icon name="more-horizontal" size={iconSize} />
@@ -532,7 +516,7 @@ function StripeMore({ windows }: { windows: ToolWindowContribution[] }) {
         onClose={() => setOpen(false)}
         anchor={ref}
         items={items}
-        placement="right-start"
+        placement={side === "left" ? "right-start" : "left-start"}
         aria-label="Tool windows"
       />
     </>
@@ -573,6 +557,7 @@ export function ToolWindowStripe({
   const primary = inSlot(side);
   const split = inSlot(`${side}-split`);
   const lower = inSlot(lowerSlot(side));
+  const moreSide = useStripes((s) => s.moreSide);
   const moreWindows = windows.filter((w) => !onStripe.includes(w));
   const focused = useToolWindowLayout((s) => s.focused);
   const drop = useStripeDrag((s) => s.drop);
@@ -600,7 +585,7 @@ export function ToolWindowStripe({
       {renderGroup(side, primary)}
       {dragging && <div className={styles.stripeSeparator} data-stripe-separator="" role="separator" />}
       {(split.length > 0 || dragging) && renderGroup(`${side}-split`, split)}
-      {side === "left" && <StripeMore windows={moreWindows} />}
+      {side === moreSide && <StripeMore side={side} windows={moreWindows} />}
       <div className={styles.stripeSpacer} data-stripe-spacer="" />
       {renderGroup(lowerSlot(side), lower)}
     </>
@@ -678,12 +663,11 @@ export function ToolWindowHeader({
   children,
 }: ToolWindowHeaderProps) {
   const tw = useContext(ToolWindowFrame)?.tw;
+  const registry = useMemo(() => (tw && closeTarget ? contentTabRegistry(tw.id) : null), [tw, closeTarget]);
   if (!tw) return null;
   return (
     <HeaderRow tw={tw} title={title} actions={actions}>
-      <TabStripRegistry.Provider value={closeTarget ? contentTabRegistry(tw.id) : null}>
-        {children}
-      </TabStripRegistry.Provider>
+      <TabStripRegistry.Provider value={registry}>{children}</TabStripRegistry.Provider>
     </HeaderRow>
   );
 }
@@ -691,9 +675,8 @@ export function ToolWindowHeader({
 /** Makes the tab strips in `children`, rendered in a tool window's content, the ones Close Tab (⌘W) acts on. */
 export function ToolWindowContentTabs({ children }: { children: ReactNode }) {
   const tw = useContext(ToolWindowFrame)?.tw;
-  return (
-    <TabStripRegistry.Provider value={tw ? contentTabRegistry(tw.id) : null}>{children}</TabStripRegistry.Provider>
-  );
+  const registry = useMemo(() => (tw ? contentTabRegistry(tw.id) : null), [tw]);
+  return <TabStripRegistry.Provider value={registry}>{children}</TabStripRegistry.Provider>;
 }
 
 /**
@@ -740,7 +723,11 @@ function ToolWindowActionsBar({ tw, className }: { tw: ToolWindowContribution; c
   return (
     <>
       <div className={clsx(styles.headerActions, className)}>
-        {Actions && <Actions id={tw.id} />}
+        {Actions && (
+          <div className={styles.headerContributedActions}>
+            <Actions id={tw.id} />
+          </div>
+        )}
         {more.length > 0 && (
           <IconButton
             ref={moreRef}
@@ -799,6 +786,8 @@ function HeaderRow({
   const useTitleMenu = tw.titleMenu ?? noTitleMenu;
   const titleMenu = useTitleMenu(tw.id);
   const titleItems = titleMenu?.items ?? (tw.plainTitle ? [] : own);
+  const windowTitle = toolWindowTitle(tw);
+  const titleLabel = titleMenu ? tx(titleMenu.label) : windowTitle;
 
   return (
     <header
@@ -824,11 +813,12 @@ function HeaderRow({
             ref={titleRef}
             type="button"
             className={styles.titleButton}
+            title={titleLabel}
             aria-haspopup="menu"
             aria-expanded={titleOpen}
             onClick={() => setTitleOpen((v) => !v)}
           >
-            <span className={styles.title}>{titleMenu ? tx(titleMenu.label) : toolWindowTitle(tw)}</span>
+            <span className={styles.title}>{titleLabel}</span>
             <Icon name="chevron-down" size={12} className={styles.titleChevron} />
           </button>
           <Menu
@@ -840,10 +830,11 @@ function HeaderRow({
           />
         </>
       ) : (
-        <span className={clsx(styles.title, styles.titlePlain)}>{toolWindowTitle(tw)}</span>
+        <span className={clsx(styles.title, styles.titlePlain)} title={windowTitle}>
+          {windowTitle}
+        </span>
       )}
       {children && <div className={clsx(styles.headerContent, !showTitle && styles.headerContentOnly)}>{children}</div>}
-      <div className={styles.headerSpacer} />
       {actions && <ToolWindowActionsBar tw={tw} />}
     </header>
   );
@@ -883,7 +874,9 @@ export function ToolWindowView({
     update(1);
     return () => update(-1);
   }, [inEditor, tw.id]);
+  const tabRegistry = useMemo(() => contentTabRegistry(tw.id), [tw.id]);
   const Content = tw.component;
+  const content = useMemo(() => <Content id={tw.id} />, [Content, tw.id]);
   const Tabs = tw.headerContent;
 
   useEffect(() => {
@@ -899,18 +892,29 @@ export function ToolWindowView({
       const root = ref.current;
       if (!root) return;
       const body = root.querySelector<HTMLElement>("[data-toolwindow-body]");
-      // Like IDEA, activation focuses the content (a field, list or tree), never a button or
-      // link: a scripted focus on one draws its focus ring (an empty view's "New…" link).
+      // Like IDEA, activation focuses visible content (a field, list or tree), never a button,
+      // link, or hidden / inert target: a scripted focus on a button draws its focus ring, and
+      // focusing a hidden element (e.g. a file input or inactive tab panel) is a silent no-op
+      // that leaves focus stranded in the previous window.
+      const isVisibleTarget = (el: HTMLElement) => {
+        if (el.matches('input[type="hidden"]') || el.closest("[hidden], [inert]")) return false;
+        for (let cur: HTMLElement | null = el; cur && cur !== body; cur = cur.parentElement) {
+          const style = getComputedStyle(cur);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+        }
+        return true;
+      };
       const contentTarget = () =>
-        body?.querySelector<HTMLElement>("[data-autofocus]") ??
+        [...(body?.querySelectorAll<HTMLElement>("[data-autofocus]") ?? [])].find(isVisibleTarget) ??
         [...(body?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].find(
-          (el) => !el.matches('button, a[href], [role="button"], [role="link"]'),
+          (el) => !el.matches('button, a[href], [role="button"], [role="link"]') && isVisibleTarget(el),
         );
       const target = contentTarget();
       if (target || !body) {
         (target ?? root).focus({ preventScroll: true });
-        return;
+        if (root.contains(document.activeElement)) return;
       }
+      if (!body) return;
       if (!body.hasAttribute("tabindex")) body.tabIndex = -1;
       body.focus({ preventScroll: true });
       // Lazily loaded views (the Terminal) render their field after this: focus it when it
@@ -953,16 +957,14 @@ export function ToolWindowView({
         {!ownHeader && (
           <HeaderRow tw={tw} title actions>
             {Tabs && (
-              <TabStripRegistry.Provider value={contentTabRegistry(tw.id)}>
+              <TabStripRegistry.Provider value={tabRegistry}>
                 <Tabs id={tw.id} />
               </TabStripRegistry.Provider>
             )}
           </HeaderRow>
         )}
         <div className={styles.body} data-toolwindow-body="">
-          <ToolWindowShownProvider value={!hidden}>
-            <Content id={tw.id} />
-          </ToolWindowShownProvider>
+          <ToolWindowShownProvider value={!hidden}>{content}</ToolWindowShownProvider>
         </div>
       </section>
     </ToolWindowFrame.Provider>
@@ -1373,16 +1375,21 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
   );
   const sizes = useToolWindowLayout((s) => s.sizes);
   const stripeButtons = useToolWindowLayout((s) => s.stripeButtons);
-  // The right stripe holds the right side's windows and Bottom Right.
-  const hasRight = windows.some((w) => {
-    const slot = slotOf(w);
-    return (
-      (w.anchor === "right" || slot === "bottom-split") && (hasStripeButton(w, stripeButtons) || visible[slot] === w.id)
-    );
-  });
-  // While a stripe button is dragged, an empty right stripe shows as a drop target.
+  // Keep the overflow button reachable and show empty stripes as drop targets while dragging.
   const dragging = useStripeDrag((s) => !!s.id);
-  const rightStripe = bars && (hasRight || dragging);
+  const showStripe = (side: StripeSide) =>
+    bars &&
+    (stripes.moreSide === side ||
+      dragging ||
+      windows.some((w) => {
+        const slot = slotOf(w);
+        return (
+          (w.anchor === side || slot === lowerSlot(side)) &&
+          (hasStripeButton(w, stripeButtons) || visible[slot] === w.id)
+        );
+      }));
+  const leftStripe = showStripe("left");
+  const rightStripe = showStripe("right");
   const gridRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   // Undocked windows take no track: the editor keeps its size under them.
@@ -1415,11 +1422,15 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
   return (
     <div
       ref={frameRef}
-      className={clsx(styles.frame, !rightStripe && styles.frameNoRight, !bars && !Navigation && styles.frameNoLeft)}
+      className={clsx(
+        styles.frame,
+        !rightStripe && styles.frameNoRight,
+        !leftStripe && !Navigation && styles.frameNoLeft,
+      )}
     >
-      {!bars && Navigation && <Navigation />}
-      {bars && stripe("left")}
-      {bars && stripeHandle("left")}
+      {!leftStripe && Navigation && <Navigation />}
+      {leftStripe && stripe("left")}
+      {leftStripe && stripeHandle("left")}
       {Sidebar && <Sidebar />}
       <div
         ref={gridRef}

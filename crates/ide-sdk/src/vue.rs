@@ -42,6 +42,16 @@ pub(crate) fn server_package(command: &str, path: &OsStr) -> Option<PathBuf> {
     package_dir(&find_command(command, path)?, PACKAGE)
 }
 
+/// Whether `root`'s manifest depends on Vue or `@vue/cli-service`, i.e. it is a Vue project.
+/// The tsserver plugin host that `vtsls` carries cannot be loaded into the native TS7
+/// server, so this decides whether the tsserver route stays for a Vue project.
+pub(crate) fn vue_project(root: &Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    package_dependencies(&manifest).iter().any(|d| d == "vue" || d == CLI_SERVICE)
+}
+
 /// vtsls `globalPlugins` entry loading the Vue plugin shipped with `package`.
 pub(crate) fn tsserver_plugin(package: &Path) -> serde_json::Value {
     serde_json::json!({
@@ -142,9 +152,11 @@ fn webpack_aliases(root: &Path, config: &Path, node: &Path) -> Option<Vec<(Strin
 }
 
 /// Directory aliases as `paths`; `name$` (exact module) and file aliases have no equivalent.
-fn alias_paths(aliases: &[(String, String)]) -> Paths {
+pub(crate) fn alias_paths(aliases: &[(String, String)]) -> Paths {
     let mut paths = Paths::new();
     for (name, target) in aliases {
+        // `'@/': '/src/'` is the `@` alias too.
+        let name = name.trim_end_matches('/');
         let dir = Path::new(target);
         if name.is_empty() || name.ends_with('$') || name.contains('*') || !dir.is_absolute() || !dir.is_dir() {
             continue;
@@ -152,7 +164,7 @@ fn alias_paths(aliases: &[(String, String)]) -> Paths {
         let dir = target.replace('\\', "/");
         let dir = dir.trim_end_matches('/');
         paths.insert(format!("{name}/*"), vec![format!("{dir}/*")]);
-        paths.insert(name.clone(), vec![dir.to_owned()]);
+        paths.insert(name.to_owned(), vec![dir.to_owned()]);
     }
     paths
 }

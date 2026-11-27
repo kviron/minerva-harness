@@ -80,6 +80,7 @@ function plugin(partial: Partial<PluginInfo> & Pick<PluginInfo, "id">): PluginIn
     hasCode: true,
     capabilities: [],
     netHosts: [],
+    netSettings: [],
     contributions: [],
     activation: [],
     warnings: [],
@@ -382,6 +383,26 @@ describe("store", () => {
     await selectPluginTheme("theme-harbor-night", "harbor-night");
     expect(usePlugins.getState().activeTheme?.theme.id).toBe("harbor-night");
     await selectPluginTheme(null, null);
+    expect(usePlugins.getState().activeTheme).toBeNull();
+  });
+
+  it("keeps a theme applied by an event over an older plugin list that predates it", async () => {
+    await refreshPlugins();
+    const applied = await backend.setTheme("theme-harbor-night", "harbor-night");
+    await backend.setTheme(null, null);
+    // The list is read before the theme lands and answers after its event.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const stale = await backend.list();
+    setPluginsBackend({ ...backend, list: () => gate.then(() => stale) });
+    const refresh = refreshPlugins();
+    handlePluginEvent({ type: "themeChanged", theme: applied });
+    release();
+    await refresh;
+    expect(usePlugins.getState().activeTheme?.theme.id).toBe("harbor-night");
+    // A list requested after the event is taken as it is.
+    setPluginsBackend(backend);
+    await refreshPlugins();
     expect(usePlugins.getState().activeTheme).toBeNull();
   });
 
@@ -1332,7 +1353,7 @@ describe("marketplace", () => {
     await waitFor(() => expect(within(list).getByText("All Plugins")).toBeInTheDocument());
     expect(within(list).queryByText(new RegExp(NO_REPOSITORY))).not.toBeInTheDocument();
     await user.click(within(list).getAllByText("Hello")[0]!);
-    expect(screen.getByText("Signed by acme")).toBeInTheDocument();
+    expect(screen.getByText("Signed by:").nextElementSibling).toHaveTextContent("acme");
     await user.click(screen.getByRole("button", { name: "Install" }));
     await waitFor(() => expect(usePlugins.getState().plugins.map((p) => p.id)).toEqual(["hello"]));
     expect(downloads).toEqual(["hello"]);
@@ -1380,7 +1401,7 @@ describe("marketplace", () => {
     expect(headers).toEqual(["Featured", "All Plugins", "Examples", "Local"]);
     // The first listed plugin is shown without a click.
     expect(screen.getByRole("heading", { name: "Popular" })).toBeInTheDocument();
-    expect(screen.getByText("Signed by Acme Inc.")).toBeInTheDocument();
+    expect(screen.getByText("Signed by:").nextElementSibling).toHaveTextContent("Acme Inc.");
     await user.click(within(list).getByText("Sample"));
     expect(screen.getByRole("note")).toHaveTextContent("not maintained as a product");
     await user.click(within(list).getByRole("button", { name: "Install Rare" }));
@@ -1452,7 +1473,12 @@ describe("marketplace", () => {
       marketUrl: async () => "https://plugins.example/index.json",
       market: async () => [
         entry("acme.dusk", "Dusk", ["themes"]),
-        entry("acme.lint", "Lint", ["linters", "tools"]),
+        {
+          ...entry("acme.lint", "Lint", ["linters", "tools"]),
+          authors: ["Ada <ada@example.com>"],
+          homepage: "https://example.com/lint",
+          downloads: 42,
+        },
         entry("acme.misc", "Misc", ["robots"]),
       ],
     });
@@ -1469,7 +1495,15 @@ describe("marketplace", () => {
     expect(within(list).queryByText("Dusk")).not.toBeInTheDocument();
     expect(within(list).queryByText("Local")).not.toBeInTheDocument();
     await user.click(within(list).getByText("Lint"));
-    expect(screen.getByText("Linters & Formatters, Tools")).toBeInTheDocument();
+    const header = within(screen.getByRole("heading", { name: "Lint" }).closest("header")!);
+    expect(header.getByText("Linters & Formatters")).toBeInTheDocument();
+    expect(header.getByText("Tools")).toBeInTheDocument();
+    expect(header.getByText("42")).toBeInTheDocument();
+    expect(header.getByText("1.0.0")).toBeInTheDocument();
+    expect(header.getByRole("link", { name: "Ada" })).toHaveAttribute("href", "https://example.com/lint");
+    expect(header.queryByText("ada@example.com")).not.toBeInTheDocument();
+    expect(screen.getByText("ada@example.com")).toBeInTheDocument();
+    expect(within(list).queryByText("1.0.0")).not.toBeInTheDocument();
   });
 
   it("shows a plugin this IDE can't load without installing it", async () => {
@@ -1596,6 +1630,75 @@ describe("marketplace", () => {
       stop();
     });
 
+    it("lets the install consent dialog select and clear all optional permissions at once", async () => {
+      const consents = updatesBackend({
+        b: preview("b", "2.0.0", {
+          needsConsent: true,
+          capabilities: [
+            { id: "editor.read", description: "Read", risk: "low", optional: false, granted: false },
+            { id: "storage", description: "Store data", risk: "low", optional: true, granted: false },
+            { id: "net:api.example", description: "Net", risk: "medium", optional: true, granted: false },
+            { id: "process:git", description: "Run git", risk: "high", optional: true, granted: false },
+          ],
+        }),
+      });
+      const stop = provideConsentDialog();
+      const user = userEvent.setup();
+      render(<ConsentDialogHost />);
+      const done = installFromDisk("b");
+
+      const selectAll = (await screen.findByRole("checkbox", {
+        name: "Allow all optional permissions",
+      })) as HTMLInputElement;
+      // Low-risk optional permission starts checked while medium/high stay unchecked -> indeterminate.
+      expect(selectAll.checked).toBe(false);
+      expect(selectAll.indeterminate).toBe(true);
+      expect(screen.getByText("1/3")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+      // Clicking from indeterminate checks every optional permission and surfaces the high-risk warning.
+      await user.click(selectAll);
+      expect(selectAll.checked).toBe(true);
+      expect(selectAll.indeterminate).toBe(false);
+      expect(screen.getByText("3/3")).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("running arbitrary code");
+
+      // Clicking again clears all optional permissions.
+      await user.click(selectAll);
+      expect(selectAll.checked).toBe(false);
+      expect(selectAll.indeterminate).toBe(false);
+      expect(screen.getByText("0/3")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+      // Selecting all again and installing passes every optional capability to the backend.
+      await user.click(selectAll);
+      await user.click(screen.getByRole("button", { name: "Install" }));
+      await done;
+      expect(consents[0]![1].optional.sort()).toEqual(["net:api.example", "process:git", "storage"]);
+      stop();
+    });
+
+    it("hides the select-all checkbox when there is at most one optional permission", async () => {
+      updatesBackend({
+        b: preview("b", "2.0.0", {
+          needsConsent: true,
+          capabilities: [
+            { id: "editor.read", description: "Read", risk: "low", optional: false, granted: false },
+            { id: "net:api.example", description: "Net", risk: "medium", optional: true, granted: false },
+          ],
+        }),
+      });
+      const stop = provideConsentDialog();
+      const user = userEvent.setup();
+      render(<ConsentDialogHost />);
+      const done = installFromDisk("b");
+      await screen.findByRole("checkbox", { name: "Allow net:api.example" });
+      expect(screen.queryByRole("checkbox", { name: "Allow all optional permissions" })).not.toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+      await done;
+      stop();
+    });
+
     it("offers Update All in the gear menu while there are updates", async () => {
       setConsentPrompt(async () => ({ optional: [] }));
       const consents = updatesBackend({ a: preview("a", "1.1.0"), b: preview("b", "2.0.0") });
@@ -1681,6 +1784,42 @@ describe("marketplace", () => {
       expect(screen.getByText("net:relay.example.org")).toBeInTheDocument();
     },
   );
+
+  it("lists the host of a net:setting grant with revoke and a pending one with approve", async () => {
+    const user = userEvent.setup();
+    const base = createMemoryPluginsBackend([
+      plugin({
+        id: "p",
+        name: "GitLab bridge",
+        netSettings: [
+          { setting: "server", http: false, host: "jira.corp.example", pending: null },
+          { setting: "server", http: true, host: null, pending: "intra.example" },
+        ],
+        capabilities: [
+          { id: "net:setting:server", risk: "medium", description: "Connect", optional: true, granted: true },
+          { id: "net.http:setting:server", risk: "medium", description: "Connect", optional: true, granted: true },
+        ],
+      }),
+    ]);
+    const approveNetSetting = vi.fn((id: string, setting: string, http: boolean, host: string) =>
+      base.approveNetSetting(id, setting, http, host),
+    );
+    const forgetNetSetting = vi.fn((id: string, setting: string, http: boolean) =>
+      base.forgetNetSetting(id, setting, http),
+    );
+    setPluginsBackend({ ...base, approveNetSetting, forgetNetSetting });
+    render(<PluginsPage initialTab="installed" />);
+
+    await screen.findAllByText("net:setting:server");
+    expect(screen.getByText(/The host set in the “server” setting, on any port\./)).toBeInTheDocument();
+    expect(screen.getByText(/The “server” setting now holds intra\.example\./)).toBeInTheDocument();
+    expect(screen.getByText(/Approving connects over unencrypted HTTP\./)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(approveNetSetting).toHaveBeenCalledWith("p", "server", true, "intra.example"));
+    // Both transports are approved now; the HTTPS row comes first.
+    await user.click((await screen.findAllByRole("button", { name: "Remove" }))[0]!);
+    await waitFor(() => expect(forgetNetSetting).toHaveBeenCalledWith("p", "server", false));
+  });
 
   it("shows the Java agent next to the java.agent permission", async () => {
     setPluginsBackend(
@@ -1800,7 +1939,6 @@ describe("marketplace", () => {
     });
     const user = userEvent.setup();
     render(<PluginsPage initialTab="installed" />);
-    expect(await screen.findByText("Unsigned")).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "Roll Back to 1.0.0" }));
     await waitFor(() => expect(rolled).toEqual(["p"]));
     expect(notes.at(-1)).toMatchObject({ title: "Rolled back P to 1.0.0" });

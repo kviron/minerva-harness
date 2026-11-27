@@ -7,8 +7,8 @@ impl AgentManager {
         let task = self.task(id)?;
         let _connecting = task.connecting.lock().await;
         let mut events = task.connection_events.lock();
-        let deleted = task.deleted.lock();
-        if *deleted {
+        let file = task.file.lock();
+        if file.deleted {
             return Err(IdeError::not_found("task deleted"));
         }
         let providers = self.shared.minerva_providers.read();
@@ -62,7 +62,7 @@ impl AgentManager {
         }
         state.task.provider = provider;
         state.pending_model = None;
-        if let Err(error) = task.persist_state(&state) {
+        if let Err(error) = task.write_snapshot(&Task::snapshot(&state)) {
             state.task.provider = previous.provider;
             state.task.config = previous.config;
             state.wanted = previous_wanted;
@@ -77,7 +77,7 @@ impl AgentManager {
         }
         drop(state);
         drop(providers);
-        drop(deleted);
+        drop(file);
         task.emit_task();
         Ok(())
     }

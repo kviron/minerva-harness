@@ -64,6 +64,35 @@ describe("counts", () => {
   });
 });
 
+describe("a problem two sources report", () => {
+  beforeEach(() => clearProblems());
+
+  it("is listed and counted once (Build's tsc step and the tsc watcher)", () => {
+    const counts = () => useProblems.getState().counts.error;
+    const listed = () => fileDiagnostics(useProblems.getState().map, "/p/b.ts").map((x) => x.source);
+    applyDiagnosticsEvent("/p/b.ts", "tsc", [d(1, "error", "tsc"), d(2, "error", "tsc")]);
+    applyDiagnosticsEvent("/p/b.ts", "build", [d(1, "error", "build")]);
+    expect(listed()).toEqual(["build", "tsc"]);
+    expect(counts()).toBe(2);
+    expect(projectCounts(useProblems.getState().map).error).toBe(2);
+    // Either source alone still shows it.
+    applyDiagnosticsEvent("/p/b.ts", "tsc", []);
+    expect(listed()).toEqual(["build"]);
+    expect(counts()).toBe(1);
+    applyDiagnosticsEvent("/p/b.ts", "build", []);
+    expect(listed()).toEqual([]);
+    expect(counts()).toBe(0);
+  });
+
+  it("keeps other sources as they are, and different problems on one line", () => {
+    let map = mergeDiagnostics(mergeDiagnostics(new Map(), "/a", "ra", [d(1)]), "/a", "eslint", [d(1)]);
+    expect(fileDiagnostics(map, "/a")).toHaveLength(2);
+    map = mergeDiagnostics(map, "/a", "build", [{ ...d(1), message: "another" }]);
+    map = mergeDiagnostics(map, "/a", "tsc", [d(1)]);
+    expect(fileDiagnostics(map, "/a")).toHaveLength(4);
+  });
+});
+
 describe("store + decorations", () => {
   beforeEach(() => clearProblems());
 
@@ -73,6 +102,74 @@ describe("store + decorations", () => {
     const deco = problemDecorations(useProblems.getState().map);
     expect([...deco.keys()]).toEqual(["/p/src/a.rs"]);
     expect(deco.get("/p/src/a.rs")).toEqual({ error: true, propagate: true, tooltip: "1 error, 1 warning" });
+  });
+});
+
+/** Entries copied by every `new Map(...)` constructed while `run` executes. */
+function entriesCopied(run: () => void): number {
+  const Original = globalThis.Map;
+  let copied = 0;
+  class Counting<K, V> extends Original<K, V> {
+    constructor(entries?: Iterable<readonly [K, V]> | null) {
+      super(entries);
+      copied += this.size;
+    }
+  }
+  globalThis.Map = Counting as MapConstructor;
+  try {
+    run();
+  } finally {
+    globalThis.Map = Original;
+  }
+  return copied;
+}
+
+describe("diagnostics storm", () => {
+  beforeEach(() => clearProblems());
+  const FILES = 2000;
+  const path = (i: number) => `/p/src/File${i}.ts`;
+
+  it("applies an event without copying the files already in the store", () => {
+    // Copying every file's entry per event is FILES^2 / 2 = 2,000,000 entries; the bound is
+    // a few entries per event (the touched file's sources).
+    const copied = entriesCopied(() => {
+      for (let i = 0; i < FILES; i++) applyDiagnosticsEvent(path(i), "lsp", [d(i % 50), d(1, "warning")]);
+    });
+    expect(copied).toBeLessThan(FILES * 4);
+    const { map, raw, counts } = useProblems.getState();
+    expect(map.size).toBe(FILES);
+    expect(raw.size).toBe(FILES);
+    expect(counts).toEqual({ error: FILES, warning: FILES, info: 0, hint: 0 });
+  });
+
+  it("rebuilds the profiled map without copying it per file", () => {
+    for (let i = 0; i < FILES; i++) applyDiagnosticsEvent(path(i), "lsp", [d(i % 50)]);
+    const { raw } = useProblems.getState();
+    let out: ReturnType<typeof profiledProblems> | undefined;
+    const copied = entriesCopied(() => {
+      out = profiledProblems(raw, { "lsp:lsp": { severity: "weakWarning" } });
+    });
+    expect(copied).toBeLessThan(FILES * 4);
+    expect(out!.size).toBe(FILES);
+  });
+
+  it("publishes a new map exactly when the content changed", () => {
+    applyDiagnosticsEvent(path(1), "lsp", [d(1)]);
+    const first = useProblems.getState();
+    applyDiagnosticsEvent(path(1), "other", []); // nothing to clear
+    expect(useProblems.getState()).toBe(first);
+
+    applyDiagnosticsEvent(path(2), "lsp", [d(1)]);
+    const second = useProblems.getState();
+    expect(second.map).not.toBe(first.map);
+    expect(second.raw).not.toBe(first.raw);
+    expect(second.map.get(path(1))).toBe(first.map.get(path(1))); // untouched file keeps its sources
+
+    applyDiagnosticsEvent(path(2), "lsp", []);
+    const third = useProblems.getState();
+    expect(third.map).not.toBe(second.map);
+    expect(third.map.has(path(2))).toBe(false);
+    expect(third.counts).toEqual({ error: 1, warning: 0, info: 0, hint: 0 });
   });
 });
 

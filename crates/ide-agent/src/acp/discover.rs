@@ -25,7 +25,7 @@ pub(crate) async fn run(shared: &Arc<Shared>, spec: &ProviderSpec, model: Option
         Err(err)
             if !prefer_stored
                 && crate::provider::is_copilot_provider(&spec.id)
-                && crate::provider::has_unconfigured_copilot_ambient_token(&spec.env)
+                && crate::provider::has_unconfigured_copilot_ambient_token(&spec.env, &shared.paths.project_root)
                 && super::auth_required(0, &err) =>
         {
             let retry = run_once(shared, spec, true, model).await;
@@ -196,11 +196,11 @@ fn levels_for_model_from_slice(options: &[AgentConfigOption]) -> Vec<AgentConfig
         .filter(|o| config::is_per_model_option(o))
         .cloned()
         .map(|mut o| {
-            if config::is_context_option(&o.id) {
+            if config::is_context_option(&o.id) || config::is_fast_option(&o.id) {
                 if o.category.is_none() {
                     o.category = Some("model_config".into());
                 }
-            } else if o.category.as_deref() != Some("thought_level") {
+            } else if o.category.is_none() {
                 o.category = Some("thought_level".into());
             }
             o

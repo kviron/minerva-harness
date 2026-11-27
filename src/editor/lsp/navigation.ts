@@ -95,6 +95,7 @@ import { dispatchMouseShortcut, shortcutLabel } from "@/platform/keymap";
 import { isNavigationGesture, onNavigationModifier, navigationModifierHeld } from "@/platform/navigationModifier";
 import { create } from "zustand";
 import { tx } from "@/platform/i18n";
+import { cssVariableAt, STYLESHEETS } from "./cssVariables";
 import {
   CONFIGURATION_NAVIGATION_MAX_AGE,
   configurationNavigationRevision,
@@ -323,9 +324,11 @@ async function gotoAfterEdits(
   superseded: () => boolean,
 ) {
   for (let attempt = 0; ; attempt++) {
+    // oxlint-disable-next-line no-await-in-loop -- a retry re-asks only after the previous answer was empty and still fresh
     const locs = await request();
     if (locs.length || attempt >= 3 || superseded() || performance.now() - (editedAt.get(view) ?? -Infinity) > 1500)
       return locs;
+    // oxlint-disable-next-line no-await-in-loop -- waits before the next retry; `superseded()` is checked again after the delay
     await new Promise((r) => setTimeout(r, 250));
     if (superseded()) return [];
   }
@@ -502,6 +505,12 @@ async function gotoResolved(
       await navigateTo(module);
       return;
     }
+  }
+  // `var(--x)`: the server only knows this stylesheet's declarations; list the project's.
+  if (declaration && STYLESHEETS.has(doc.language)) {
+    const line = view.state.doc.lineAt(offset);
+    if (cssVariableAt(line.text, offset - line.from) && (await gotoWebReference(view, doc, pos, offset, superseded)))
+      return;
   }
   // Python: its servers have no type hierarchy and see one root, so the IDE's inheritance
   // graph answers implementations too (merged with the server's, not replacing them).

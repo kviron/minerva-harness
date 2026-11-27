@@ -6,8 +6,7 @@
  */
 import { RangeSet, StateEffect, StateField, type Extension } from "@codemirror/state";
 import { EditorView, GutterMarker, ViewPlugin, type ViewUpdate } from "@codemirror/view";
-import { iconAreaSource, registerEditorContribution } from "@/editor/api";
-import { rangeToOffsets } from "@/editor/lsp/positions";
+import { iconAreaSource, rangeToOffsets, registerEditorContribution } from "@/editor/api";
 import { editorPrefs } from "@/platform/editorSettings";
 import { useProject } from "@/platform/project";
 import type { FileMarkers, IndexedMarker, Location } from "@/platform/ipc";
@@ -84,6 +83,21 @@ export function markersOf(
   );
 }
 
+/** Created once: every `EditorView.baseTheme` call mounts new CSS rules into the document. */
+const INDEXED_MARKERS_THEME = EditorView.baseTheme({
+  ".cm-plugin-mapping-button": {
+    border: "none",
+    padding: "0 2px",
+    background: "transparent",
+    color: "inherit",
+    cursor: "pointer",
+    height: "100%",
+    display: "flex",
+    alignItems: "center",
+  },
+  ".cm-plugin-mapping-button:focus-visible": { outline: "1px solid var(--accent)" },
+});
+
 export function indexedMarkers(path: string): Extension {
   return [
     markersField,
@@ -93,19 +107,7 @@ export function indexedMarkers(path: string): Extension {
       markers: (view) => view.state.field(markersField),
       reserve: (state) => state.field(markersField).size > 0,
     }),
-    EditorView.baseTheme({
-      ".cm-plugin-mapping-button": {
-        border: "none",
-        padding: "0 2px",
-        background: "transparent",
-        color: "inherit",
-        cursor: "pointer",
-        height: "100%",
-        display: "flex",
-        alignItems: "center",
-      },
-      ".cm-plugin-mapping-button:focus-visible": { outline: "1px solid var(--accent)" },
-    }),
+    INDEXED_MARKERS_THEME,
     ViewPlugin.fromClass(
       class {
         last: FileMarkers | undefined;

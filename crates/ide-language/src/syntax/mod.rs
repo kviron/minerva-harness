@@ -1,5 +1,6 @@
 //! Tree-sitter driven structure: outline, folding, symbol tags, selection ranges, highlighting.
 
+mod bundler_aliases;
 mod cache;
 mod configuration;
 mod external;
@@ -12,6 +13,8 @@ mod literals;
 mod outline;
 mod php_align;
 mod python_facts;
+mod python_imports;
+mod rearrange;
 mod rst;
 mod selection;
 mod sfc;
@@ -19,6 +22,7 @@ mod vue;
 mod web;
 
 use crate::{FoldRange, LanguageConfig, LanguageRegistry, ScriptRegion, SymbolTag};
+pub use bundler_aliases::bundler_aliases;
 pub use cache::{MAX_CACHED_TREES, SyntaxCache, SyntaxCacheStats};
 pub use configuration::ConfigurationKey;
 pub use external::{ExternalFold, ExternalSymbol, ExternalSyntax, ExternalToken, set_external_syntax};
@@ -30,7 +34,7 @@ pub use lines::{shift_pos, shift_range};
 pub use literals::{Literal, LiteralKind, SpellingKind, SpellingRegion};
 pub use outline::{merge_kinds, merge_visibility};
 pub use php_align::PhpAlignment;
-pub use python_facts::{MethodBody, PythonClassFacts, PythonFacts, PythonMethodFacts};
+pub use python_facts::{MethodBody, PythonClassFacts, PythonFacts, PythonMethodFacts, PythonSuppression};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;

@@ -16,7 +16,6 @@ import {
   moveCompletionSelection,
   pickedCompletion,
   selectedCompletion,
-  snippet,
   startCompletion,
   type Completion,
   type CompletionContext,
@@ -53,6 +52,7 @@ import {
   typeColumnText,
   withoutDuplicates,
 } from "./completionItems";
+import { applySnippet } from "@/editor/core/cm/linkedSnippet";
 import { lspSnippetToCm, lspSnippetToPlainWithCaret, snippetVariables } from "./snippet";
 import { docOf, isUnavailable, lspDoc, lspRequest, reportLspError } from "./lsp";
 import { offsetToPos, posToOffset, textEditsToChanges } from "./positions";
@@ -62,6 +62,8 @@ import { iconNode } from "@/ui/iconNode";
 import { parameterInfoOrLeave, triggerSignatureHelp } from "./signature";
 import { featureBackoff } from "./availability";
 import { pathCompletionSource, pathContext, pathLike } from "./fileReferences";
+import { cssVariablePrefix, cssVariableSource, STYLESHEETS, type VariableOption } from "./cssVariables";
+import { javaDeclarationAt, variableNameSource } from "./variableNames";
 import { editorPrefs } from "@/platform/editorSettings";
 import { tx } from "@/platform/i18n";
 import { showHint } from "./hint";
@@ -70,6 +72,8 @@ import { languageSemantics } from "./semantic";
 import { remoteChange } from "@/editor/api";
 import { tooltipBounds } from "@/editor/core/cm/setup";
 import { completionLabelOffset } from "./theme";
+import { expectedFromSignature, expectedFromText, mentionedNames, smartItems } from "./smartCompletion";
+import { pythonInheritanceGraph } from "@/editor/navigation/inheritanceGraph";
 
 interface RequestContext {
   doc: number;
@@ -296,7 +300,8 @@ export function applyLspCompletion(
       start = tr.changes.mapPos(start, 1);
       end = tr.changes.mapPos(end, 1);
     }
-    snippet(lspSnippetToCm(item.insertText, snippetVariables(req.path)))(view, completion, start, end);
+    const source = lspSnippetToCm(item.insertText, snippetVariables(req.path));
+    applySnippet(view, [{ from: start, to: end, snippet: source }], completion);
     // A call snippet without a stop (`ArrayList<>()`): the caret goes inside until
     // signature help says there is nothing to pass.
     const head = view.state.selection.main.head;
@@ -616,14 +621,24 @@ function cancelInflight() {
   inflight = null;
 }
 
+/** Inside a stylesheet's `var(`, where `cssVariableSource` lists the project's custom properties instead of the server or the document's words. */
+function inVarCall(ctx: CompletionContext): boolean {
+  const language = ctx.state.facet(lspDoc)?.language ?? "";
+  if (!STYLESHEETS.has(language) || !isTauri()) return false;
+  const line = ctx.state.doc.lineAt(ctx.pos);
+  return cssVariablePrefix(line.text.slice(0, ctx.pos - line.from)) !== null;
+}
+
 /** Language-data completion sources (keywords etc.), used when no server answers. */
 async function fallback(ctx: CompletionContext): Promise<CompletionResult | null> {
+  if (inVarCall(ctx)) return null;
   const sources = ctx.state.languageDataAt<CompletionSource | readonly (string | Completion)[]>(
     "autocomplete",
     ctx.pos,
   );
   for (const s of sources) {
     const source = typeof s === "function" ? s : completeFromList(s);
+    // oxlint-disable-next-line no-await-in-loop -- falls back to the next source only when this one has no result; first answer wins
     const r = await source(ctx);
     if (r) return r;
   }
@@ -658,11 +673,9 @@ export function makeCompletion(item: CompletionItem, req: RequestContext): LspCo
  * for none) and `typeText` (the right-aligned type column), like LSP items.
  */
 const contributedSource: CompletionSource = async (ctx) => {
-  const results: CompletionResult[] = [];
-  for (const source of ctx.state.languageDataAt<CompletionSource>("openideaCompletion", ctx.pos)) {
-    const result = await source(ctx);
-    if (result) results.push(result);
-  }
+  const sources = ctx.state.languageDataAt<CompletionSource>("openideaCompletion", ctx.pos);
+  const answers = await Promise.all(sources.map((source) => source(ctx)));
+  const results = answers.filter((r): r is CompletionResult => !!r);
   return mergeResults(results);
 };
 
@@ -691,10 +704,11 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
   const doc = ctx.state.facet(lspDoc);
   if (!doc || doc.readOnly) return null;
   const word = ctx.matchBefore(WORD_BEFORE);
-  const trigger = triggerCharacter(ctx.state.sliceDoc(Math.max(0, ctx.pos - 2), ctx.pos));
+  const trigger = triggerCharacter(ctx.state.sliceDoc(Math.max(0, ctx.pos - 128), ctx.pos), doc.language);
   if (!ctx.explicit && !word && !trigger) return null;
   if (!ctx.explicit && word && !trigger && /^\d/.test(word.text)) return null;
-  if (!ctx.explicit && completionBackoff.active(doc.doc)) return fallback(ctx);
+  const smart = ctx.state.field(smartLookup, false) ?? false;
+  if (!ctx.explicit && completionBackoff.active(doc.doc)) return smart ? null : fallback(ctx);
   cancelInflight();
   const id = nextRequestId();
   inflight = id;
@@ -711,13 +725,40 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
   } catch (e) {
     if (isUnavailable(e)) {
       completionBackoff.mark(doc.doc);
-      return fallback(ctx);
+      return smart ? null : fallback(ctx);
     }
     return null;
   } finally {
     if (inflight === id) inflight = null;
   }
-  if (ctx.aborted || !list.items.length) return list.items.length ? null : fallback(ctx);
+  if (ctx.aborted || !list.items.length) return list.items.length || smart ? null : fallback(ctx);
+  let lower: ReadonlySet<CompletionItem> = new Set();
+  if (smart) {
+    const expected = await expectedType(ctx, doc.doc, word?.from ?? ctx.pos);
+    if (ctx.aborted) return null;
+    if (!expected) {
+      smartHint(ctx, tx("No expected type at the caret"));
+      return null;
+    }
+    const from = word?.from ?? ctx.pos;
+    const graph = doc.language === "python" ? await pythonInheritanceGraph().catch(() => []) : [];
+    const bases = new Map<string, string[]>();
+    for (const c of graph) bases.set(c.name, [...(bases.get(c.name) ?? []), ...c.bases]);
+    const smartResult = await smartItems(list.items, expected, (item) => resolveItem(doc.doc, item), {
+      typed: word?.text ?? "",
+      member: ctx.state.sliceDoc(from - 1, from) === ".",
+      mentioned: mentionedNames(ctx.state.doc.toString()),
+      bases: (name) => bases.get(name) ?? [],
+      aborted: () => ctx.aborted,
+    });
+    if (ctx.aborted) return null;
+    list = { ...list, items: smartResult.items };
+    lower = smartResult.lower;
+    if (!list.items.length) {
+      smartHint(ctx, tx`No suggestions of type ${expected}`);
+      return null;
+    }
+  }
   const req: RequestContext = { doc: doc.doc, path: doc.path, language: doc.uiMode, pos: ctx.pos, text: ctx.state.doc };
   const prefs = editorPrefs().completion;
   const typed = word?.text ?? "";
@@ -726,6 +767,7 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
       ? list.items.filter((it) => matchesCase(it.filterText ?? it.label, typed, prefs.caseSensitivity))
       : list.items,
   );
+  if (inVarCall(ctx)) items = items.filter((it) => !it.label.startsWith("--"));
   // A server snippet named like a live template (jdtls `sout`, `fori`) would be listed twice; the template wins.
   if (items.some((it) => it.kind === "snippet")) {
     const own = await contributedSource(ctx);
@@ -735,9 +777,17 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
   }
   return {
     from: word ? word.from : ctx.pos,
-    options: items.map((item) => makeCompletion(item, req)),
-    // "All letters" must re-check case on every keystroke.
-    validFor: list.isIncomplete || (prefs.matchCase && prefs.caseSensitivity === "all") ? undefined : VALID_FOR,
+    options: items.map((item) => {
+      const option = makeCompletion(item, req);
+      // Smart Type: an item that may fit (`Any`) follows the ones that do.
+      if (lower.has(item)) option.boost = -10;
+      return option;
+    }),
+    // "All letters" must re-check case on every keystroke; Smart Type resolved only what matched the typed letters.
+    validFor:
+      list.isIncomplete || (prefs.matchCase && prefs.caseSensitivity === "all") || (smart && typed)
+        ? undefined
+        : VALID_FOR,
     filter: true,
   };
 }
@@ -823,11 +873,67 @@ function exclusiveSource(ctx: CompletionContext): CompletionSource | null {
   return null;
 }
 
+/**
+ * Smart Type completion: while its lookup is open, the language server's items are narrowed to
+ * the caret's expected type and the other sources stay out.
+ */
+const setSmartLookup = StateEffect.define<boolean>();
+const smartLookup = StateField.define<boolean>({
+  create: () => false,
+  update: (value, tr) => tr.effects.reduce((v, e) => (e.is(setSmartLookup) ? e.value : v), value),
+});
+
+/** Ends Smart Type mode when its lookup closes or finds nothing. */
+const endSmartLookup = EditorView.updateListener.of((u) => {
+  if (!u.state.field(smartLookup) || completionStatus(u.startState) === null || completionStatus(u.state) !== null)
+    return;
+  queueMicrotask(() => {
+    if (u.view.state.field(smartLookup) && completionStatus(u.view.state) === null)
+      u.view.dispatch({ effects: setSmartLookup.of(false) });
+  });
+});
+
+/** The type expected at `from`: an annotated assignment, a `return`, else the active parameter's. */
+async function expectedType(ctx: CompletionContext, doc: number, from: number): Promise<string | null> {
+  const fromText = expectedFromText(ctx.state, from);
+  if (fromText) return fromText;
+  const help = await lspRequest(() => commands.lspSignatureHelp(doc, offsetToPos(ctx.state.doc, from))).catch(
+    () => null,
+  );
+  return expectedFromSignature(help);
+}
+
+/** Says why the Smart Type lookup is empty, in place of the generic "No suggestions". */
+function smartHint(ctx: CompletionContext, text: string) {
+  if (!ctx.view) return;
+  explicitPending.delete(ctx.view);
+  showHint(ctx.view, text, { timeout: 2000 });
+}
+
+/** ⌃Space: Basic completion, leaving Smart Type mode as IDEA does. */
+export function basicCompletion(view: EditorView): boolean {
+  if (view.state.field(smartLookup, false)) view.dispatch({ effects: setSmartLookup.of(false) });
+  return explicitCompletion(view);
+}
+
+/** ⌃⇧Space: the lookup lists only what fits the expected type at the caret. */
+export function smartTypeCompletion(view: EditorView): boolean {
+  closeCompletion(view);
+  view.dispatch({ effects: setSmartLookup.of(true) });
+  const started = explicitCompletion(view);
+  if (!started) view.dispatch({ effects: setSmartLookup.of(false) });
+  return started;
+}
+
 /** Show suggestions as you type: sources only answer explicit requests when it is off. */
 function gated(source: CompletionSource): CompletionSource {
   return (ctx) => {
+    if (ctx.state.field(smartLookup, false) && source !== claimingLspSource) return null;
     const only = exclusiveSource(ctx);
     if (only) return source === contributedSource ? only(ctx) : null;
+    // At a Java declaration's name only names fit: IDEA lists no live templates there, and
+    // jdtls' own name proposals repeat the type (`orderBookOrderBook`).
+    if (source !== variableNameSource && javaDeclarationAt(ctx)) return null;
     if (!ctx.explicit && (!editorPrefs().completion.autoPopup || inplaceRenameActive(ctx.state))) return null;
     if (!editorPrefs().completion.sortAlphabetically) return source(ctx);
     return Promise.resolve(source(ctx)).then(
@@ -961,6 +1067,13 @@ export function explicitCompletion(view: EditorView): boolean {
 // Rendering
 
 function kindBadge(c: Completion): Node | null {
+  const swatch = (c as VariableOption).swatch;
+  if (swatch) {
+    const span = document.createElement("span");
+    span.className = "cm-lsp-kind cm-lsp-swatch";
+    span.style.setProperty("--swatch", swatch);
+    return span;
+  }
   if (!isLsp(c) && "icon" in c) {
     const icon = (c as RichCompletion).icon;
     if (icon) return iconNode(icon, 16, "cm-lsp-kind");
@@ -1045,6 +1158,7 @@ const completionPopup = ViewPlugin.fromClass(
             footer.className = "cm-lsp-completion-footer";
             const tip = document.createElement("span");
             tip.textContent = tx("Press ↵ to insert, ⇥ to replace");
+            tip.title = tip.textContent;
             footer.append(tip, sortToggle(this.view));
           }
           // CodeMirror appends a fresh list when the candidates change.
@@ -1090,8 +1204,16 @@ export function completionExtension() {
   return [
     lookupKeys,
     prefetchResolve,
+    smartLookup,
+    endSmartLookup,
     autocompletion({
-      override: [gated(claimingLspSource), gated(contributedSource), gated(pathFallbackSource)],
+      override: [
+        gated(claimingLspSource),
+        gated(contributedSource),
+        gated(pathFallbackSource),
+        gated(cssVariableSource),
+        gated(variableNameSource),
+      ],
       icons: false,
       addToOptions: [
         { render: kindBadge, position: 20 },

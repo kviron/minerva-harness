@@ -1,5 +1,7 @@
-use ide_core::{NullSink, RequestId};
-use ide_host::{Host, HostConfig, ops};
+mod common;
+
+use ide_core::RequestId;
+use ide_host::{Host, ops};
 use std::sync::{Arc, Mutex};
 
 async fn find(host: &Host, pattern: &str) -> Vec<ide_search::FileMatches> {
@@ -30,17 +32,7 @@ async fn find_in_files_decodes_closed_files_with_the_project_encoding() {
     std::fs::create_dir(&root).unwrap();
     let text = "class CreditQuerySendUtils {\n    //中文搜索验证 Chinese Chinese Chinese\n}\n";
     std::fs::write(root.join("CreditQuerySendUtils.java"), ide_vfs::encode(text, "gbk", false).unwrap()).unwrap();
-    let host = Host::new(HostConfig {
-        config_dir: base.join("config"),
-        data_dir: base.join("data"),
-        local_data_dir: base.join("data"),
-        languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
-        syntax: Arc::default(),
-        sink_for: Box::new(|_| Arc::new(NullSink)),
-        owner: |w| w,
-        runtime: tokio::runtime::Handle::current(),
-        project_environment: false,
-    });
+    let host = Host::new(common::host_config(&base));
     host.trust.decide(&root, true, false).unwrap();
     let project = host.open_project("main", &root).unwrap();
     let mut defaults = project.documents.file_defaults();
@@ -57,4 +49,26 @@ async fn find_in_files_decodes_closed_files_with_the_project_encoding() {
     defaults.project_fallback = "big5".into();
     project.documents.set_file_defaults(defaults);
     assert!(find(&host, "中文搜索验证").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn find_in_files_decodes_closed_files_with_the_editorconfig_charset() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = dunce::canonicalize(temp.path()).unwrap();
+    let root = base.join("project");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join(".editorconfig"), "root = true\n[*.java]\ncharset = iso-8859-15\n").unwrap();
+    std::fs::write(root.join("A.java"), b"// a\xe7\xe3o \xa4 needle\n").unwrap();
+    let host = Host::new(common::host_config(&base));
+    host.trust.decide(&root, true, false).unwrap();
+    let project = host.open_project("main", &root).unwrap();
+    let mut defaults = project.documents.file_defaults();
+    defaults.project_fallback = "gbk".into();
+    project.documents.set_file_defaults(defaults);
+
+    let files = find(&host, "ação €").await;
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].matches[0].text, "// ação € needle", "the text the editor shows");
+    assert_eq!(find(&host, "needle").await[0].matches[0].text, "// ação € needle");
 }

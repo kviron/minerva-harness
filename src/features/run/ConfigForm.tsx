@@ -6,13 +6,22 @@
 import { writeClipboardText } from "@/platform/clipboard";
 import { isJvmApplication, parseJavaArgs } from "@/platform/javaLaunch";
 import { useRunTargets } from "@/platform/pluginRunTargets";
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import clsx from "clsx";
 import { isTauri, type BeforeLaunchTask, type BuildPolicy, type RunConfig } from "@/platform/ipc";
 import { useWorkflowSettings } from "@/platform/workflowSettings";
 import { relativePath, useProject } from "@/platform/project";
 import { isRemoteWindow } from "@/platform/remote";
-import { useTx, useTxTemplate } from "@/platform/i18n";
+import { txPart, useTx, useTxTemplate } from "@/platform/i18n";
 import {
   Button,
   Checkbox,
@@ -48,11 +57,24 @@ import {
 } from "./configs";
 import { gradleContainsModule } from "./gradleRun";
 import { EnvDialog } from "./EnvDialog";
+import { PluginArgsInput } from "./PluginArgsInput";
+import { pluginOwnedConfig } from "./pluginArgsCompletion";
 import { useBuildModel } from "@/platform/buildModel";
 import { COMPOUND, formParams, terminalApplies, withParams } from "./types";
+import { frameworkFor } from "./testing";
 import { TomcatSettings } from "./TomcatSettings";
 import { toolWindowTitle } from "@/workbench/toolwindows/title";
 import styles from "./Run.module.css";
+
+const TASK_ICONS: Readonly<Partial<Record<string, string>>> = {
+  build: "build-project",
+  buildModule: "build-project",
+  buildArtifacts: "build-rebuild",
+  dotnetBuild: "build-project",
+  run: "run",
+  tool: "settings",
+  command: "terminal",
+};
 
 /**
  * Debug adapters with a real launch template (`debugger/launch.ts`, `debugger/java.ts`),
@@ -88,6 +110,7 @@ export type OptionId =
   | "openToolWindow"
   | "focusToolWindow"
   | "isTest"
+  | "watch"
   | "emulateTerminal";
 
 const VALUE_OPTIONS: ReadonlySet<OptionId> = new Set([
@@ -110,13 +133,14 @@ const OPTION_LABELS: Record<OptionId, string> = {
   openToolWindow: "Open run/debug tool window when started",
   focusToolWindow: "Focus run/debug tool window when started",
   isTest: "Show results in the test runner",
+  watch: "Watch for changes",
   emulateTerminal: "Emulate terminal in output console",
 };
 
 const OPTION_GROUPS: ReadonlyArray<{ label: string; options: OptionId[]; process: boolean }> = [
   { label: "Operating System", options: ["allowParallel", "stdinFile", "envFiles", "emulateTerminal"], process: true },
   { label: "Logs", options: ["outputFile", "showOnStdout", "showOnStderr"], process: true },
-  { label: "Test", options: ["isTest"], process: true },
+  { label: "Test", options: ["isTest", "watch"], process: true },
   {
     label: "Before Launch",
     options: ["buildPolicy", "beforeLaunch", "openToolWindow", "focusToolWindow"],
@@ -149,6 +173,8 @@ export function optionSet(config: RunConfig, id: OptionId, openByDefault: boolea
       return !!config.focusToolWindow;
     case "isTest":
       return config.isTest;
+    case "watch":
+      return !!config.watch;
     case "emulateTerminal":
       return !!config.emulateTerminal;
   }
@@ -179,6 +205,8 @@ export function optionPatch(id: OptionId, on: boolean): Partial<RunConfig> {
       return { focusToolWindow: on };
     case "isTest":
       return on ? { isTest: true, emulateTerminal: false } : { isTest: false };
+    case "watch":
+      return { watch: on };
     case "emulateTerminal":
       return { emulateTerminal: on };
   }
@@ -327,12 +355,18 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
   });
   const [shown, setShown] = useState<ReadonlySet<OptionId>>(() => new Set());
   const [argsText, setArgsText] = useState<string | null>(null);
+  const setArgs = (text: string) => {
+    setArgsText(text);
+    const args = parseArgs(text);
+    const module = parseJavaArgs(args).mainClass === parseJavaArgs(config.args).mainClass ? config.module : undefined;
+    update({ args, params: {}, module });
+  };
   const [envText, setEnvText] = useState<string | null>(null);
   const [envFilesText, setEnvFilesText] = useState<string | null>(null);
   const [envOpen, setEnvOpen] = useState(false);
   const [modifyOpen, setModifyOpen] = useState(false);
   const [lastRequest, setLastRequest] = useState(modifyRequest);
-  const [taskMenu, setTaskMenu] = useState(false);
+  const [taskMenu, setTaskMenu] = useState<"add" | { index: number; anchor: HTMLButtonElement } | null>(null);
   const modifyRef = useRef<HTMLButtonElement>(null);
   const taskRef = useRef<HTMLButtonElement>(null);
 
@@ -371,6 +405,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
   };
 
   const terminal = terminalApplies(config, type);
+  const watchApplies = config.isTest && frameworkFor(config) === "js";
   // A terminal has no separate input file: the two options exclude each other.
   const blocked = (id: OptionId) =>
     (id === "emulateTerminal" && isShown("stdinFile")) || (id === "stdinFile" && !!config.emulateTerminal);
@@ -381,7 +416,8 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
         (id) =>
           (!compound || id === "beforeLaunch") &&
           (id !== "emulateTerminal" || terminal || !!config.emulateTerminal) &&
-          (id !== "buildPolicy" || buildPolicyApplies(config)),
+          (id !== "buildPolicy" || buildPolicyApplies(config)) &&
+          (id !== "watch" || watchApplies),
       )
       .map((id): MenuItem => ({
         label: OPTION_LABELS[id],
@@ -406,23 +442,23 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
         run: () => addTask("run", c.id),
       })),
     },
-    { label: TASK_LABELS.build, icon: "build-project", run: () => addTask("build") },
+    { label: TASK_LABELS.build, icon: TASK_ICONS.build, run: () => addTask("build") },
     {
       label: TASK_LABELS.buildModule,
-      icon: "build-project",
+      icon: TASK_ICONS.buildModule,
       disabled: config.module == null,
       run: () => addTask("buildModule", config.module ?? ""),
     },
-    { label: TASK_LABELS.buildArtifacts, icon: "build-rebuild", run: () => addTask("buildArtifacts") },
+    { label: TASK_LABELS.buildArtifacts, icon: TASK_ICONS.buildArtifacts, run: () => addTask("buildArtifacts") },
     ...(config.kind === "dotnet"
-      ? [{ label: TASK_LABELS.dotnetBuild, icon: "build-project", run: () => addTask("dotnetBuild") }]
+      ? [{ label: TASK_LABELS.dotnetBuild, icon: TASK_ICONS.dotnetBuild, run: () => addTask("dotnetBuild") }]
       : []),
     {
       label: TASK_LABELS.tool,
       disabled: !externalTools.length,
       submenu: externalTools.map((t) => ({ label: t.name, verbatim: true, run: () => addTask("tool", t.id) })),
     },
-    { label: TASK_LABELS.command, icon: "terminal", run: () => addTask("command") },
+    { label: TASK_LABELS.command, icon: TASK_ICONS.command, run: () => addTask("command") },
     {
       label: TASK_LABELS.toolWindow,
       submenu: [...toolWindows.values()]
@@ -442,6 +478,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
     [next[i], next[j]] = [next[j]!, next[i]!];
     setTasks(next);
   };
+  const taskActions = taskMenu === "add" ? null : taskMenu;
 
   const adapterOptions: SelectOption[] = [
     { value: "", label: "None" },
@@ -456,7 +493,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
   const targetOptions: SelectOption[] = [
     { value: "__default", label: "Default run target" },
     { value: "", label: "Local machine" },
-    ...runTargets.map((t) => ({ value: t.id, label: t.name.trim() || t.id })),
+    ...runTargets.map((t) => ({ value: t.id, verbatim: true, label: t.name.trim() || t.id })),
   ];
   if (config.target && !runTargets.some((t) => t.id === config.target))
     targetOptions.push({ value: config.target, label: txTemplate(`${config.target} (missing)`) });
@@ -470,6 +507,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
       "openToolWindow",
       "focusToolWindow",
       "isTest",
+      "watch",
     ] as const
   ).filter(
     (id) => (!noProcess || id === "openToolWindow" || id === "focusToolWindow") && optionSet(config, id, openByDefault),
@@ -507,7 +545,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
       {config.kind === "tomcat" ? (
         <TomcatSettings config={config} onChange={onChange} />
       ) : (
-        <>
+        <div className={styles.formSettings}>
           {!noProcess && (
             <Field
               label="Run on"
@@ -602,21 +640,22 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
                 />
               </Field>
               <Field label="Arguments">
-                <Input
-                  mono
-                  aria-label="Arguments"
-                  value={argsText ?? formatArgs(config.args)}
-                  placeholder="Space separated; quote with ' or &quot;"
-                  onChange={(e) => {
-                    setArgsText(e.target.value);
-                    const args = parseArgs(e.target.value);
-                    const module =
-                      parseJavaArgs(args).mainClass === parseJavaArgs(config.args).mainClass
-                        ? config.module
-                        : undefined;
-                    update({ args, params: {}, module });
-                  }}
-                />
+                {pluginOwnedConfig(config) ? (
+                  <PluginArgsInput
+                    configId={config.id}
+                    value={argsText ?? formatArgs(config.args)}
+                    placeholder="Space separated; quote with ' or &quot;"
+                    onChange={setArgs}
+                  />
+                ) : (
+                  <Input
+                    mono
+                    aria-label="Arguments"
+                    value={argsText ?? formatArgs(config.args)}
+                    placeholder="Space separated; quote with ' or &quot;"
+                    onChange={(e) => setArgs(e.target.value)}
+                  />
+                )}
               </Field>
             </>
           )}
@@ -763,62 +802,104 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
 
           {isShown("beforeLaunch") && (
             <Field label="Before launch" error={errors.beforeLaunch} top>
-              <div className={styles.taskList} role="list" aria-label={tx("Before launch tasks")}>
-                {tasks.map((t, i) => (
-                  <div key={i} role="listitem" className={styles.taskRow}>
-                    {t.kind === "command" ? (
-                      <Input
-                        mono
-                        aria-label={txTemplate(`Before launch command ${i + 1}`)}
-                        value={t.target ?? ""}
-                        placeholder="Shell command, e.g. make generate"
-                        onChange={(e) =>
-                          setTasks(tasks.map((x, j) => (j === i ? { ...x, target: e.target.value } : x)))
-                        }
-                      />
-                    ) : (
-                      <span className={styles.taskLabel} title={txTemplate(taskLabel(t, all))}>
-                        {txTemplate(taskLabel(t, all))}
-                      </span>
-                    )}
-                    <span className={styles.taskActions}>
+              <div className={styles.beforeLaunchTasks} role="list" aria-label={tx("Before launch tasks")}>
+                {tasks.map((t, i) => {
+                  const label = txTemplate(taskLabel(t, all));
+                  const target = t.kind === "run" ? all.find((c) => c.id === t.target) : undefined;
+                  const icon = target ? configIcon(target) : TASK_ICONS[t.kind];
+                  const prefix = (
+                    <>
+                      {icon && <Icon name={icon} size={14} />}
+                      <span className={styles.taskOrder}>{i + 1}.</span>
+                    </>
+                  );
+                  const actions = {
+                    "aria-haspopup": "menu" as const,
+                    "aria-expanded": taskActions?.index === i,
+                    onClick: (e: MouseEvent<HTMLButtonElement>) => setTaskMenu({ index: i, anchor: e.currentTarget }),
+                  };
+                  return (
+                    // oxlint-disable-next-line react/no-array-index-key -- tasks of one kind can repeat; position is the identity
+                    <div key={i} role="listitem" className={styles.taskTag}>
+                      {t.kind === "command" ? (
+                        <>
+                          {prefix}
+                          <Input
+                            mono
+                            className={styles.taskCommand}
+                            aria-label={txTemplate(`Before launch command ${i + 1}`)}
+                            value={t.target ?? ""}
+                            placeholder="Shell command, e.g. make generate"
+                            onChange={(e) =>
+                              setTasks(tasks.map((x, j) => (j === i ? { ...x, target: e.target.value } : x)))
+                            }
+                          />
+                          <IconButton icon="more" title="Task Actions" size="small" {...actions} />
+                        </>
+                      ) : (
+                        <button type="button" className={styles.taskName} title={label} {...actions}>
+                          {prefix}
+                          <span className={styles.taskLabel}>{label}</span>
+                        </button>
+                      )}
                       <IconButton
-                        icon="arrow-up"
-                        size="small"
-                        iconSize={12}
-                        title="Move Up"
-                        disabled={i === 0}
-                        onClick={() => moveTask(i, -1)}
-                      />
-                      <IconButton
-                        icon="arrow-down"
-                        size="small"
-                        iconSize={12}
-                        title="Move Down"
-                        disabled={i === tasks.length - 1}
-                        onClick={() => moveTask(i, 1)}
-                      />
-                      <IconButton
-                        icon="minus"
+                        icon="close"
                         size="small"
                         iconSize={12}
                         title="Remove Task"
                         onClick={() => setTasks(tasks.filter((_, j) => j !== i))}
                       />
-                    </span>
-                  </div>
-                ))}
-                <Button
-                  ref={taskRef}
-                  size="small"
-                  variant="ghost"
-                  icon="plus"
-                  aria-haspopup="menu"
-                  onClick={() => setTaskMenu(true)}
-                >
-                  <T>Add task</T>
-                </Button>
-                <Menu open={taskMenu} anchor={taskRef} items={taskItems} onClose={() => setTaskMenu(false)} />
+                    </div>
+                  );
+                })}
+                <div role="listitem">
+                  {tasks.length ? (
+                    <IconButton
+                      ref={taskRef}
+                      title="Add task"
+                      icon="plus"
+                      size="small"
+                      aria-haspopup="menu"
+                      aria-expanded={taskMenu === "add"}
+                      onClick={() => setTaskMenu("add")}
+                    />
+                  ) : (
+                    <Button
+                      ref={taskRef}
+                      size="small"
+                      variant="ghost"
+                      icon="plus"
+                      aria-haspopup="menu"
+                      aria-expanded={taskMenu === "add"}
+                      onClick={() => setTaskMenu("add")}
+                    >
+                      <T>Add task</T>
+                    </Button>
+                  )}
+                </div>
+                <Menu open={taskMenu === "add"} anchor={taskRef} items={taskItems} onClose={() => setTaskMenu(null)} />
+                {taskActions && (
+                  <Menu
+                    open
+                    anchor={taskActions.anchor}
+                    aria-label={tx("Task Actions")}
+                    items={[
+                      {
+                        label: "Move Up",
+                        icon: "arrow-up",
+                        disabled: taskActions.index === 0,
+                        run: () => moveTask(taskActions.index, -1),
+                      },
+                      {
+                        label: "Move Down",
+                        icon: "arrow-down",
+                        disabled: taskActions.index === tasks.length - 1,
+                        run: () => moveTask(taskActions.index, 1),
+                      },
+                    ]}
+                    onClose={() => setTaskMenu(null)}
+                  />
+                )}
               </div>
             </Field>
           )}
@@ -832,11 +913,17 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
                     icon="close"
                     size="small"
                     iconSize={10}
-                    title={tx`Remove '${OPTION_LABELS[id]}'`}
+                    title={tx`Remove '${txPart(OPTION_LABELS[id])}'`}
                     onClick={() => update(optionPatch(id, false))}
                   />
                 </span>
               ))}
+            </div>
+          )}
+
+          {config.watch && watchApplies && !noProcess && (
+            <div className={styles.notice}>
+              <T>Debug runs the tests once, without watching.</T>
             </div>
           )}
 
@@ -860,7 +947,7 @@ export function ConfigForm({ config, all, type, errors, template, onChange, modi
               }}
             />
           )}
-        </>
+        </div>
       )}
     </div>
   );
@@ -896,8 +983,9 @@ function TypeField({
   }, [field]);
   if (field.control === "output") return <OutputField label={field.label} text={field.value?.(params) ?? ""} />;
   if (field.control === "select") {
-    const options = [...(field.options ?? []), ...loaded];
-    if (value && !options.some((o) => o.value === value)) options.push({ value, label: value });
+    // Loaded options are detected data (JDKs, build modules), not catalog text.
+    const options: SelectOption[] = [...(field.options ?? []), ...loaded.map((o) => ({ ...o, verbatim: true }))];
+    if (value && !options.some((o) => o.value === value)) options.push({ value, label: value, verbatim: true });
     return (
       <Select
         value={value || (options[0]?.value ?? "")}

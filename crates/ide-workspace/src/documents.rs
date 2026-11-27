@@ -1,5 +1,5 @@
 use crate::editorconfig::{EditorConfig, EditorConfigProps};
-use crate::file_defaults::FileDefaults;
+use crate::file_defaults::{EncodingSource, FileDefaults};
 use ide_core::error::ErrorKind;
 use ide_core::{ChangeSet, DocId, IdeError, IdeEvent, IdeResult, LanguageId, SharedSink, TextEdit};
 use ide_text::{AppliedChange, ByteEdit, Document, LineEnding};
@@ -29,8 +29,8 @@ pub struct DocumentInfo {
     /// (archive entries, JDT sources with an editable attachment encoding,
     /// Git revisions); false for server-generated content (decompiled code).
     pub can_reload_encoding: bool,
-    /// Larger than `ide_vfs::LARGE_FILE_THRESHOLD`: language servers, syntax
-    /// structure and folding are disabled; the editor should drop heavy features.
+    /// Marks files above `ide_vfs::LARGE_FILE_THRESHOLD` for reduced editor
+    /// features such as disabling language servers and folding.
     #[specta(optional)]
     pub large: bool,
     /// Effective `.editorconfig` properties, when any section applies.
@@ -168,15 +168,63 @@ struct DocState {
     can_reload_encoding: bool,
     /// The user picked `encoding`; reloads keep it instead of detecting again.
     encoding_chosen: bool,
+    /// The user converted the text to `encoding`; it is theirs to keep once a save writes it.
+    encoding_unsaved: bool,
     /// Disk state we last loaded or wrote; changes matching it are our own.
     disk_mtime: f64,
     disk_len: u64,
     /// The file changed on disk while this buffer had unsaved changes; autosave leaves it
     /// alone until the user saves explicitly or the buffer is reloaded.
     disk_conflict: bool,
+    /// External changes seen while the buffer had unsaved changes (each `disk_conflict`), so an
+    /// undo of a refactoring can tell a write by another program from the IDE's own saves.
+    external_writes: u64,
+    /// Text as of that disk state: an edit that returns to it (undo) leaves the document clean.
+    /// `None` for large files (no second copy), virtual documents, and once a pending encoding,
+    /// line-ending or BOM change makes the buffer differ from the file whatever the text.
+    clean_text: Option<Document>,
     closed: bool,
     /// URI of a virtual document (no file behind it).
     uri: Option<String>,
+}
+
+impl DocState {
+    /// The buffer matches the file on disk again, read or written at `mtime`.
+    fn synced(&mut self, mtime: f64) {
+        self.disk_mtime = mtime;
+        self.disk_len = disk_len(&self.path);
+        self.disk_conflict = false;
+        self.clean_text = (!self.large).then(|| self.doc.clone());
+    }
+
+    /// The bytes saving `doc` with this document's encoding, BOM and conversion would write.
+    fn bytes_for_save(&self, doc: &Document) -> IdeResult<Vec<u8>> {
+        let text = doc.text_for_save();
+        Ok(if self.native_to_ascii {
+            ide_vfs::encode_properties_ascii(&text).into_bytes()
+        } else {
+            ide_vfs::encode(&text, &self.encoding, self.has_bom)?
+        })
+    }
+
+    /// Whether the file changed on disk since the buffer last matched it. A moved stamp with the
+    /// same bytes (touch, a tool rewriting the file unchanged) is no change and its stamp is adopted. Reads the file
+    /// only when the mtime moved but the length did not; without a clean text to compare (large
+    /// files, a pending encoding, line-ending or BOM change, a reported conflict) a moved stamp counts.
+    fn changed_on_disk(&mut self, meta: &std::fs::Metadata) -> bool {
+        let mtime = ide_vfs::mtime_ms(meta);
+        if mtime == self.disk_mtime && meta.len() == self.disk_len {
+            return false;
+        }
+        let same_bytes = meta.len() == self.disk_len
+            && self.clean_text.as_ref().is_some_and(|clean| {
+                self.bytes_for_save(clean).is_ok_and(|bytes| std::fs::read(&self.path).is_ok_and(|disk| disk == bytes))
+            });
+        if same_bytes {
+            self.disk_mtime = mtime;
+        }
+        !same_bytes
+    }
 }
 
 fn keys_for(path: &Path) -> Vec<PathBuf> {
@@ -199,6 +247,28 @@ fn absolute(path: &Path) -> PathBuf {
 
 fn disk_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// EditorConfig takes precedence over File Encodings for legacy text and ASCII labels.
+/// UTF-16 is detected, not assumed; invalid UTF-8 still uses the File Encodings fallback.
+fn configured_fallback<'a>(
+    defaults: &'a FileDefaults,
+    path: &Path,
+    editorconfig: Option<&EditorConfigProps>,
+) -> Option<ide_vfs::Fallback<'a>> {
+    let path = absolute(path);
+    let charset = editorconfig.filter(|_| defaults.editorconfig).and_then(EditorConfigProps::encoding);
+    let inherited = defaults.inherited_encoding_for(&path);
+    let fallback = if inherited.source == EncodingSource::Folder && charset.is_some() {
+        defaults.project_encoding_for(&path).fallback()
+    } else {
+        inherited.fallback()
+    };
+    match charset {
+        Some(("utf-8", _)) => fallback.map(|f| ide_vfs::Fallback { ascii: false, ..f }),
+        Some((encoding, _)) if !encoding.starts_with("utf-16") => Some(ide_vfs::Fallback { encoding, ascii: true }),
+        _ => fallback,
+    }
 }
 
 fn read_only_error(path: &Path) -> IdeError {
@@ -264,9 +334,7 @@ impl Documents {
                 let loaded = Self::load_as(&st.path, &st.encoding, enabled)?;
                 self.replace_locked(id, st, &loaded.text)?;
                 st.native_to_ascii = enabled;
-                st.disk_mtime = loaded.mtime_ms;
-                st.disk_len = disk_len(&st.path);
-                st.disk_conflict = false;
+                st.synced(loaded.mtime_ms);
                 Ok(())
             });
             if let Err(e) = result {
@@ -304,13 +372,48 @@ impl Documents {
 
     /// Closed-file readers use the same decoding as document opening.
     pub fn load_file(&self, path: &Path) -> IdeResult<ide_vfs::LoadedText> {
-        Self::load_with_defaults(path, &self.file_defaults())
+        let defaults = self.file_defaults();
+        Ok(Self::load_with_defaults(path, &defaults, self.editorconfig_for(path, &defaults).as_ref())?.0)
+    }
+
+    /// Encoding of `bytes`, a revision of `path`, with the same rules as opening the file.
+    pub fn detect_encoding(&self, path: &Path, bytes: &[u8]) -> &'static encoding_rs::Encoding {
+        let defaults = self.file_defaults();
+        let editorconfig = self.editorconfig_for(path, &defaults);
+        let configured = defaults.configured_encoding_for(&absolute(path));
+        if configured.source == EncodingSource::File
+            && let Some(enc) = encoding_rs::Encoding::for_label(configured.label.as_bytes())
+            && !enc.decode_with_bom_removal(bytes).0.contains(char::REPLACEMENT_CHARACTER)
+        {
+            return enc;
+        }
+        ide_vfs::detect_encoding(bytes, configured_fallback(&defaults, path, editorconfig.as_ref()))
+    }
+
+    fn editorconfig_for(&self, path: &Path, defaults: &FileDefaults) -> Option<EditorConfigProps> {
+        if !defaults.editorconfig || ide_vfs::is_archive_path(path) {
+            return None;
+        }
+        self.editorconfig.resolve(&absolute(path))
+    }
+
+    /// Fallback encoding for closed-file search; ASCII relabelling does not affect its text.
+    pub fn configured_encoding_for(&self, path: &Path) -> Option<String> {
+        let defaults = self.file_defaults();
+        let editorconfig = self.editorconfig_for(path, &defaults);
+        let configured = defaults.configured_encoding_for(&absolute(path));
+        if configured.source == EncodingSource::File {
+            return Some(configured.label.to_owned());
+        }
+        configured_fallback(&defaults, path, editorconfig.as_ref()).map(|f| f.encoding.to_owned())
     }
 
     /// Bounded closed-file snapshots use the same project defaults as open documents.
     pub fn load_file_bounded(&self, path: &Path, max_bytes: usize) -> IdeResult<ide_vfs::LoadedText> {
         let defaults = self.file_defaults();
-        let mut loaded = ide_vfs::load_text_bounded(path, defaults.fallback_for(&absolute(path)), max_bytes)?;
+        let editorconfig = self.editorconfig_for(path, &defaults);
+        let mut loaded =
+            ide_vfs::load_text_bounded(path, configured_fallback(&defaults, path, editorconfig.as_ref()), max_bytes)?;
         if !loaded.binary && defaults.native_to_ascii_for(path) {
             loaded.text = ide_vfs::decode_properties_escapes(&loaded.text);
         }
@@ -321,12 +424,30 @@ impl Documents {
         Self::load_as(path, encoding, self.native_to_ascii_for(path))
     }
 
-    fn load_with_defaults(path: &Path, defaults: &FileDefaults) -> IdeResult<ide_vfs::LoadedText> {
-        let mut loaded = ide_vfs::load_text_with_fallback(path, defaults.fallback_for(&absolute(path)))?;
+    /// Loads `path` as the settings say. `true`: decoded in the encoding chosen for this
+    /// very file, as "Reload with Encoding" does, instead of detecting it.
+    fn load_with_defaults(
+        path: &Path,
+        defaults: &FileDefaults,
+        editorconfig: Option<&EditorConfigProps>,
+    ) -> IdeResult<(ide_vfs::LoadedText, bool)> {
+        let path_abs = absolute(path);
+        let configured = defaults.configured_encoding_for(&path_abs);
+        if configured.source == EncodingSource::File {
+            let loaded = Self::load_as(path, configured.label, defaults.native_to_ascii_for(path))?;
+            // The bytes are not text in that encoding (the file changed outside the IDE):
+            // open it as if nothing was chosen, rather than show and save broken characters.
+            // A single-byte encoding decodes any bytes, so this only catches the others.
+            if !loaded.text.contains(char::REPLACEMENT_CHARACTER) {
+                return Ok((loaded, true));
+            }
+        }
+        let fallback = configured_fallback(defaults, path, editorconfig);
+        let mut loaded = ide_vfs::load_text_with_fallback(path, fallback)?;
         if !loaded.binary && defaults.native_to_ascii_for(path) {
             loaded.text = ide_vfs::decode_properties_escapes(&loaded.text);
         }
-        Ok(loaded)
+        Ok((loaded, false))
     }
 
     pub fn file_defaults(&self) -> FileDefaults {
@@ -407,7 +528,9 @@ impl Documents {
             return Ok(info);
         }
         let defaults = self.file_defaults();
-        let loaded = Self::load_with_defaults(path, &defaults)?;
+        let editorconfig = self.editorconfig_for(path, &defaults);
+        let (loaded, encoding_chosen) = Self::load_with_defaults(path, &defaults, editorconfig.as_ref())?;
+        let editorconfig = editorconfig.filter(|_| !loaded.binary);
         let language = (self.detect_language)(path, loaded.text.lines().next());
         let ui_mode = (self.detect_ui_mode)(path, &language);
         // Archive entries (`<jar>!/<entry>`) are read-only and kept from language
@@ -417,25 +540,28 @@ impl Documents {
         let writable = !in_archive && meta.as_ref().map(|m| !m.permissions().readonly()).unwrap_or(true);
         let empty_file = meta.as_ref().is_some_and(|m| m.len() == 0);
         let observed = !(loaded.binary || loaded.too_large || in_archive);
-        let editorconfig = if loaded.binary || in_archive || !defaults.editorconfig {
-            None
-        } else {
-            self.editorconfig.resolve(&absolute(path))
-        };
         let mut doc = Document::new(&loaded.text);
         let (mut encoding, mut has_bom) = (loaded.encoding, loaded.has_bom);
         // An empty file has nothing to detect: Code Style / File Encodings defaults apply.
         if empty_file && !loaded.binary {
             doc.set_line_ending(defaults.line_ending);
-            encoding = defaults.encoding.clone();
-            has_bom = defaults.encoding == "utf-8" && defaults.utf8_bom;
+            if !encoding_chosen {
+                let configured = defaults.configured_encoding_for(&absolute(path));
+                encoding = match configured.source {
+                    EncodingSource::Folder => configured.label.to_owned(),
+                    _ => defaults.encoding.clone(),
+                };
+                has_bom = encoding == "utf-8" && defaults.utf8_bom;
+            }
         }
         if let Some(ec) = &editorconfig {
             if let Some(le) = ec.end_of_line {
                 doc.set_line_ending(le);
             }
-            // An empty file has no detectable encoding: take the configured one.
-            if empty_file && let Some((enc, bom)) = ec.encoding() {
+            if let Some((enc, bom)) = ec.encoding()
+                && empty_file
+                && !encoding_chosen
+            {
                 (encoding, has_bom) = (enc.to_owned(), bom);
             }
         }
@@ -457,13 +583,18 @@ impl Documents {
             binary: loaded.binary,
             dirty: false,
             can_reload_encoding: true,
-            encoding_chosen: false,
+            encoding_chosen,
+            encoding_unsaved: false,
             disk_mtime: loaded.mtime_ms,
             disk_len: disk_len(path),
             disk_conflict: false,
+            external_writes: 0,
+            clean_text: None,
             closed: false,
             uri: None,
         };
+        let mut state = state;
+        state.clean_text = (!state.large).then(|| state.doc.clone());
         let slot: Slot = Arc::new(Mutex::new(state));
         let st = slot.lock();
         let id = {
@@ -531,9 +662,12 @@ impl Documents {
             dirty: false,
             can_reload_encoding,
             encoding_chosen: false,
+            encoding_unsaved: false,
             disk_mtime: 0.0,
             disk_len: 0,
             disk_conflict: false,
+            external_writes: 0,
+            clean_text: None,
             closed: false,
             uri: Some(uri.to_owned()),
         };
@@ -590,9 +724,12 @@ impl Documents {
             dirty: false,
             can_reload_encoding: false,
             encoding_chosen: false,
+            encoding_unsaved: false,
             disk_mtime: 0.0,
             disk_len: 0,
             disk_conflict: false,
+            external_writes: 0,
+            clean_text: None,
             closed: false,
             uri: Some(key.to_string_lossy().into_owned()),
         };
@@ -668,6 +805,44 @@ impl Documents {
         }
     }
 
+    /// Releases client-held document references when a remote window disconnects:
+    /// clean documents close so external changes on disk are picked up cleanly on
+    /// reopen, while dirty buffers remain registered (`refs = 0`) so reconnecting
+    /// after a dropped connection keeps unsaved edits without leaking refcounts.
+    pub fn release_client_refs(&self) {
+        let _operation = self.operations.lock();
+        let mut to_close = Vec::new();
+        {
+            let mut reg = self.registry.lock();
+            let ids: Vec<DocId> = reg.docs.keys().copied().collect();
+            for id in ids {
+                let dirty = reg.docs.get(&id).is_some_and(|e| e.slot.lock().dirty);
+                if dirty {
+                    if let Some(entry) = reg.docs.get_mut(&id) {
+                        entry.refs = 0;
+                    }
+                } else if let Some(entry) = reg.docs.remove(&id) {
+                    for k in &entry.keys {
+                        if reg.by_key.get(k) == Some(&id) {
+                            reg.by_key.remove(k);
+                        }
+                    }
+                    to_close.push((id, entry.slot));
+                }
+            }
+        }
+        let observers = self.observers();
+        for (doc, slot) in to_close {
+            let mut st = slot.lock();
+            st.closed = true;
+            if st.observed {
+                for o in &observers {
+                    o.closed(doc, &st.path);
+                }
+            }
+        }
+    }
+
     fn set_dirty(&self, doc: DocId, st: &mut DocState, dirty: bool) {
         if st.dirty != dirty {
             st.dirty = dirty;
@@ -699,7 +874,8 @@ impl Documents {
                     tracing::warn!("edit of {} rejected: {e}", st.path.display());
                 }
             })?;
-            self.set_dirty(doc, st, true);
+            let dirty = !st.clean_text.as_ref().is_some_and(|clean| clean.same_text(&st.doc));
+            self.set_dirty(doc, st, dirty);
             self.notify_changed(doc, st, &applied, &edits);
             Ok(st.doc.version())
         })
@@ -825,11 +1001,35 @@ impl Documents {
     /// on disk after this buffer was edited, which only an explicit save may overwrite.
     pub fn autosave(&self, doc: DocId) -> IdeResult<bool> {
         self.with_doc(doc, |st| {
+            self.check_disk_conflict(doc, st);
             if st.dirty && st.disk_conflict {
                 return Ok(false);
             }
             self.write(doc, st).map(|()| true)
         })
+    }
+
+    /// An unsaved buffer whose file another program wrote: the watcher event may not have arrived
+    /// yet, so check the stamp now.
+    fn check_disk_conflict(&self, doc: DocId, st: &mut DocState) {
+        if st.dirty
+            && !st.disk_conflict
+            && st.uri.is_none()
+            && let Ok(meta) = std::fs::metadata(&st.path)
+            && st.changed_on_disk(&meta)
+        {
+            self.disk_conflict(doc, st, &meta);
+        }
+    }
+
+    fn disk_conflict(&self, doc: DocId, st: &mut DocState, meta: &std::fs::Metadata) {
+        st.disk_mtime = ide_vfs::mtime_ms(meta);
+        st.disk_len = meta.len();
+        st.disk_conflict = true;
+        st.external_writes += 1;
+        // The text read before no longer matches the file: undoing back to it is not clean.
+        st.clean_text = None;
+        self.sink.emit(IdeEvent::DocDiskConflict { doc, path: st.path.to_string_lossy().into_owned() });
     }
 
     fn write(&self, doc: DocId, st: &mut DocState) -> IdeResult<()> {
@@ -843,9 +1043,7 @@ impl Documents {
             } else {
                 ide_vfs::save_text(&st.path, &text, &st.encoding, st.has_bom)?
             };
-            st.disk_mtime = mtime;
-            st.disk_len = disk_len(&st.path);
-            st.disk_conflict = false;
+            st.synced(mtime);
             self.set_dirty(doc, st, false);
             if st.observed {
                 let text = st.doc.text();
@@ -923,8 +1121,7 @@ impl Documents {
             st.ui_mode = ui_mode;
             st.editorconfig = if defaults.editorconfig { self.editorconfig.resolve(&st.path) } else { None };
             st.native_to_ascii = defaults.native_to_ascii_for(&st.path);
-            st.disk_mtime = mtime;
-            st.disk_len = disk_len(&st.path);
+            st.synced(mtime);
             self.set_dirty(doc, st, false);
             let info = Self::info(doc, st);
             if st.observed {
@@ -939,6 +1136,10 @@ impl Documents {
             }
             Ok(info)
         })
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.registry.lock().docs.values().any(|entry| entry.slot.lock().dirty)
     }
 
     /// Saves every dirty document; reports the first failure after trying all.
@@ -1085,6 +1286,7 @@ impl Documents {
                 return Err(read_only_error(&st.path));
             }
             st.doc.set_line_ending(le);
+            st.clean_text = None;
             self.set_dirty(doc, st, true);
             Ok(())
         })
@@ -1112,10 +1314,8 @@ impl Documents {
                 st.encoding = loaded.encoding.clone();
                 st.encoding_chosen = true;
                 st.has_bom = loaded.has_bom;
-                st.disk_mtime = loaded.mtime_ms;
-                st.disk_len = disk_len(&st.path);
-                st.disk_conflict = false;
                 self.replace_locked(doc, st, &loaded.text)?;
+                st.synced(loaded.mtime_ms);
                 // Reloading is not an edit: the buffer matches the file again.
                 self.set_dirty(doc, st, false);
                 return Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom });
@@ -1132,9 +1332,34 @@ impl Documents {
             st.encoding = encoding.to_owned();
             st.encoding_chosen = true;
             st.has_bom = has_bom;
+            st.clean_text = None;
             self.set_dirty(doc, st, true);
             Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom })
         })
+    }
+
+    /// Whether the encoding the user chose for `doc` is still to reach its file: the text was
+    /// converted and not saved. It is then reported by [`Documents::take_saved_encodings`]
+    /// once a save has written it.
+    pub fn keep_encoding_when_saved(&self, doc: DocId) -> IdeResult<bool> {
+        self.with_doc(doc, |st| {
+            st.encoding_unsaved = st.dirty;
+            Ok(st.dirty)
+        })
+    }
+
+    /// The files saved in the encoding their text was converted to since
+    /// [`Documents::keep_encoding_when_saved`], with that encoding. Each is reported once.
+    pub fn take_saved_encodings(&self) -> Vec<(PathBuf, String)> {
+        let ids: Vec<DocId> = self.registry.lock().docs.keys().copied().collect();
+        let saved = |id| {
+            self.with_doc(id, |st| {
+                let saved = st.encoding_unsaved && !st.dirty;
+                st.encoding_unsaved &= st.dirty;
+                Ok(saved.then(|| (st.path.clone(), st.encoding.clone())))
+            })
+        };
+        ids.into_iter().filter_map(|id| saved(id).ok().flatten()).collect()
     }
 
     /// Load Changes from Disk: drops the buffer's unsaved changes and reads its file again in
@@ -1146,10 +1371,9 @@ impl Documents {
             }
             let loaded = Self::load_as(&st.path, &st.encoding, st.native_to_ascii)?;
             st.has_bom = loaded.has_bom;
-            st.disk_mtime = loaded.mtime_ms;
-            st.disk_len = disk_len(&st.path);
-            st.disk_conflict = false;
+            st.encoding_unsaved = false;
             self.replace_locked(doc, st, &loaded.text)?;
+            st.synced(loaded.mtime_ms);
             self.set_dirty(doc, st, false);
             Ok(())
         })
@@ -1234,6 +1458,7 @@ impl Documents {
             }
             if st.has_bom != has_bom {
                 st.has_bom = has_bom;
+                st.clean_text = None;
                 self.set_dirty(doc, st, true);
             }
             Ok(DocumentEncoding { encoding: st.encoding.clone(), has_bom: st.has_bom })
@@ -1303,10 +1528,10 @@ impl Documents {
                     return Ok(());
                 }
                 if st.dirty {
-                    st.disk_mtime = mtime;
-                    st.disk_len = meta.len();
-                    st.disk_conflict = true;
-                    self.sink.emit(IdeEvent::DocDiskConflict { doc: id, path: st.path.to_string_lossy().into_owned() });
+                    if !st.changed_on_disk(&meta) {
+                        return Ok(());
+                    }
+                    self.disk_conflict(id, st, &meta);
                     return Ok(());
                 }
                 let loaded = if force_clean {
@@ -1317,15 +1542,15 @@ impl Documents {
                     let loaded = if st.encoding_chosen {
                         Self::load_as(&st.path, &st.encoding, native_to_ascii)?
                     } else {
-                        Self::load_with_defaults(&st.path, &defaults)?
+                        Self::load_with_defaults(&st.path, &defaults, st.editorconfig.as_ref())?.0
                     };
                     st.native_to_ascii = native_to_ascii;
                     loaded
                 };
-                st.disk_mtime = loaded.mtime_ms;
-                st.disk_len = disk_len(&st.path);
-                st.disk_conflict = false;
                 if loaded.binary || st.binary {
+                    st.disk_mtime = loaded.mtime_ms;
+                    st.disk_len = disk_len(&st.path);
+                    st.disk_conflict = false;
                     return Ok(());
                 }
                 st.encoding = loaded.encoding;
@@ -1334,6 +1559,7 @@ impl Documents {
                 let ec_eol = st.editorconfig.as_ref().and_then(|ec| ec.end_of_line);
                 st.doc.set_line_ending(ec_eol.unwrap_or_else(|| LineEnding::detect(&loaded.text)));
                 self.replace_locked(id, st, &loaded.text)?;
+                st.synced(loaded.mtime_ms);
                 Ok(())
             });
             if let Err(e) = result {

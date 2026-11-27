@@ -1,6 +1,7 @@
 //! A trusted local driver profile is shared by data sources. JDBC URLs and properties
 //! can run driver-specific initialization. A project source may connect only with the
 //! settings its user last accepted in the dialog; the approval lives outside the project.
+use crate::local_settings::persist_local;
 use crate::{DataSource, DbManager, QueryResult, ResultColumn};
 use ide_core::{CancellationToken, IdeError, IdeResult};
 use serde::{Deserialize, Serialize};
@@ -22,18 +23,12 @@ const LIMIT: usize = 16 * 1024 * 1024;
 pub struct DbJdbcDriver {
     pub id: String,
     pub name: String,
+    /// Data source preset id; absent for a generic JDBC profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
     pub jars: Vec<String>,
     pub class_name: String,
     pub url_template: String,
-}
-
-fn persist_local(path: &Path, data: &[u8]) -> IdeResult<()> {
-    let dir = path.parent().expect("registry paths have a parent");
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    std::io::Write::write_all(&mut tmp, data)?;
-    tmp.persist(path).map_err(|e| IdeError::from(e.error))?;
-    Ok(())
 }
 
 fn local_jar(jar: &str) -> IdeResult<&Path> {
@@ -146,7 +141,7 @@ impl DbManager {
     fn jdbc_approval(&self, source: &DataSource) -> IdeResult<(PathBuf, String)> {
         let registry = self.jdbc_registry()?;
         let key = serde_json::to_vec(&(&self.root, &source.id)).map_err(|e| IdeError::internal(e.to_string()))?;
-        let settings = serde_json::to_vec(&(
+        let mut settings = serde_json::to_vec(&(
             &source.jdbc_driver,
             &source.url,
             &source.user,
@@ -155,6 +150,9 @@ impl DbManager {
             &source.options,
         ))
         .map_err(|e| IdeError::internal(e.to_string()))?;
+        if self.jdbc_password_isolated(source) {
+            settings.extend_from_slice(b"\0jdbc-password");
+        }
         Ok((
             registry.with_file_name("jdbc-approvals").join(blake3::hash(&key).to_hex().as_str()),
             blake3::hash(&settings).to_hex().to_string(),
@@ -195,6 +193,9 @@ impl DbManager {
             .into_iter()
             .find(|d| d.id == source.jdbc_driver)
             .ok_or_else(|| IdeError::invalid("Select an installed JDBC driver profile"))?;
+        if !source.vendor.is_empty() && driver.vendor.as_deref() != Some(source.vendor.as_str()) {
+            return Err(IdeError::invalid("The JDBC driver profile is not associated with this data source type"));
+        }
         JdbcPool::connect(source, password, driver, self.jdbc_registry()?.with_file_name("jdbc"))
             .await
             .map(Box::new)
@@ -597,6 +598,7 @@ fn decode(data: &[u8], sql: &str, elapsed_ms: f64) -> IdeResult<QueryResult> {
         affected: (affected >= 0).then_some(affected as f64),
         elapsed_ms,
         execution_ms: elapsed_ms,
+        truncated: Vec::new(),
     })
 }
 

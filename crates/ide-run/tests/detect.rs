@@ -52,6 +52,100 @@ fn npm_scripts_with_lockfile_package_manager() {
 }
 
 #[test]
+fn playwright_scripts_and_configs() {
+    let dir = project(&[
+        ("package.json", r#"{"scripts":{"e2e":"cross-env CI=1 playwright test --project=chromium","test":"vitest"}}"#),
+        ("playwright.config.ts", ""),
+        ("site/package.json", r#"{"devDependencies":{"@playwright/test":"^1.56.0"}}"#),
+        ("site/playwright.config.ts", ""),
+    ]);
+    let c = detect(dir.path());
+    let e2e = find(&c, "npm:e2e");
+    assert!(e2e.is_test);
+    assert_eq!(e2e.extras.test_runner.as_deref(), Some("playwright"));
+    assert_eq!(find(&c, "npm:test").extras.test_runner, None);
+    // The root's script runs Playwright already; the nested package has none.
+    assert!(!ids(&c).contains(&"playwright"));
+    let site = find(&c, "playwright:site");
+    assert_eq!(cmdline(site), "npx playwright test");
+    assert_eq!(site.name, "site: playwright test");
+    assert!(site.is_test && site.detected);
+    assert_eq!(site.kind, "node");
+    assert_eq!(site.cwd.as_deref(), Some(Path::new("site")));
+    assert_eq!(site.extras.test_runner.as_deref(), Some("playwright"));
+    assert_eq!(site.debug_adapter.as_deref(), Some("js-debug"));
+}
+
+#[test]
+fn cypress_scripts_dependencies_and_configs() {
+    let dir = project(&[
+        ("package.json", r#"{"scripts":{"cy:run":"cypress run --browser chrome","cy:open":"cypress open"}}"#),
+        ("cypress.config.ts", ""),
+        ("web/package.json", r#"{"devDependencies":{"cypress":"^15.0.0"}}"#),
+        ("docs/package.json", r#"{"scripts":{"build":"vite build"}}"#),
+        ("docs/cypress.config.js", ""),
+    ]);
+    let c = detect(dir.path());
+    let run = find(&c, "npm:cy:run");
+    assert!(run.is_test);
+    assert_eq!(run.extras.test_runner.as_deref(), Some("cypress"));
+    assert!(!find(&c, "npm:cy:open").is_test);
+    // The root's script runs Cypress already.
+    assert!(!ids(&c).contains(&"cypress"));
+    let web = find(&c, "cypress:web");
+    assert_eq!(cmdline(web), "npx cypress run");
+    assert_eq!(web.name, "web: cypress run");
+    assert!(web.is_test && web.detected);
+    assert_eq!(web.kind, "cypress");
+    assert_eq!(web.cwd.as_deref(), Some(Path::new("web")));
+    assert_eq!(find(&c, "cypress:docs").kind, "cypress");
+}
+
+#[test]
+fn node_test_scripts() {
+    let dir = project(&[(
+        "package.json",
+        r#"{"scripts":{"test":"node --import tsx --test","check":"tsx --test src/","tap":"node --test --test-reporter=tap","start":"node server.js --test"}}"#,
+    )]);
+    let c = detect(dir.path());
+    assert_eq!(find(&c, "npm:test").extras.test_runner.as_deref(), Some("node-test"));
+    let check = find(&c, "npm:check");
+    assert!(check.is_test);
+    assert_eq!(check.extras.test_runner.as_deref(), Some("node-test"));
+    // A reporter of its own: run as written, without the IDE's.
+    assert_eq!(find(&c, "npm:tap").extras.test_runner, None);
+    assert_eq!(find(&c, "npm:start").extras.test_runner, None);
+}
+
+#[test]
+fn mocha_scripts() {
+    let dir = project(&[(
+        "package.json",
+        r#"{"scripts":{"spec":"mocha --recursive","test":"nyc ./node_modules/.bin/mocha","lint":"eslint mocha.config.js"}}"#,
+    )]);
+    let c = detect(dir.path());
+    let spec = find(&c, "npm:spec");
+    assert!(spec.is_test);
+    assert_eq!(spec.extras.test_runner.as_deref(), Some("mocha"));
+    assert_eq!(find(&c, "npm:test").extras.test_runner.as_deref(), Some("mocha"));
+    assert!(!find(&c, "npm:lint").is_test);
+}
+
+#[test]
+fn jasmine_scripts() {
+    let dir = project(&[(
+        "package.json",
+        r#"{"scripts":{"spec":"jasmine --config=spec/support/jasmine.json","test":"tsc && node node_modules/jasmine/bin/jasmine.js","browser":"jasmine-browser-runner runSpecs"}}"#,
+    )]);
+    let c = detect(dir.path());
+    let spec = find(&c, "npm:spec");
+    assert!(spec.is_test);
+    assert_eq!(spec.extras.test_runner.as_deref(), Some("jasmine"));
+    assert_eq!(find(&c, "npm:test").extras.test_runner.as_deref(), Some("jasmine"));
+    assert!(!find(&c, "npm:browser").is_test);
+}
+
+#[test]
 fn package_manager_selection() {
     for (lock, pm) in [("yarn.lock", "yarn"), ("bun.lockb", "bun"), ("bun.lock", "bun"), ("package-lock.json", "npm")] {
         let dir = project(&[("package.json", r#"{"scripts":{"start":"node ."}}"#), (lock, "")]);
@@ -955,7 +1049,7 @@ fn go_work_external_member_has_a_plain_absolute_working_directory() {
 
 #[test]
 fn go_work_parser_ignores_other_directives_comments_and_malformed_groups() {
-    use ide_run::go::work_modules;
+    use ide_core::go::work_modules;
     assert_eq!(
         work_modules("replace use => ./not-a-member\n// use ./also-not\nuse ./real\n"),
         vec![std::path::PathBuf::from("./real")]
@@ -966,7 +1060,7 @@ fn go_work_parser_ignores_other_directives_comments_and_malformed_groups() {
 
 #[test]
 fn go_work_paths_decode_go_string_escapes() {
-    use ide_run::go::work_modules;
+    use ide_core::go::work_modules;
     for path in [r#""./\u0061pp""#, r#""./\x61pp""#, r#""./\141pp""#, "`./app`"] {
         assert_eq!(work_modules(&format!("use {path}\n")), vec![std::path::PathBuf::from("./app")]);
     }
@@ -1322,4 +1416,41 @@ fn sbt_projects() {
     if !cfg!(windows) {
         assert_eq!(cmdline(&detect(dir.path())[1]), "./sbt test");
     }
+}
+
+/// UE writes a `.sln` listing the engine's own tool projects; expanding it buries the run menu.
+#[test]
+fn a_solution_in_a_unreal_project_is_not_expanded_into_dotnet_configurations() {
+    let dir = project(&[
+        ("Game.uproject", r#"{"FileVersion":3,"EngineAssociation":"5.8"}"#),
+        (
+            "Game.sln",
+            r#"Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Game", "Source\Game\Game.csproj", "{00000000-0000-0000-0000-000000000000}"
+EndProject
+"#,
+        ),
+        (
+            "Source/Game/Game.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup></Project>"#,
+        ),
+    ]);
+    let c = detect(dir.path());
+    assert!(c.iter().all(|c| !c.kind.starts_with("dotnet")), "{:?}", ids(&c));
+}
+
+/// The engine keeps copies of its tool projects under the generated trees, which hold no code
+/// anyone runs from here — and on a real project they are deep enough to slow detection down.
+#[test]
+fn csproj_under_unreal_generated_directories_is_not_detected() {
+    let exe =
+        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup></Project>"#;
+    let dir = project(&[
+        ("Intermediate/ProjectFiles/UnrealBuildTool/UnrealBuildTool.csproj", exe),
+        ("Binaries/Win64/ShaderCopy/ShaderCopy.csproj", exe),
+        ("Saved/Tools/Helper/Helper.csproj", exe),
+        ("DerivedDataCache/Worker/Worker.csproj", exe),
+    ]);
+    let c = detect(dir.path());
+    assert!(c.is_empty(), "{:?}", ids(&c));
 }

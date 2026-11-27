@@ -17,14 +17,18 @@ import {
   type DbCompletion,
   type DbDatabases,
   type DbDriver,
+  type DbIntrospection_Deserialize,
   type ExecutionEvent,
   type DbObjectKind,
   type DbPlanNode,
   type DbSchemaObjects,
+  type DbQueryResult,
   type DbStatementOutcome,
   type DbTableDetails,
   type DbTableInfo,
   type DbTableKind,
+  type DbVisibilityChange,
+  type DbTableGrant,
   type RequestId,
   type SqlStatement,
 } from "@/platform/ipc";
@@ -55,10 +59,12 @@ import {
 import { tableFolder, type DbNode } from "./nodes";
 import { SQL_LANGUAGE } from "./sqlLanguage";
 import { TABLE_KIND, type TableRef } from "./tableInput";
+import type { DiagramData } from "./erDiagram";
 import type { ExportData, ExportFormat } from "./export";
 import type { DbObjectRef } from "./objects";
 import { formatted } from "./sql/format";
-import { bindParams, findParams } from "./sql/params";
+import { unsafeStatement, type UnsafeStatement } from "./sql/unsafe";
+import { bindParams, findParams, unbindRange } from "./sql/params";
 import { isReadOnlyQuery } from "./sql/readOnly";
 import { pageFetch } from "./resultView";
 import type { TableSnapshot } from "./schemaCompare";
@@ -73,6 +79,11 @@ const CONSOLE_SCHEMAS_KEY = "openidea.database.consoleSchemas";
 const VIEW_OPTIONS_KEY = "openidea.database.viewOptions";
 const MAX_TABS = 12;
 const RESULT_DELIVERY_TIMEOUT_MS = 15_000;
+/**
+ * The longest cell text (UTF-16 units) a page of a result carries. A cut cell shows a marker
+ * and its whole value is read when it is expanded, copied, exported or edited.
+ */
+export const CELL_LIMIT = 8192;
 
 export interface ResultTab {
   id: number;
@@ -133,6 +144,7 @@ export type DialogState =
   | { kind: "sourceUrl" }
   /** Rename a data source (`object` null) or a schema object of target `id`. */
   | { kind: "rename"; id: string; object: DbObjectRef | null }
+  | { kind: "renameDatabase"; id: string; database: string }
   /** Confirm Drop / Truncate, with a preview of the statement. */
   | { kind: "drop"; id: string; object: DbObjectRef }
   | { kind: "truncate"; id: string; schema: string; table: string }
@@ -165,7 +177,9 @@ export type DialogState =
   /** Export with 'mysqldump' of a data source, database or table. */
   | { kind: "mysqlDump"; target: string; database: string; tables?: string }
   /** Restore with 'mysql' into a database. */
-  | { kind: "mysqlRestore"; target: string; database: string };
+  | { kind: "mysqlRestore"; target: string; database: string }
+  /** Diagrams › Show Diagram Popup. */
+  | { kind: "diagram"; data: DiagramData };
 
 /** The schemas and tables of a data source's databases, as far as introspection has read them. */
 export interface SourceCatalog {
@@ -191,6 +205,8 @@ interface DatabaseState {
   loaded: boolean;
   /** Connected targets (see `splitTarget`). */
   connected: Set<string>;
+  /** Targets or whole sources deactivated until the next deliberate database operation. */
+  pausedConsoleMetadata: ReadonlySet<string>;
   /** Data source id → databases of its server (PostgreSQL). */
   databases: Record<string, Loaded<DbDatabases>>;
   /** Data source id → what its introspection has read (Snowflake; see `introspection.ts`). */
@@ -225,6 +241,8 @@ interface DatabaseState {
   selectedSource: string | null;
   /** The tree's lead node: what the tree actions act on. */
   selectedNode: DbNode | null;
+  /** Every selected node of the tree, the lead's included (Show Diagram). */
+  selectedNodes: DbNode[];
   /** The toolbar's New popup is open. */
   newMenuOpen: boolean;
   /** Expanded nodes of the Database tree. */
@@ -270,6 +288,7 @@ export const useDatabase = create<DatabaseState>(() => ({
   sources: [],
   loaded: false,
   connected: new Set(),
+  pausedConsoleMetadata: new Set(),
   databases: {},
   catalogs: {},
   schemas: {},
@@ -290,6 +309,7 @@ export const useDatabase = create<DatabaseState>(() => ({
   dialog: null,
   selectedSource: null,
   selectedNode: null,
+  selectedNodes: [],
   newMenuOpen: false,
   treeExpanded: new Set(),
   treeReveal: null,
@@ -297,6 +317,23 @@ export const useDatabase = create<DatabaseState>(() => ({
   manualCommit: new Set(),
   pendingTx: new Set(),
 }));
+
+/**
+ * A result's later pages continue a cursor the backend keeps open on the server; it closes when
+ * no result tab shows the statement any more (the backend also closes idle ones).
+ */
+const resultKey = (tab: ResultTab) =>
+  JSON.stringify([tab.sourceId, tab.outcome.statement.text, tab.schema ?? consoleSchema(tab.path)]);
+useDatabase.subscribe((state, previous) => {
+  if (state.results === previous.results && state.inline === previous.inline) return;
+  const shown = [...state.results, ...state.inline];
+  const keys = new Set(shown.map(resultKey));
+  for (const tab of [...previous.results, ...previous.inline]) {
+    if (tab.plan || keys.has(resultKey(tab))) continue;
+    const schema = tab.schema ?? consoleSchema(tab.path);
+    void call(commands.dbReleaseResult(tab.sourceId, tab.outcome.statement.text, schema || null)).catch(() => {});
+  }
+});
 
 export function toggleSeparateProceduresAndFunctions() {
   const separateProceduresAndFunctions = !useDatabase.getState().separateProceduresAndFunctions;
@@ -334,6 +371,23 @@ export function connectedTargets(id: string): string[] {
   return [...useDatabase.getState().connected].filter((t) => splitTarget(t).id === id);
 }
 
+export function allowsPassiveConsoleMetadata(
+  id: string,
+  paused = useDatabase.getState().pausedConsoleMetadata,
+): boolean {
+  return !paused.has(id) && !paused.has(splitTarget(id).id);
+}
+
+function pauseConsoleMetadata(id: string, pause: boolean) {
+  useDatabase.setState((s) => {
+    if (s.pausedConsoleMetadata.has(id) === pause) return s;
+    const pausedConsoleMetadata = new Set(s.pausedConsoleMetadata);
+    if (pause) pausedConsoleMetadata.add(id);
+    else pausedConsoleMetadata.delete(id);
+    return { pausedConsoleMetadata };
+  });
+}
+
 let sourcesRequest = 0;
 const connectionIntents = new Map<string, object>();
 const sourceConnectionIntents = new Map<string, object>();
@@ -346,6 +400,30 @@ function sourceMutation(id: string): () => boolean {
   return () => project() && sourceMutations.get(id) === intent;
 }
 
+/** The cached names come from the server before the visibility rules are applied. */
+function sourceMetadataKey(source: DataSource | undefined): string | undefined {
+  if (!source) return undefined;
+  const { introspection, ...connection } = source;
+  const metadata: DbIntrospection_Deserialize = {
+    ...introspection,
+    showSystem: !!introspection?.showSystem,
+    showTemplates: !!introspection?.showTemplates,
+  };
+  delete metadata.allDatabases;
+  delete metadata.databases;
+  delete metadata.allSchemas;
+  delete metadata.schemas;
+  delete metadata.schemasByDatabase;
+  delete metadata.objectFilter;
+  return JSON.stringify([connection, metadata]);
+}
+
+function jdbcSchemaRuleKey(source: DataSource): string | undefined {
+  const rules = source.introspection;
+  if (rules?.allSchemas !== false) return undefined;
+  return JSON.stringify([...new Set(rules.schemas?.map((pattern) => pattern.trim()).filter(Boolean))].sort());
+}
+
 export async function loadSources(): Promise<void> {
   // Closing the project resets `loaded` while its SQL consoles are still mounted.
   if (!useProject.getState().project) return;
@@ -356,8 +434,20 @@ export async function loadSources(): Promise<void> {
   try {
     const [sources, connected] = await Promise.all([call(commands.dbSources()), call(commands.dbConnected())]);
     if (request !== sourcesRequest || !current()) return;
+    const staleCompletionSources = new Set<string>();
     for (const old of useDatabase.getState().sources) {
-      if (JSON.stringify(old) !== JSON.stringify(sources.find((s) => s.id === old.id))) forget(old.id ?? "");
+      const next = sources.find((s) => s.id === old.id);
+      const id = old.id ?? "";
+      if (sourceMetadataKey(old) !== sourceMetadataKey(next)) forget(id);
+      else if (old.driver === "jdbc" && next && jdbcSchemaRuleKey(old) !== jdbcSchemaRuleKey(next)) {
+        staleCompletionSources.add(id);
+      }
+    }
+    if (staleCompletionSources.size) {
+      // JDBC completion uses the source's schema rules. Raw names and live sessions do not.
+      for (const target of completionLoads.keys()) {
+        if (staleCompletionSources.has(splitTarget(target).id)) completionLoads.delete(target);
+      }
     }
     useDatabase.setState((s) => {
       const server = new Set(connected);
@@ -370,7 +460,12 @@ export async function loadSources(): Promise<void> {
           sourceIntents.get(sourceId) !== sourceConnectionIntents.get(sourceId);
         return changed ? s.connected.has(target) : server.has(target);
       });
-      return { sources, connected: new Set(live), loaded: true };
+      const completion = staleCompletionSources.size
+        ? Object.fromEntries(
+            Object.entries(s.completion).filter(([target]) => !staleCompletionSources.has(splitTarget(target).id)),
+          )
+        : s.completion;
+      return { sources, connected: new Set(live), completion, loaded: true };
     });
   } catch (e) {
     if (request !== sourcesRequest || !current()) return;
@@ -410,11 +505,15 @@ export async function saveSource(
 ): Promise<void> {
   const id = source.id ?? "";
   const st = useDatabase.getState();
+  const preserve =
+    password === undefined &&
+    sshSecret === undefined &&
+    sourceMetadataKey(st.sources.find((s) => s.id === id)) === sourceMetadataKey(source);
   const loaded = id in st.databases || Object.keys(st.schemas).some((t) => splitTarget(t).id === id);
   // Taken before anything is forgotten: what the tree had expanded under this source.
-  const levels = loadedLevels(id);
+  const levels = !preserve && loaded ? loadedLevels(id) : undefined;
   const connection = connectionIntents.get(id);
-  forget(id);
+  if (!preserve) forget(id);
   const current = sourceMutation(id);
   const sources = useDatabase.getState().sources;
   const next = sources.some((s) => s.id === source.id)
@@ -431,7 +530,21 @@ export async function saveSource(
   // expanded nodes don't stay on Loading.
   await loadSources();
   if (!current() || !sourceById(id)) return;
-  if (loaded && connectionIntents.get(id) === connection) await refresh(id, levels);
+  if (levels && connectionIntents.get(id) === connection) await refresh(id, levels);
+}
+
+export async function saveSourceVisibility(id: string, available: string[], change: DbVisibilityChange): Promise<void> {
+  const current = projectRequest();
+  try {
+    await call(commands.dbSaveSourceVisibility(id, available, change));
+  } catch (e) {
+    // This command is deliberately separate: older hosts reject it before writing or disconnecting.
+    if (message(e).includes("command db_save_source_visibility is not available remotely")) {
+      throw new Error(tx("Update the remote OpenIDEA server to edit visibility from the tree."), { cause: e });
+    }
+    throw e;
+  }
+  if (current()) await loadSources();
 }
 
 /** Copy/Paste › Duplicate: a copy of data source `id` named `<name> [2]` (its password is not copied). */
@@ -548,19 +661,29 @@ export async function withConnection<T>(id: string, op: () => Promise<T>): Promi
   const current = databaseRequest(id);
   for (;;) {
     try {
+      // oxlint-disable-next-line no-await-in-loop -- the retry loop must finish op before updating connection state or deciding to retry
       const r = await op();
       // A completed write keeps its result, but must not revive an old connection.
       if (!current()) return r;
       connectionIntents.set(id, {});
       lastUsed.set(id, Date.now());
-      if (!useDatabase.getState().connected.has(id)) {
-        useDatabase.setState((s) => ({ connected: new Set(s.connected).add(id) }));
-        applyConnectDefaults(id);
+      const state = useDatabase.getState();
+      const fresh = !state.connected.has(id);
+      if (fresh || !allowsPassiveConsoleMetadata(id, state.pausedConsoleMetadata)) {
+        const pausedConsoleMetadata = new Set(state.pausedConsoleMetadata);
+        pausedConsoleMetadata.delete(id);
+        pausedConsoleMetadata.delete(splitTarget(id).id);
+        useDatabase.setState({
+          connected: fresh ? new Set(state.connected).add(id) : state.connected,
+          pausedConsoleMetadata,
+        });
+        if (fresh) applyConnectDefaults(id);
       }
       return r;
     } catch (e) {
       if (!current()) throw new IpcError({ kind: "cancelled", message: "Cancelled", data: null });
       const source = sourceById(id);
+      // oxlint-disable-next-line no-await-in-loop -- credential/host-key prompts must resolve before deciding whether to retry the connection
       if (!source || !(await resolveConnectError(e, source))) throw e;
       if (!current()) throw new IpcError({ kind: "cancelled", message: "Cancelled", data: null });
     }
@@ -584,12 +707,24 @@ export async function disconnect(id: string): Promise<void> {
   const targets = splitTarget(id).database ? [id] : connectedTargets(id);
   if (!targets.includes(id)) targets.push(id);
   const current = projectRequest();
-  forget(id);
-  useDatabase.setState((s) => ({ treeExpanded: collapseTarget(s.treeExpanded, id) }));
   const intent = {};
   for (const target of targets) connectionIntents.set(target, intent);
   if (!splitTarget(id).database) sourceConnectionIntents.set(id, {});
-  await Promise.all(targets.map((t) => call(commands.dbDisconnect(t))));
+  const alreadyPaused = useDatabase.getState().pausedConsoleMetadata.has(id);
+  // Dropping the caches can wake up metadata effects in a still-mounted console.
+  pauseConsoleMetadata(id, true);
+  forget(id);
+  useDatabase.setState((s) => ({ treeExpanded: collapseTarget(s.treeExpanded, id) }));
+  try {
+    if (!splitTarget(id).database && sourceById(id)?.externalTunnel) {
+      await call(commands.dbDisconnect(id, true));
+    } else {
+      await Promise.all(targets.map((t) => call(commands.dbDisconnect(t, null))));
+    }
+  } catch (e) {
+    if (current() && connectionIntents.get(id) === intent && !alreadyPaused) pauseConsoleMetadata(id, false);
+    throw e;
+  }
   if (!current()) return;
   if (!splitTarget(id).database) sourceConnectionIntents.set(id, {});
   useDatabase.setState((s) => {
@@ -775,6 +910,7 @@ export async function schemaSnapshot(id: string, schema: string, signal?: AbortS
     while (next < tables.length) {
       if (signal?.aborted) return;
       const t = tables[next++]!;
+      // oxlint-disable-next-line no-await-in-loop -- bounded worker pool: each of up to 4 workers claims the next table via the shared index and checks the abort signal
       const details = await call(commands.dbTableDetails(id, schema, t.name));
       out.push({ name: t.name, kind: t.kind, ...details });
     }
@@ -794,6 +930,11 @@ export async function loadDetails(id: string, schema: string, table: string): Pr
     if (!current()) return;
     useDatabase.setState((s) => ({ details: { ...s.details, [key]: { status: "error", message: message(e) } } }));
   }
+}
+
+/** The privileges granted on a table (PostgreSQL and MySQL; see `grantsSupported`). */
+export function loadGrants(id: string, schema: string, table: string): Promise<DbTableGrant[]> {
+  return withConnection(id, () => call(commands.dbTableGrants(id, schema, table)));
 }
 
 /**
@@ -909,7 +1050,7 @@ export function loadCompletion(id: string): Promise<DbCompletion | null> {
     const current = databaseRequest(id);
     const promise = call(commands.dbCompletion(id))
       .then((model) => {
-        if (!current()) return null;
+        if (!current() || completionLoads.get(id)?.promise !== promise) return null;
         useDatabase.setState((s) => ({ completion: { ...s.completion, [id]: model } }));
         return model;
       })
@@ -932,6 +1073,7 @@ useProject.subscribe((state, previous) => {
   completionLoads.clear();
   preparingConsoles.clear();
   lastUsed.clear();
+  if (useDatabase.getState().pausedConsoleMetadata.size) useDatabase.setState({ pausedConsoleMetadata: new Set() });
 });
 
 // ---- consoles ----------------------------------------------------------------
@@ -1147,15 +1289,18 @@ async function run(
 ): Promise<DbStatementOutcome[]> {
   const current = databaseRequest(id);
   const wasConnected = useDatabase.getState().connected.has(id);
+  // Only a query that is safe to run again has its cells cut: the whole value is read by running it again.
+  const driver = sourceById(id)?.driver ?? "sqlite";
+  const cellLimit = statements.every((s) => isReadOnlyQuery(s.text, driver)) ? CELL_LIMIT : null;
   const outcomes = await withConnection(id, async () => {
     const execute = async () => {
       progress?.emit({ type: "started", index: 0 });
-      const outcomes = await call(commands.dbExecute(request, id, statements, skip, maxRows, schema || null)).catch(
-        (error: unknown) => {
-          if (isCancelled(error)) progress?.onStatementCancelled();
-          throw error;
-        },
-      );
+      const outcomes = await call(
+        commands.dbExecute(request, id, statements, skip, maxRows, schema || null, cellLimit),
+      ).catch((error: unknown) => {
+        if (isCancelled(error)) progress?.onStatementCancelled();
+        throw error;
+      });
       outcomes.forEach((outcome, index) => progress?.emit({ type: "completed", index, outcome }));
       return outcomes;
     };
@@ -1191,7 +1336,7 @@ async function run(
     });
     try {
       // Large channel frames can arrive after the reply. Bound only this delivery wait.
-      await call(commands.dbExecuteStream(request, id, statements, maxRows, schema || null, channel));
+      await call(commands.dbExecuteStream(request, id, statements, maxRows, schema || null, cellLimit, channel));
       acknowledged = true;
       waitForDelivery();
       const result = await done;
@@ -1288,6 +1433,14 @@ export async function dropDatabase(id: string, database: string, sql: string): P
   return true;
 }
 
+/** Renames `database` of data source `id` with `sql` after closing the sessions on it. */
+export async function renameDatabase(id: string, database: string, sql: string): Promise<boolean> {
+  await disconnect(`${id}:${database}`);
+  if (!(await runSql(id, [sql]))) return false;
+  void refresh(id);
+  return true;
+}
+
 /** Opens the query console of `id` with `text` appended and selected (SQL Scripts › …). */
 export async function openConsoleWith(id: string, text: string): Promise<void> {
   let path: string;
@@ -1313,6 +1466,7 @@ export async function openConsoleWith(id: string, text: string): Promise<void> {
       view.focus();
       return;
     }
+    // oxlint-disable-next-line no-await-in-loop -- polling waits 50ms between attempts for the editor view to mount
     await new Promise((r) => setTimeout(r, 50));
   }
 }
@@ -1339,15 +1493,15 @@ export async function openDdl(id: string, schema: string, name: string): Promise
   }
 }
 
-/**
- * Runs the statement at `from` (or the selection `from..to`, UTF-16 offsets)
- * of console `path` on its data source. Result sets open as `Result N` tabs
- * of the Services view, replacing the console's unpinned ones; everything is
- * logged to its Output tab; returns the outcomes (errors included) for the
- * editor's marks.
- */
-/** Asks for the values of the statements' query parameters and binds them; `[]` when cancelled. */
-async function withParams(statements: SqlStatement[], driver: DbDriver): Promise<SqlStatement[]> {
+interface BoundStatements {
+  /** The statements with their parameters' values in their text; `[]` when cancelled. */
+  statements: SqlStatement[];
+  /** A range of statement `i`'s bound text in its unbound text; `null` when it overlaps a value. */
+  unbind: (i: number, from: number, to: number) => { from: number; to: number } | null;
+}
+
+/** Asks for the values of the statements' query parameters and binds them. */
+async function withParams(statements: SqlStatement[], driver: DbDriver): Promise<BoundStatements> {
   let numbered = 0;
   const found = statements.map((st) => {
     const params = findParams(st.text, driver, numbered);
@@ -1355,15 +1509,29 @@ async function withParams(statements: SqlStatement[], driver: DbDriver): Promise
     return params;
   });
   const names = [...new Set(found.flat().map((p) => p.name))];
-  if (!names.length) return statements;
+  const same: BoundStatements["unbind"] = (_i, from, to) => ({ from, to });
+  if (!names.length) return { statements, unbind: same };
   const values = await new Promise<Record<string, string> | null>((resolve) =>
     useDatabase.setState({ dialog: { kind: "params", names, resolve } }),
   );
-  if (!values) return [];
+  if (!values) return { statements: [], unbind: same };
   useDatabase.setState((s) => ({ paramValues: { ...s.paramValues, ...values } }));
-  return statements.map((st, i) => ({ ...st, text: bindParams(st.text, found[i]!, values) }));
+  return {
+    statements: statements.map((st, i) => ({ ...st, text: bindParams(st.text, found[i]!, values) })),
+    unbind: (i, from, to) => unbindRange(found[i]!, values, from, to),
+  };
 }
 
+/** Asks whether to run an unsafe statement (see `sql/unsafe`); false cancels the run. */
+export type ConfirmUnsafe = (statement: SqlStatement, unsafe: UnsafeStatement) => Promise<boolean>;
+
+/**
+ * Runs the statement at `from` (or the selection `from..to`, UTF-16 offsets)
+ * of console `path` on its data source. Result sets open as `Result N` tabs
+ * of the Services view, replacing the console's unpinned ones; everything is
+ * logged to its Output tab; returns the outcomes (errors included) for the
+ * editor's marks.
+ */
 export async function executeConsole(
   path: string,
   text: string,
@@ -1372,6 +1540,7 @@ export async function executeConsole(
   /** Called once the statements are submitted, with what was submitted. */
   onStart?: (statements: readonly SqlStatement[]) => void,
   onProgress?: (events: readonly StatementProgress[]) => ReadonlyMap<number, DbStatementOutcome> | void,
+  confirmUnsafe?: ConfirmUnsafe,
 ): Promise<DbStatementOutcome[]> {
   const id = consoleSource(path);
   if (!id) {
@@ -1396,7 +1565,7 @@ export async function executeConsole(
   let statementCancelled = false;
   let deliveryIncomplete = false;
   try {
-    const statements = await consoleStatements(id, text, from, to);
+    const statements = await consoleStatements(id, text, from, to, confirmUnsafe);
     if (!current() || preparingConsoles.get(path) !== request || !statements.length) return [];
     preparingConsoles.delete(path);
     const prev = useDatabase.getState().running[path];
@@ -1553,10 +1722,29 @@ function capResults(results: ResultTab[], fresh: ReadonlySet<number>): ResultTab
 }
 
 /** The statements of console `path` to run or explain: the selection's, else the one at `from`, parameters bound. */
-async function consoleStatements(id: string, text: string, from: number, to: number): Promise<SqlStatement[]> {
+async function consoleStatements(
+  id: string,
+  text: string,
+  from: number,
+  to: number,
+  confirmUnsafe?: ConfirmUnsafe,
+): Promise<SqlStatement[]> {
   const statements: SqlStatement[] = await call(commands.dbStatements(id, text, from, to));
   if (!statements.length) return [];
-  return withParams(statements, sourceById(id)?.driver ?? "sqlite");
+  const driver = sourceById(id)?.driver ?? "sqlite";
+  const bound = await withParams(statements, driver);
+  // The bound text is what runs: a parameter's value can make it unsafe (`where :cond`, `1=1`).
+  if (confirmUnsafe)
+    for (const [i, st] of bound.statements.entries()) {
+      const unsafe = unsafeStatement(st.text, driver);
+      if (!unsafe) continue;
+      const original = statements[i]!;
+      // A mark inside a parameter's value marks the whole statement.
+      const at = bound.unbind(i, unsafe.from, unsafe.to) ?? { from: 0, to: original.text.length };
+      // oxlint-disable-next-line no-await-in-loop -- each warning must be answered before asking the next
+      if (!(await confirmUnsafe(original, { ...unsafe, ...at }))) return [];
+    }
+  return bound.statements;
 }
 
 const PLAN_TITLE = "Query Plan";
@@ -1664,6 +1852,26 @@ export async function rerunResult(tabId: number): Promise<void> {
 /** Whether result tab `tab` can show other pages: running its query again only reads. */
 export function pageable(tab: ResultTab): boolean {
   return !tab.plan && isReadOnlyQuery(tab.outcome.statement.text, sourceById(tab.sourceId)?.driver ?? "sqlite");
+}
+
+/** Row `row` (from 0, over all pages) of result tab `tab`'s query, with its cells whole. */
+export async function readResultRow(tab: ResultTab, row: number): Promise<DbQueryResult> {
+  const schema = tab.schema ?? consoleSchema(tab.path);
+  return withConnection(tab.sourceId, () =>
+    call(commands.dbResultRow(nextRequestId(), tab.sourceId, tab.outcome.statement, row, schema || null)),
+  );
+}
+
+/** The rows of the page result tab `tab` shows, with their cells whole. */
+export async function readResultPage(tab: ResultTab): Promise<DbQueryResult> {
+  const schema = tab.schema ?? consoleSchema(tab.path);
+  const rows = Math.max(tab.outcome.result?.rows.length ?? 0, 1);
+  const { skip } = pageFetch(tab.page ?? 0, tab.pageSize ?? rows);
+  const [outcome] = await withConnection(tab.sourceId, () =>
+    call(commands.dbExecute(nextRequestId(), tab.sourceId, [tab.outcome.statement], skip, rows, schema || null, null)),
+  );
+  if (!outcome?.result) throw new Error(outcome?.error ?? "The statement returned no result");
+  return outcome.result;
 }
 
 /** Result tab `tabId`, in the Services view or in an editor. */

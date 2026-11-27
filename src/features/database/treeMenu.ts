@@ -1,8 +1,10 @@
 /** Menus of the Database tool window, laid out like IDEA's (New ▸, Copy/Paste ▸, SQL Scripts ▸ …). */
+import { choosePath } from "@/platform/choosePath";
+import { tx } from "@/platform/i18n";
 import type { MenuItem } from "@/ui";
 import { notifications } from "@/workbench/contributions";
 import { fileSourceName, parseSourceUrl } from "./model";
-import { VENDORS, vendorPreset } from "./vendors";
+import { VENDORS, vendorById, vendorPreset } from "./vendors";
 import { nodeTarget, objectOf, tableOf, type DbNode } from "./nodes";
 import { SCRIPT_LABELS, canDrop, canModifyTable, canRename, type ScriptKind } from "./objects";
 import {
@@ -31,13 +33,14 @@ const act = (
 
 const sep: MenuItem = { kind: "separator" };
 
-async function sqliteFromFile() {
-  const { open } = await import("@/platform/dialog");
-  const file = await open({ multiple: false, directory: false, title: "SQLite Database File" });
-  if (typeof file === "string") openSourceDialog(null, { driver: "sqlite", file, name: fileSourceName(file) });
+async function sourceFromFile() {
+  const file = await choosePath({ directory: false, title: tx("Database File") });
+  if (file === null) return;
+  const preset = /\.duckdb$/i.test(file) ? vendorPreset(vendorById("duckdb")!) : { driver: "sqlite" as const };
+  openSourceDialog(null, { ...preset, file, name: fileSourceName(file) });
 }
 
-/** New ▸ Data Source ▸ — the drivers the backend speaks and wire-compatible products, A–Z like IDEA's. */
+/** New ▸ Data Source ▸ — built-in and JDBC presets, A–Z. */
 function dataSourceItems(): MenuItem[] {
   return [
     {
@@ -49,7 +52,7 @@ function dataSourceItems(): MenuItem[] {
         run: () => openSourceDialog(null, vendorPreset(v)),
       })),
     },
-    { label: "Data Source from File…", icon: "folder", run: () => void sqliteFromFile() },
+    { label: "Data Source from File…", icon: "folder", run: () => void sourceFromFile() },
     { label: "Data Source from URL…", icon: "external-link", run: () => openDialog({ kind: "sourceUrl" }) },
     { label: "Import from Clipboard", icon: "paste", run: () => void sourceFromClipboard() },
   ];
@@ -107,6 +110,12 @@ function dumpItems(n: DbNode, restore: boolean): MenuItem[] {
 function importExport(items: MenuItem[]): MenuItem[] {
   return items.length ? [{ label: "Import/Export", submenu: items }] : [];
 }
+
+/** Diagrams ▸ Show Diagram / Show Diagram Popup, of the tree's selection when it holds `n`. */
+const diagrams = (n: DbNode): MenuItem => ({
+  label: "Diagrams",
+  submenu: [act("db.showDiagram", n), act("db.showDiagramPopup", n)],
+});
 
 /** Context menu of a tree node (`null`: the empty area). */
 export function nodeMenu(n: DbNode | null): MenuItem[] {
@@ -178,6 +187,7 @@ export function nodeMenu(n: DbNode | null): MenuItem[] {
         { label: "Copy/Paste", submenu: [copyRef] },
         refresh,
         act("db.disconnect", n, { disabled: !useDatabase.getState().connected.has(id) || n.current }),
+        ...(createsDatabases(sourceById(id)) ? [sep, act("db.rename", n, { disabled: n.current || readOnly })] : []),
         sep,
         navigation(),
         sqlScripts(n, false),
@@ -191,12 +201,13 @@ export function nodeMenu(n: DbNode | null): MenuItem[] {
         ...(n.kind === "schema" ? [{ label: "Copy/Paste", submenu: [copyRef] }] : []),
         refresh,
         sep,
-        ...(n.kind === "schema" ? [quickDoc] : []),
+        ...(n.kind === "schema" ? [rename, sep, quickDoc] : []),
         navigation(),
         sep,
         sqlScripts(n, false),
         ...(n.kind === "schema" ? [act("db.compareSchemas", n)] : []),
         ...importExport(dumpItems(n, true)),
+        ...(n.kind === "schema" || ["tables", "views", "materializedViews"].includes(n.folder) ? [diagrams(n)] : []),
         ...(n.kind === "schema" ? [sep, drop] : []),
       ];
     case "table":
@@ -228,6 +239,7 @@ export function nodeMenu(n: DbNode | null): MenuItem[] {
         navigation([act("db.goToDdl", n)]),
         sep,
         sqlScripts(n, true),
+        ...(n.kind === "table" ? [diagrams(n)] : []),
         ...(n.kind === "table" && !view
           ? [
               {

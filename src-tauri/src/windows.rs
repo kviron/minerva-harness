@@ -6,7 +6,7 @@
 //! (`window_take_launch`), and re-taken whenever [`LAUNCH_EVENT`] fires (a
 //! second app instance asking an already-loaded window to open a path).
 //!
-//! Auxiliary windows ([`AuxKind`]: Settings, Compare with Local, Diff, Sync with Deployed) belong to a project window and share its project (see
+//! Auxiliary windows ([`AuxKind`]: Settings, Compare with Local, Diff, Sync with Deployed, New Project, Get from VCS, Remote Development) belong to a project window and share its project (see
 //! [`AppState::project`]). Their labels name the kind and the parent
 //! (`settings-main`, `comparison-project-2-3`, `diff-main-0`); their [`Launch`] says what to show.
 
@@ -24,8 +24,9 @@ use ide_core::{IdeError, IdeResult};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::utils::config::{Color, WindowConfig};
 use tauri::{AppHandle, Emitter, Manager, Theme, WebviewWindow, WebviewWindowBuilder};
@@ -45,6 +46,12 @@ const EDITOR_SIZE: (f64, f64) = (1100.0, 720.0);
 const EDITOR_MIN_SIZE: (f64, f64) = (640.0, 360.0);
 const DEPLOYMENT_SIZE: (f64, f64) = (1400.0, 900.0);
 const DEPLOYMENT_MIN_SIZE: (f64, f64) = (800.0, 500.0);
+const NEW_PROJECT_SIZE: (f64, f64) = (860.0, 620.0);
+const NEW_PROJECT_MIN_SIZE: (f64, f64) = (720.0, 480.0);
+const CLONE_SIZE: (f64, f64) = (920.0, 620.0);
+const CLONE_MIN_SIZE: (f64, f64) = (640.0, 420.0);
+const CONNECT_SIZE: (f64, f64) = (600.0, 460.0);
+const CONNECT_MIN_SIZE: (f64, f64) = (520.0, 380.0);
 
 /// What a freshly opened window should do once its frontend is up.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -82,6 +89,9 @@ pub struct Launch {
     /// Editor windows: the file to show (Open in New Window → lightweight aux editor).
     #[serde(default)]
     pub editor: Option<Box<EditorLaunch>>,
+    /// Get from VCS windows: the repository URL to fill in.
+    #[serde(default)]
+    pub clone_url: Option<String>,
 }
 
 /// What a lightweight editor window shows: a file, with optional caret / selection (0-based), or
@@ -178,10 +188,26 @@ pub struct DiffLaunch {
     /// Absolute path of the file (the right side's path).
     pub path: String,
     pub left: DiffSide,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub middle: Option<DiffSide>,
     pub right: DiffSide,
-    /// 0-based line of the right side to reveal.
+    /// 0-based line to reveal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_side: Option<DiffLineSide>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub col: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Vec<DiffLaunch>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum DiffLineSide {
+    Left,
+    Middle,
+    Right,
 }
 
 /// The two files of a command-line diff (`openidea diff a.txt b.txt`), both sides editable.
@@ -304,15 +330,16 @@ pub struct WindowsState {
     cli: Mutex<cli::Queue>,
     /// Most recently focused window label (menu events go there).
     last_focused: Mutex<Option<String>>,
-    /// Set by Quit while windows close one by one.
+    /// Set by Quit while windows close in parallel.
     quitting: AtomicBool,
     /// The last closed project opted out of Welcome; macOS keeps its app in the Dock.
     #[cfg(target_os = "macos")]
     pub keep_alive: AtomicBool,
-    /// Windows asked to close whose guards have not finished. AppKit closes a whole tab group at
-    /// once, so its members ask together.
-    close_requests: Mutex<Vec<String>>,
-    /// Project tabs closing one by one (Close Other Tabs and friends).
+    /// Coordinates parallel window/tab-group closes so clean tabs hide together in one frame
+    /// and interactive prompts still run one at a time.
+    close: Mutex<CloseState>,
+    pub close_notify: Arc<tokio::sync::Notify>,
+    /// Project tabs closing in parallel (Close Other Tabs and friends).
     pub tab_closes: Mutex<Option<crate::window_groups::TabCloses>>,
     /// Relaunch once the quit completes (after installing an update).
     restart: AtomicBool,
@@ -339,20 +366,180 @@ pub(crate) struct AuxGeometry {
     pub maximized: bool,
 }
 
+#[derive(Default)]
+struct CloseState {
+    /// Windows asked to close whose guards have not finished. AppKit closes a whole tab group at
+    /// once, so its members ask together; Quit and Close Other Tabs also close members in parallel.
+    pending: Vec<String>,
+    /// Members that passed their close guard and are waiting at the batch barrier before destroying.
+    ready: HashSet<String>,
+    /// Members whose batch was cancelled while they waited; they stay open.
+    aborted: HashSet<String>,
+    /// Windows already hidden as part of their closing cohort so hiding only runs once per batch.
+    hidden: HashSet<String>,
+    /// Window currently showing an interactive close dialog (at most one across a batch).
+    prompt_holder: Option<String>,
+}
+
 impl WindowsState {
     pub fn close_requested(&self, label: &str) {
-        let mut requests = self.close_requests.lock();
-        if !requests.iter().any(|l| l == label) {
-            requests.push(label.to_owned());
+        let mut close = self.close.lock();
+        close.aborted.remove(label);
+        close.ready.remove(label);
+        close.hidden.remove(label);
+        if !close.pending.iter().any(|l| l == label) {
+            close.pending.push(label.to_owned());
         }
     }
 
     pub fn close_settled(&self, label: &str) {
-        self.close_requests.lock().retain(|l| l != label);
+        {
+            let mut close = self.close.lock();
+            close.pending.retain(|l| l != label);
+            close.ready.remove(label);
+            close.aborted.remove(label);
+            close.hidden.remove(label);
+            if close.prompt_holder.as_deref() == Some(label) {
+                close.prompt_holder = None;
+            }
+        }
+        self.close_notify.notify_waiters();
     }
 
     pub fn pending_closes(&self) -> Vec<String> {
-        self.close_requests.lock().clone()
+        self.close.lock().pending.clone()
+    }
+
+    pub fn is_closing(&self, label: &str) -> bool {
+        let in_close = {
+            let close = self.close.lock();
+            close.pending.iter().any(|l| l == label) || close.ready.contains(label)
+        };
+        in_close || self.in_tab_close_batch(label)
+    }
+
+    pub fn has_other_pending_closes(&self, exclude: &str) -> bool {
+        let other_pending = self.close.lock().pending.iter().any(|l| l != exclude);
+        other_pending || self.tab_closes.lock().as_ref().is_some_and(|b| b.has_other(exclude))
+    }
+
+    pub fn in_tab_close_batch(&self, label: &str) -> bool {
+        self.tab_closes.lock().as_ref().is_some_and(|b| b.contains(label))
+    }
+
+    /// Marks `label` ready to destroy. Returns `false` if its batch was already cancelled.
+    pub fn mark_ready(&self, label: &str) -> bool {
+        let ok = {
+            let mut close = self.close.lock();
+            if close.aborted.remove(label) {
+                close.pending.retain(|l| l != label);
+                close.ready.remove(label);
+                close.hidden.remove(label);
+                if close.prompt_holder.as_deref() == Some(label) {
+                    close.prompt_holder = None;
+                }
+                false
+            } else {
+                if close.prompt_holder.as_deref() == Some(label) {
+                    close.prompt_holder = None;
+                }
+                close.ready.insert(label.to_owned());
+                true
+            }
+        };
+        self.close_notify.notify_waiters();
+        ok
+    }
+
+    pub fn is_ready(&self, label: &str) -> bool {
+        self.close.lock().ready.contains(label)
+    }
+
+    pub fn take_aborted(&self, label: &str) -> bool {
+        let mut close = self.close.lock();
+        if close.aborted.remove(label) {
+            close.pending.retain(|l| l != label);
+            close.ready.remove(label);
+            close.hidden.remove(label);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Marks `labels` as hidden once and returns those newly claimed for hiding.
+    pub fn claim_hide(&self, labels: &[String]) -> Vec<String> {
+        let mut close = self.close.lock();
+        labels.iter().filter(|l| close.hidden.insert((*l).clone())).cloned().collect()
+    }
+
+    /// Marks `labels` as aborted so peers waiting at the close barrier or prompt turn stay open.
+    pub fn abort_batch(&self, labels: impl IntoIterator<Item = String>) {
+        {
+            let mut close = self.close.lock();
+            for label in labels {
+                close.ready.remove(&label);
+                close.hidden.remove(&label);
+                close.pending.retain(|l| l != &label);
+                close.aborted.insert(label);
+            }
+            close.prompt_holder = None;
+        }
+        self.close_notify.notify_waiters();
+    }
+
+    /// Aborts every in-flight close except `initiator` (used when cancelling Quit).
+    pub fn abort_all_closing(&self, initiator: Option<&str>) {
+        {
+            let mut close = self.close.lock();
+            let mut targets: Vec<String> = std::mem::take(&mut close.pending);
+            for label in close.ready.drain() {
+                if !targets.iter().any(|l| l == &label) {
+                    targets.push(label);
+                }
+            }
+            close.hidden.clear();
+            close.prompt_holder = None;
+            for label in targets {
+                if initiator != Some(label.as_str()) {
+                    close.aborted.insert(label);
+                }
+            }
+        }
+        self.close_notify.notify_waiters();
+    }
+
+    /// Tries to acquire the interactive prompt turn. `Err(())` means this close was aborted.
+    pub fn try_acquire_prompt(&self, label: &str) -> Result<bool, ()> {
+        let mut close = self.close.lock();
+        if close.aborted.contains(label) {
+            return Err(());
+        }
+        if close.prompt_holder.is_none() || close.prompt_holder.as_deref() == Some(label) {
+            close.prompt_holder = Some(label.to_owned());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn release_prompt(&self, label: &str) {
+        let released = {
+            let mut close = self.close.lock();
+            if close.prompt_holder.as_deref() == Some(label) {
+                close.prompt_holder = None;
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            self.close_notify.notify_waiters();
+        }
+    }
+
+    pub fn has_prompt_holder(&self) -> bool {
+        self.close.lock().prompt_holder.is_some()
     }
 
     pub fn set_launch(&self, label: &str, launch: Launch) {
@@ -460,11 +647,22 @@ pub enum AuxKind {
     Diff,
     Editor,
     Deployment,
+    NewProject,
+    Clone,
+    Connect,
 }
 
 impl AuxKind {
-    const ALL: [AuxKind; 5] =
-        [AuxKind::Settings, AuxKind::Comparison, AuxKind::Diff, AuxKind::Editor, AuxKind::Deployment];
+    const ALL: [AuxKind; 8] = [
+        AuxKind::Settings,
+        AuxKind::Comparison,
+        AuxKind::Diff,
+        AuxKind::Editor,
+        AuxKind::Deployment,
+        AuxKind::NewProject,
+        AuxKind::Clone,
+        AuxKind::Connect,
+    ];
 
     /// Label prefix, and the key of the one remembered geometry shared by every window of the kind.
     pub fn name(self) -> &'static str {
@@ -474,6 +672,9 @@ impl AuxKind {
             AuxKind::Diff => "diff",
             AuxKind::Editor => "editor",
             AuxKind::Deployment => "deployment",
+            AuxKind::NewProject => "new-project",
+            AuxKind::Clone => "clone",
+            AuxKind::Connect => "connect",
         }
     }
 
@@ -485,17 +686,23 @@ impl AuxKind {
     /// Shows the project's documents: gets its parent's events and edits made in sibling windows,
     /// and asks about its own unsaved changes before the parent closes it.
     pub fn shares_documents(self) -> bool {
-        self != AuxKind::Settings
+        !self.dialog()
     }
 
-    /// Has no actions of its own: menu items run in its project window.
-    fn runs_menu_in_parent(self) -> bool {
-        self == AuxKind::Settings
+    /// Has no actions of its own: menu items run in its project window, which owns the menu.
+    pub fn runs_menu_in_parent(self) -> bool {
+        self.dialog()
     }
 
     /// Needs its parent to have a project open.
     fn needs_project(self) -> bool {
-        self != AuxKind::Settings
+        !self.dialog()
+    }
+
+    /// A dialog in its own window (Settings, New Project, Get from VCS, Remote Development):
+    /// works without the parent's project or documents, and leaves the menu to the parent.
+    fn dialog(self) -> bool {
+        matches!(self, AuxKind::Settings | AuxKind::NewProject | AuxKind::Clone | AuxKind::Connect)
     }
 
     pub fn min_size(self) -> (f64, f64) {
@@ -505,6 +712,9 @@ impl AuxKind {
             AuxKind::Diff => DIFF_MIN_SIZE,
             AuxKind::Editor => EDITOR_MIN_SIZE,
             AuxKind::Deployment => DEPLOYMENT_MIN_SIZE,
+            AuxKind::NewProject => NEW_PROJECT_MIN_SIZE,
+            AuxKind::Clone => CLONE_MIN_SIZE,
+            AuxKind::Connect => CONNECT_MIN_SIZE,
         }
     }
 
@@ -515,6 +725,9 @@ impl AuxKind {
             AuxKind::Diff => DIFF_SIZE,
             AuxKind::Editor => EDITOR_SIZE,
             AuxKind::Deployment => DEPLOYMENT_SIZE,
+            AuxKind::NewProject => NEW_PROJECT_SIZE,
+            AuxKind::Clone => CLONE_SIZE,
+            AuxKind::Connect => CONNECT_SIZE,
         }
     }
 }
@@ -731,22 +944,68 @@ pub fn focus(window: &WebviewWindow) {
     let _ = window.set_focus();
 }
 
-/// Present one project's save prompt at a time, including hidden group members.
-pub fn continue_quit(app: &AppHandle, closed: Option<&str>) {
-    if !app.state::<WindowsState>().quitting() {
+pub fn hide_windows(windows: Vec<WebviewWindow>) {
+    #[cfg(target_os = "macos")]
+    crate::macos::hide_windows(windows);
+    #[cfg(not(target_os = "macos"))]
+    for window in windows {
+        let _ = window.hide();
+    }
+}
+
+/// Closes every project window in parallel without flipping focus across clean tabs.
+/// Windows that need user confirmation acquire the prompt turn one at a time via `begin_prompt`.
+pub fn start_quit(app: &AppHandle) {
+    let state = app.state::<WindowsState>();
+    let labels = project_window_labels(app);
+    if labels.is_empty() {
+        app.exit(0);
         return;
     }
-    let next = project_window_labels(app)
-        .into_iter()
-        .filter(|label| Some(label.as_str()) != closed)
-        .find_map(|label| app.get_webview_window(&label));
-    if let Some(window) = next {
-        focus(&window);
-        if window.close().is_err() {
-            app.state::<WindowsState>().set_quitting(false);
+    for label in &labels {
+        state.close_requested(label);
+    }
+    let mut any_sent = false;
+    for label in labels {
+        if let Some(window) = app.get_webview_window(&label)
+            && window.close().is_ok()
+        {
+            any_sent = true;
+            continue;
         }
-    } else {
+        state.close_settled(&label);
+    }
+    if !any_sent {
+        if project_window_labels(app).is_empty() {
+            app.exit(0);
+        } else {
+            state.set_quitting(false);
+        }
+    }
+}
+
+/// Exits once every project window has finished closing during Quit.
+pub fn continue_quit(app: &AppHandle, closed: Option<&str>) {
+    let state = app.state::<WindowsState>();
+    if !state.quitting() {
+        return;
+    }
+    let remaining: Vec<String> =
+        project_window_labels(app).into_iter().filter(|label| Some(label.as_str()) != closed).collect();
+    if remaining.is_empty() {
         app.exit(0);
+        return;
+    }
+    // Close any window that appeared after Quit began and was not yet asked to close.
+    for label in remaining {
+        if !state.is_closing(&label)
+            && let Some(window) = app.get_webview_window(&label)
+        {
+            state.close_requested(&label);
+            if window.close().is_err() {
+                state.close_settled(&label);
+            }
+        }
     }
 }
 
@@ -834,8 +1093,20 @@ fn build_project_window(app: &AppHandle, mut config: WindowConfig) -> IdeResult<
     }
     #[cfg(target_os = "linux")]
     let show_after_build = crate::linux_window_state::prepare(app, &mut config);
+    // Windows opens a project window at the configured size (window-state restores only the
+    // maximized flag there), which Restore Down returns to.
+    #[cfg(windows)]
+    if let Ok(Some(monitor)) = app.primary_monitor() {
+        let area = monitor.work_area().size.to_logical::<f64>(monitor.scale_factor());
+        let min = (config.min_width.unwrap_or(0.0), config.min_height.unwrap_or(0.0));
+        let (size, min) = fit_new_window((config.width, config.height), min, (area.width, area.height));
+        (config.width, config.height) = size;
+        (config.min_width, config.min_height) = (Some(min.0), Some(min.1));
+    }
     let window = WebviewWindowBuilder::from_config(app, &config)
-        .and_then(|b| dev_font_preferences(b).on_new_window(open_popup_in_browser).build())
+        .and_then(|b| {
+            macos_webview_configuration(app, webview_profile(app, b)).on_new_window(open_popup_in_browser).build()
+        })
         .map_err(|e| IdeError::internal(format!("cannot create window: {e}")))?;
     #[cfg(target_os = "linux")]
     decorate_csd(&window);
@@ -1606,8 +1877,8 @@ pub struct AuxWindow {
     pub background: Option<String>,
 }
 
-/// Opens an auxiliary window of `caller`'s project window, centred over it. A kind with one window
-/// per parent reuses it: the new launch is handed over ([`LAUNCH_EVENT`]) and the window focused.
+/// Opens an auxiliary window of `caller`'s project window, centred over it. A matching window
+/// receives the new launch ([`LAUNCH_EVENT`]) and is focused.
 pub fn open_auxiliary_window(app: &AppHandle, caller: &WebviewWindow, aux: AuxWindow) -> IdeResult<()> {
     // Asked from an auxiliary window itself: open it for that window's parent.
     let parent_label = auxiliary_parent(caller.label()).unwrap_or(caller.label()).to_owned();
@@ -1626,7 +1897,7 @@ pub fn open_auxiliary_window(app: &AppHandle, caller: &WebviewWindow, aux: AuxWi
         format!("{}-{parent_label}", aux.kind.name())
     };
     if let Some(existing) = app.get_webview_window(&label) {
-        if aux.kind != AuxKind::Diff && aux.launch != Launch::default() {
+        if aux.launch != Launch::default() {
             windows.set_launch(&label, aux.launch);
             let _ = app.emit_to(label.as_str(), LAUNCH_EVENT, ());
         }
@@ -1673,10 +1944,11 @@ pub fn open_auxiliary_window(app: &AppHandle, caller: &WebviewWindow, aux: AuxWi
     // display's Space, so macOS keeps it too.
     #[cfg(target_os = "linux")]
     let builder = builder.and_then(|b| b.parent(&parent));
-    let window = builder.and_then(|b| dev_font_preferences(b).build()).map_err(|e| {
-        windows.forget(&label);
-        IdeError::internal(format!("cannot create {} window: {e}", aux.kind.name()))
-    })?;
+    let window =
+        builder.and_then(|b| macos_webview_configuration(app, webview_profile(app, b)).build()).map_err(|e| {
+            windows.forget(&label);
+            IdeError::internal(format!("cannot create {} window: {e}", aux.kind.name()))
+        })?;
     #[cfg(target_os = "linux")]
     decorate_csd(&window);
     #[cfg(target_os = "macos")]
@@ -1820,7 +2092,7 @@ pub fn open_comparison_window(
 fn diff_window_id(diff: &DiffLaunch) -> u64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    (&diff.path, &diff.left, &diff.right).hash(&mut hasher);
+    (&diff.path, &diff.left, &diff.middle, &diff.right).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1887,6 +2159,60 @@ pub fn open_deployment_window(
             size: AuxKind::Deployment.default_size(),
             min_size: AuxKind::Deployment.min_size(),
             launch: Launch { deployment: Some(DeploymentLaunch { server, paths }), ..Default::default() },
+            background,
+        },
+    )
+}
+
+/// Opens (or focuses) the New Project window of `parent`'s project window: a separate window
+/// centred over it, so the wizard can be moved and sized on its own.
+pub fn open_new_project_window(app: &AppHandle, parent: &WebviewWindow, background: Option<String>) -> IdeResult<()> {
+    open_auxiliary_window(
+        app,
+        parent,
+        AuxWindow {
+            kind: AuxKind::NewProject,
+            title: "New Project",
+            size: AuxKind::NewProject.default_size(),
+            min_size: AuxKind::NewProject.min_size(),
+            launch: Launch::default(),
+            background,
+        },
+    )
+}
+
+/// Opens (or focuses, filling in `url`) the Get from VCS window of `parent`'s project window.
+pub fn open_clone_window(
+    app: &AppHandle,
+    parent: &WebviewWindow,
+    url: Option<String>,
+    background: Option<String>,
+) -> IdeResult<()> {
+    open_auxiliary_window(
+        app,
+        parent,
+        AuxWindow {
+            kind: AuxKind::Clone,
+            title: "Get from Version Control",
+            size: AuxKind::Clone.default_size(),
+            min_size: AuxKind::Clone.min_size(),
+            launch: Launch { clone_url: url.filter(|u| !u.trim().is_empty()), ..Default::default() },
+            background,
+        },
+    )
+}
+
+/// Opens (or focuses) the Remote Development window of `parent`'s project window.
+pub fn open_connect_window(app: &AppHandle, parent: &WebviewWindow, background: Option<String>) -> IdeResult<()> {
+    open_auxiliary_window(
+        app,
+        parent,
+        AuxWindow {
+            kind: AuxKind::Connect,
+            title: "Remote Development",
+            size: AuxKind::Connect.default_size(),
+            min_size: AuxKind::Connect.min_size(),
+            launch: Launch::default(),
             background,
         },
     )
@@ -2088,6 +2414,18 @@ fn fit_over_parent(
     rx.recv_timeout(FIT_ON_MAIN_TIMEOUT).map_err(|_| tauri::Error::FailedToReceiveMessage)
 }
 
+/// A new window's size and minimum size (logical pixels) shrunk to fit `area`, the work area of
+/// the monitor it opens on: the default 1440×900 is taller than a 1920×1080 laptop screen at
+/// 150 % scaling once the taskbar is taken off.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn fit_new_window(size: (f64, f64), min: (f64, f64), area: (f64, f64)) -> ((f64, f64), (f64, f64)) {
+    if area.0 <= 0.0 || area.1 <= 0.0 {
+        return (size, min);
+    }
+    let size = (size.0.min(area.0), size.1.min(area.1));
+    (size, (min.0.min(size.0), min.1.min(size.1)))
+}
+
 /// Centres the settings window over its owner, inside the owner's monitor work area. The window
 /// may still be on another display with a different scale, so its size is converted with its own
 /// scale and its position is given in physical pixels.
@@ -2180,18 +2518,103 @@ fn open_popup_in_browser<R: tauri::Runtime>(
     tauri::webview::NewWindowResponse::Deny
 }
 
-/// Reproduce WKWebView's user-font restriction before WKWebView creation. The
-/// private selector and environment override are absent from release builds.
-#[cfg(all(debug_assertions, target_os = "macos"))]
-fn dev_font_preferences(
-    builder: WebviewWindowBuilder<'_, tauri::Wry, AppHandle>,
-) -> WebviewWindowBuilder<'_, tauri::Wry, AppHandle> {
+/// On Windows every window keeps WebView2's profile (localStorage, IndexedDB) in the local
+/// data directory, so a custom location from Settings › System Settings › Caches holds it too;
+/// Tauri would always use the default one. All windows share it: one WebView2 browser process
+/// serves a single profile folder.
+fn webview_profile<'a>(
+    app: &AppHandle,
+    builder: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    #[cfg(windows)]
+    if let Some(state) = app.try_state::<AppState>() {
+        return builder.data_directory(state.host.local_data_dir.clone());
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+    builder
+}
+
+/// Configure macOS `WKWebViewConfiguration` before `WKWebView` creation:
+/// - Disable macOS 15+ Apple Intelligence Writing Tools so its floating selection
+///   affordance does not appear over Markdown previews, Quick Documentation, or editors.
+/// - In debug builds, optionally reproduce WKWebView's user-font restriction when
+///   `OPENIDEA_DEV_DISALLOW_USER_FONTS=1` is set (absent from release builds).
+#[cfg(target_os = "macos")]
+fn macos_webview_configuration<'a>(
+    app: &AppHandle,
+    builder: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    match build_macos_webview_configuration(app) {
+        Some(config) => builder.with_webview_configuration(config),
+        None => builder,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_webview_configuration(
+    app: &AppHandle,
+) -> Option<objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>> {
+    build_macos_webview_configuration_with(|f| app.run_on_main_thread(f))
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_webview_configuration_with(
+    run_on_main_thread: impl FnOnce(Box<dyn FnOnce() + Send>) -> tauri::Result<()>,
+) -> Option<objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>> {
+    const ON_MAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    struct SendConfig(objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>);
+    // SAFETY: Created and configured exclusively on the main thread, then moved untouched into
+    // `WebviewWindowBuilder::with_webview_configuration`, which transfers it back to the main
+    // thread when Wry constructs the WKWebView.
+    unsafe impl Send for SendConfig {}
+
+    let make = |mtm: objc2::MainThreadMarker| {
+        let config = unsafe { objc2_web_kit::WKWebViewConfiguration::new(mtm) };
+        configure_macos_webview_configuration(&config).then_some(SendConfig(config))
+    };
+
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        return make(mtm).map(|c| c.0);
+    }
+
+    // Secondary project windows (`spawn_window`) and auxiliary windows (`open_auxiliary_window`)
+    // build off the main thread; create the configuration on the AppKit main thread and fall back
+    // to the default builder if the event loop cannot service it.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if let Err(err) = run_on_main_thread(Box::new(move || {
+        let result = objc2::MainThreadMarker::new().and_then(make);
+        let _ = tx.send(result);
+    })) {
+        tracing::warn!("could not schedule macOS WKWebViewConfiguration on main thread: {err}");
+        return None;
+    }
+    match rx.recv_timeout(ON_MAIN_TIMEOUT) {
+        Ok(Some(config)) => Some(config.0),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!("timed out waiting for macOS WKWebViewConfiguration on main thread: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_webview_configuration(config: &objc2_web_kit::WKWebViewConfiguration) -> bool {
+    use objc2::{msg_send, sel};
+    use objc2_app_kit::NSWritingToolsBehavior;
+    use objc2_foundation::NSObjectProtocol;
+
+    let mut configured = false;
+    if config.respondsToSelector(sel!(setWritingToolsBehavior:)) {
+        unsafe {
+            let _: () = msg_send![config, setWritingToolsBehavior: NSWritingToolsBehavior::None];
+        }
+        configured = true;
+    }
+    #[cfg(debug_assertions)]
     if std::env::var("OPENIDEA_DEV_DISALLOW_USER_FONTS").as_deref() == Ok("1") {
-        use objc2::{MainThreadMarker, msg_send, sel};
-        use objc2_foundation::NSObjectProtocol;
-        let config = unsafe {
-            objc2_web_kit::WKWebViewConfiguration::new(MainThreadMarker::new().expect("window creation on main thread"))
-        };
         let preferences = unsafe { config.preferences() };
         if preferences.respondsToSelector(sel!(_setShouldAllowUserInstalledFonts:)) {
             unsafe {
@@ -2199,17 +2622,19 @@ fn dev_font_preferences(
             }
             let allowed: bool = unsafe { msg_send![&preferences, _shouldAllowUserInstalledFonts] };
             tracing::info!(allowed, "Development user-installed fonts override");
-            return builder.with_webview_configuration(config);
+            configured = true;
+        } else {
+            tracing::warn!("WKPreferences user-font development selector unavailable");
         }
-        tracing::warn!("WKPreferences user-font development selector unavailable");
     }
-    builder
+    configured
 }
 
-#[cfg(not(all(debug_assertions, target_os = "macos")))]
-fn dev_font_preferences(
-    builder: WebviewWindowBuilder<'_, tauri::Wry, AppHandle>,
-) -> WebviewWindowBuilder<'_, tauri::Wry, AppHandle> {
+#[cfg(not(target_os = "macos"))]
+fn macos_webview_configuration<'a>(
+    _app: &AppHandle,
+    builder: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
     builder
 }
 
@@ -2222,12 +2647,19 @@ mod tests {
         let mut diff = DiffLaunch {
             path: "/p/a.txt".into(),
             left: DiffSide::Rev { rev: "HEAD".into(), path: None, label: None },
+            middle: None,
             right: DiffSide::Worktree { label: None, label_detail: None },
             line: None,
+            line_side: None,
+            col: None,
+            chain: None,
         };
         let id = diff_window_id(&diff);
         diff.line = Some(12);
         assert_eq!(diff_window_id(&diff), id);
+        diff.middle = Some(DiffSide::Rev { rev: ":0".into(), path: None, label: None });
+        assert_ne!(diff_window_id(&diff), id);
+        diff.middle = None;
         diff.right = DiffSide::Rev { rev: ":0".into(), path: None, label: None };
         assert_ne!(diff_window_id(&diff), id);
         diff.path = "/p/b.txt".into();
@@ -2288,6 +2720,76 @@ mod tests {
             a.preferred_dark_theme = id.into();
             assert_eq!(frame_color(&a, false), color);
             assert_eq!(frame_color(&a, true), color);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_webview_configuration_disables_writing_tools() {
+        use objc2::{MainThreadMarker, msg_send, sel};
+        use objc2_app_kit::NSWritingToolsBehavior;
+        use objc2_foundation::NSObjectProtocol;
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let config = unsafe { objc2_web_kit::WKWebViewConfiguration::new(mtm) };
+        let configured = configure_macos_webview_configuration(&config);
+        if config.respondsToSelector(sel!(writingToolsBehavior)) {
+            assert!(configured);
+            let behavior: NSWritingToolsBehavior = unsafe { msg_send![&config, writingToolsBehavior] };
+            assert_eq!(behavior, NSWritingToolsBehavior::None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_webview_configuration_handles_non_main_thread() {
+        use objc2::{MainThreadMarker, sel};
+        use objc2_foundation::NSObjectProtocol;
+
+        // Off-thread scheduling failure falls back to None instead of panicking.
+        let result = std::thread::spawn(|| {
+            assert!(MainThreadMarker::new().is_none());
+            build_macos_webview_configuration_with(|_| Err(tauri::Error::FailedToReceiveMessage)).is_none()
+        })
+        .join()
+        .expect("worker thread must not panic");
+        assert!(result);
+
+        // Off-thread callback without a main-thread marker falls back to None instead of panicking.
+        let result = std::thread::spawn(|| {
+            assert!(MainThreadMarker::new().is_none());
+            build_macos_webview_configuration_with(|f| {
+                f();
+                Ok(())
+            })
+            .is_none()
+        })
+        .join()
+        .expect("worker thread must not panic");
+        assert!(result);
+
+        // When a main thread is available (e.g. nextest or --test-threads=1), dispatching from a
+        // worker thread constructs and configures WKWebViewConfiguration on the main thread.
+        if let Some(mtm) = MainThreadMarker::new() {
+            let probe = unsafe { objc2_web_kit::WKWebViewConfiguration::new(mtm) };
+            let expects_config = probe.respondsToSelector(sel!(setWritingToolsBehavior:));
+
+            let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(1);
+            let worker = std::thread::spawn(move || {
+                assert!(MainThreadMarker::new().is_none());
+                build_macos_webview_configuration_with(move |f| {
+                    work_tx.send(f).map_err(|_| tauri::Error::FailedToReceiveMessage)
+                })
+                .is_some()
+            });
+            let work = work_rx.recv().expect("worker should schedule onto main thread");
+            work();
+            let got_config = worker.join().expect("worker thread must not panic");
+            if expects_config {
+                assert!(got_config);
+            }
         }
     }
 
@@ -2863,6 +3365,10 @@ mod tests {
         assert_eq!(auxiliary("diff-project-2-3"), Some((AuxKind::Diff, "project-2")));
         assert_eq!(auxiliary("editor-project-2-3"), Some((AuxKind::Editor, "project-2")));
         assert_eq!(auxiliary("deployment-project-2"), Some((AuxKind::Deployment, "project-2")));
+        assert_eq!(auxiliary("new-project-project-2"), Some((AuxKind::NewProject, "project-2")));
+        assert_eq!(auxiliary("new-project-main"), Some((AuxKind::NewProject, "main")));
+        assert_eq!(auxiliary("clone-project-2"), Some((AuxKind::Clone, "project-2")));
+        assert_eq!(auxiliary("connect-main"), Some((AuxKind::Connect, "main")));
         for label in ["main", "project-1", "comparison-main", "comparison-main-x", "settings-", "settingsmain"] {
             assert_eq!(auxiliary(label), None, "{label}");
         }
@@ -2892,6 +3398,9 @@ mod tests {
             ("settings-main", "app.checkForUpdates", Parent { label: "main", raise: true }),
             ("settings-project-2", "file.newFile", Parent { label: "project-2", raise: true }),
             ("settings-main", "editor.closeTab", Parent { label: "main", raise: true }),
+            ("new-project-main", "file.newFile", Parent { label: "main", raise: true }),
+            ("clone-main", "vcs.clone", Parent { label: "main", raise: true }),
+            ("new-project-project-2", "editor.closeTab", Parent { label: "project-2", raise: true }),
             ("settings-main", "file.settings", Parent { label: "main", raise: false }),
             ("settings-main", "app.quit", Parent { label: "main", raise: false }),
             ("comparison-main-0", "app.quit", Parent { label: "main", raise: false }),
@@ -2901,6 +3410,19 @@ mod tests {
         ] {
             assert_eq!(menu_destination(label, action), expected, "{label} {action}");
         }
+    }
+
+    #[test]
+    fn a_new_window_fits_the_work_area() {
+        // 1920×1080 at 150 % with a 48-pixel taskbar (#5750).
+        let area = (1280.0, 1032.0 / 1.5);
+        assert_eq!(fit_new_window((1440.0, 900.0), (400.0, 500.0), area), ((1280.0, 688.0), (400.0, 500.0)));
+        // A minimum larger than the screen gives way too.
+        assert_eq!(fit_new_window((1440.0, 900.0), (400.0, 800.0), area).1, (400.0, 688.0));
+        // A large screen keeps the configured size; an unknown work area changes nothing.
+        let big = ((1440.0, 900.0), (400.0, 500.0));
+        assert_eq!(fit_new_window(big.0, big.1, (2560.0, 1400.0)), big);
+        assert_eq!(fit_new_window(big.0, big.1, (0.0, 0.0)), big);
     }
 
     #[test]
@@ -2948,6 +3470,9 @@ mod tests {
             "comparison-project-2-0",
             "diff-main-9",
             "deployment-main",
+            "new-project-main",
+            "clone-main",
+            "connect-main",
         ] {
             assert!(!keeps_window_state(label), "{label} must not use physical window-state");
         }
@@ -3030,5 +3555,39 @@ mod tests {
         assert_eq!(menu_settings_launch("main", false, false, "file.settings", None), None);
         assert_eq!(menu_settings_launch("main", true, true, "file.settings", None), None);
         assert_eq!(menu_settings_launch("main", false, true, "file.openProject", None), None);
+    }
+
+    #[test]
+    fn parallel_close_coordination_tracks_ready_prompt_and_abort() {
+        let st = WindowsState::default();
+        st.close_requested("main");
+        st.close_requested("project-1");
+        assert!(st.is_closing("main"));
+        assert!(st.has_other_pending_closes("main"));
+
+        // Prompt turn allows only one holder at a time.
+        assert_eq!(st.try_acquire_prompt("main"), Ok(true));
+        assert_eq!(st.try_acquire_prompt("project-1"), Ok(false));
+        assert!(st.has_prompt_holder());
+
+        // Marking ready releases the prompt turn.
+        assert!(st.mark_ready("main"));
+        assert!(!st.has_prompt_holder());
+        assert_eq!(st.try_acquire_prompt("project-1"), Ok(true));
+
+        // Cancelling the batch aborts waiting ready peers and clears the prompt holder.
+        st.abort_all_closing(Some("project-1"));
+        assert!(!st.has_prompt_holder());
+        assert!(st.take_aborted("main"));
+        assert!(!st.is_closing("main"));
+        assert!(!st.take_aborted("project-1"));
+
+        // A fresh close clears any stale aborted state and claims hide once per cohort.
+        st.close_requested("main");
+        assert_eq!(
+            st.claim_hide(&["main".into(), "project-1".into()]),
+            vec!["main".to_string(), "project-1".to_string()]
+        );
+        assert!(st.claim_hide(&["main".into(), "project-1".into()]).is_empty());
     }
 }

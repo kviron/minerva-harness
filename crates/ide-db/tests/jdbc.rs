@@ -1,5 +1,5 @@
 use ide_core::{CancellationToken, IdeResult};
-use ide_db::{DataSource, DbDriver, DbJdbcDriver, DbManager, SortKey};
+use ide_db::{DataSource, DbDriver, DbJdbcDriver, DbManager, DbProperty, SortKey};
 use std::{path::Path, sync::Arc};
 
 fn manager(dir: &Path) -> DbManager {
@@ -17,12 +17,14 @@ async fn jdbc_profiles_persist_and_project_files_cannot_start_drivers() -> IdeRe
     db.save_jdbc_driver(DbJdbcDriver {
         id: "fixture".into(),
         name: "Test".into(),
+        vendor: None,
         jars: vec![jar.display().to_string()],
         class_name: "test.Driver".into(),
         url_template: "jdbc:test:".into(),
     })?;
     let reopened = manager(tmp.path());
     assert_eq!(reopened.jdbc_drivers()?[0].class_name, "test.Driver");
+    assert_eq!(reopened.jdbc_drivers()?[0].vendor, None);
     let source = DataSource {
         id: "local".into(),
         name: "local".into(),
@@ -54,19 +56,58 @@ async fn jdbc_profiles_persist_and_project_files_cannot_start_drivers() -> IdeRe
 }
 
 #[tokio::test]
-#[ignore = "requires DUCKDB_JDBC_JAR and a local Java 17+ runtime"]
-async fn duckdb_custom_driver_through_database_manager() -> IdeResult<()> {
+async fn named_jdbc_sources_persist_the_type_and_reject_a_profile_for_another_type() -> IdeResult<()> {
     let tmp = tempfile::tempdir()?;
+    let jar = tmp.path().join("fixture.jar");
+    std::fs::write(&jar, [])?;
     let db = manager(tmp.path());
+    db.save_jdbc_driver(DbJdbcDriver {
+        id: "fixture".into(),
+        name: "Test".into(),
+        vendor: Some("tidb".into()),
+        jars: vec![jar.display().to_string()],
+        class_name: "test.Driver".into(),
+        url_template: String::new(),
+    })?;
+    let source = DataSource {
+        id: "local".into(),
+        name: "local".into(),
+        driver: DbDriver::Jdbc,
+        vendor: "mariadb".into(),
+        jdbc_driver: "fixture".into(),
+        url: "jdbc:test:".into(),
+        ..Default::default()
+    };
+    db.save_sources(vec![source]).await?;
+    let reopened = manager(tmp.path());
+    let source = reopened.source("local")?;
+    assert_eq!(reopened.jdbc_drivers()?[0].vendor.as_deref(), Some("tidb"));
+    assert_eq!(source.driver, DbDriver::Jdbc);
+    assert_eq!(source.vendor, "mariadb");
+    let err = reopened.test(&source, None, None).await.unwrap_err();
+    assert!(err.message.contains("not associated with this data source type"));
+    Ok(())
+}
+
+fn register_duckdb(db: &DbManager, vendor: Option<&str>) -> IdeResult<()> {
     let jar = std::env::var("DUCKDB_JDBC_JAR").expect("DUCKDB_JDBC_JAR");
     assert_eq!(ide_db::jdbc_driver_classes(std::slice::from_ref(&jar))?, ["org.duckdb.DuckDBDriver"]);
     db.save_jdbc_driver(DbJdbcDriver {
         id: "duck".into(),
         name: "DuckDB".into(),
+        vendor: vendor.map(str::to_owned),
         jars: vec![jar],
         class_name: "org.duckdb.DuckDBDriver".into(),
         url_template: "jdbc:duckdb:".into(),
-    })?;
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires DUCKDB_JDBC_JAR and a local Java 17+ runtime"]
+async fn duckdb_custom_driver_through_database_manager() -> IdeResult<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = manager(tmp.path());
+    register_duckdb(&db, None)?;
     let source = DataSource {
         id: "test".into(),
         name: "DuckDB".into(),
@@ -121,6 +162,104 @@ async fn duckdb_custom_driver_through_database_manager() -> IdeResult<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires DUCKDB_JDBC_JAR and a local Java 17+ runtime"]
+async fn duckdb_named_file_enforces_read_only_at_open() -> IdeResult<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = manager(tmp.path());
+    register_duckdb(&db, Some("duckdb"))?;
+    let file = tmp.path().join("example.duckdb");
+    let mut source = DataSource {
+        id: "test".into(),
+        name: "DuckDB".into(),
+        driver: DbDriver::Jdbc,
+        vendor: "duckdb".into(),
+        global: true,
+        jdbc_driver: "duck".into(),
+        url: format!("jdbc:duckdb:{}", file.display()),
+        file: Some(file.clone().into()),
+        read_only: true,
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let err = db.test(&source, None, None).await.unwrap_err();
+    assert!(err.message.contains("existing database file"), "{}", err.message);
+    assert!(!file.exists());
+
+    source.read_only = false;
+    db.save_sources(vec![source.clone()]).await?;
+    db.execute("test", "create table items (id int)", 1, &cancel).await?;
+    db.execute("test", "insert into items values (1)", 1, &cancel).await?;
+    db.disconnect("test").await;
+
+    source.read_only = true;
+    let reopened = manager(tmp.path());
+    assert!(reopened.test(&source, None, None).await?.to_lowercase().contains("duckdb"));
+    let mut conflicting = source.clone();
+    for options in ["; access_mode = READ_WRITE", "; duckdb.read_only = false"] {
+        conflicting.url = format!("{}{options}", source.url);
+        let err = reopened.test(&conflicting, None, None).await.unwrap_err();
+        assert!(err.message.contains("conflicts with Read-only"), "{}", err.message);
+    }
+    conflicting.url = source.url.clone();
+    conflicting.properties.push(DbProperty { name: "ACCESS_MODE".into(), value: "READ_WRITE".into() });
+    let err = reopened.test(&conflicting, None, None).await.unwrap_err();
+    assert!(err.message.contains("conflicts with Read-only"), "{}", err.message);
+
+    reopened.save_sources(vec![source.clone()]).await?;
+    assert_eq!(reopened.source("test")?.vendor, "duckdb");
+    assert_eq!(reopened.execute("test", "select id from items", 1, &cancel).await?.rows, [vec![Some("1".into())]]);
+    for query in ["insert into items values (2)", "create table added (id int)"] {
+        let err = reopened.execute("test", query, 1, &cancel).await.unwrap_err();
+        assert!(err.message.to_lowercase().contains("read-only"), "{}", err.message);
+    }
+    assert!(!reopened.tables("test", "main").await?.iter().any(|table| table.name == "added"));
+    reopened.disconnect("test").await;
+
+    source.read_only = false;
+    reopened.save_sources(vec![source]).await?;
+    reopened.execute("test", "insert into items values (2)", 1, &cancel).await?;
+    assert_eq!(
+        reopened.execute("test", "select count(*) from items", 1, &cancel).await?.rows,
+        [vec![Some("2".into())]]
+    );
+    reopened.disconnect("test").await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires DUCKDB_JDBC_JAR and a local Java 17+ runtime"]
+async fn duckdb_named_memory_lives_until_disconnect() -> IdeResult<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = manager(tmp.path());
+    register_duckdb(&db, Some("duckdb"))?;
+    let mut source = DataSource {
+        id: "test".into(),
+        name: "DuckDB (memory)".into(),
+        driver: DbDriver::Jdbc,
+        vendor: "duckdb".into(),
+        global: true,
+        jdbc_driver: "duck".into(),
+        url: "jdbc:duckdb:".into(),
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    db.save_sources(vec![source.clone()]).await?;
+    db.execute("test", "create table session_items as select 42 as id", 1, &cancel).await?;
+    assert_eq!(db.execute("test", "select id from session_items", 1, &cancel).await?.rows, [vec![Some("42".into())]]);
+    db.disconnect("test").await;
+    assert!(!db.tables("test", "main").await?.iter().any(|table| table.name == "session_items"));
+    db.disconnect("test").await;
+
+    source.read_only = true;
+    for url in ["jdbc:duckdb:", "jdbc:duckdb::memory:"] {
+        source.url = url.into();
+        let err = db.test(&source, None, None).await.unwrap_err();
+        assert!(err.message.contains("existing database file"), "{}", err.message);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires CLICKHOUSE_JDBC_CLASSPATH and a loopback ClickHouse fixture on CLICKHOUSE_JDBC_TEST_PORT"]
 async fn clickhouse_vendor_driver_reads_catalog_and_results() -> IdeResult<()> {
     let tmp = tempfile::tempdir()?;
@@ -135,6 +274,7 @@ async fn clickhouse_vendor_driver_reads_catalog_and_results() -> IdeResult<()> {
     db.save_jdbc_driver(DbJdbcDriver {
         id: "clickhouse".into(),
         name: "ClickHouse JDBC".into(),
+        vendor: Some("clickhouse".into()),
         jars,
         class_name: "com.clickhouse.jdbc.ClickHouseDriver".into(),
         url_template: "jdbc:clickhouse://".into(),
@@ -143,6 +283,7 @@ async fn clickhouse_vendor_driver_reads_catalog_and_results() -> IdeResult<()> {
         id: "test".into(),
         name: "ClickHouse JDBC".into(),
         driver: DbDriver::Jdbc,
+        vendor: "clickhouse".into(),
         jdbc_driver: "clickhouse".into(),
         url: format!("jdbc:clickhouse://127.0.0.1:{port}/default"),
         user: "fixture".into(),
@@ -181,6 +322,7 @@ async fn unresponsive_driver_closes_before_reconnect() -> IdeResult<()> {
     db.save_jdbc_driver(DbJdbcDriver {
         id: "fixture".into(),
         name: "Fixture".into(),
+        vendor: None,
         jars: vec![std::env::var("JDBC_FIXTURE_JAR").unwrap()],
         class_name: "ai.openidea.jdbc.SelfTest$Fixture".into(),
         url_template: String::new(),
@@ -229,6 +371,7 @@ async fn a_lost_session_reconnects_on_the_next_statement() -> IdeResult<()> {
     db.save_jdbc_driver(DbJdbcDriver {
         id: "fixture".into(),
         name: "Fixture".into(),
+        vendor: None,
         jars: vec![std::env::var("JDBC_FIXTURE_JAR").unwrap()],
         class_name: "ai.openidea.jdbc.SelfTest$Fixture".into(),
         url_template: String::new(),

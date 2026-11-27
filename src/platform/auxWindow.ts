@@ -1,5 +1,6 @@
 /**
- * Auxiliary windows: Settings, comparison and deployment windows that belong
+ * Auxiliary windows: Settings, comparison, deployment and dialog windows (New Project, Get from VCS,
+ * Remote Development) that belong
  * to a project window (their parent) and share its project. Labels name the
  * kind and the parent (`settings-main`, `comparison-project-2-3`), mirroring
  * `windows::auxiliary` in src-tauri/src/windows.rs.
@@ -8,11 +9,30 @@ import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 import { TauriEvent } from "@tauri-apps/api/event";
 import { isTauri } from "./ipc";
 
-export type AuxKind = "settings" | "comparison" | "diff" | "editor" | "deployment";
+export type AuxKind =
+  | "settings"
+  | "comparison"
+  | "diff"
+  | "editor"
+  | "deployment"
+  | "new-project"
+  | "clone"
+  | "connect";
 
 /** Kinds with several windows per parent (`<kind>-<parent>-<n>`); the others have one (`<kind>-<parent>`). */
 const MULTIPLE: ReadonlySet<AuxKind> = new Set(["comparison", "diff", "editor"]);
-const KINDS: readonly AuxKind[] = ["settings", "comparison", "diff", "editor", "deployment"];
+const KINDS: readonly AuxKind[] = [
+  "settings",
+  "comparison",
+  "diff",
+  "editor",
+  "deployment",
+  "new-project",
+  "clone",
+  "connect",
+];
+/** Kinds that show none of the parent's documents (`AuxKind::shares_documents` in windows.rs). */
+const WITHOUT_DOCUMENTS: ReadonlySet<AuxKind> = new Set(["settings", "new-project", "clone", "connect"]);
 
 /** An auxiliary window reports to its parent whether it closed, and which documents it released. */
 export const AUX_CLOSED = "openidea://auxiliary/closed";
@@ -64,22 +84,29 @@ export async function closeDocumentWindows(): Promise<boolean> {
   const parent = getCurrentWindow();
   const children = (await getAllWindows()).filter((window) => {
     const aux = auxiliaryWindow(window.label);
-    return aux !== null && aux.kind !== "settings" && aux.parent === parent.label;
+    return aux !== null && !WITHOUT_DOCUMENTS.has(aux.kind) && aux.parent === parent.label;
   });
   for (const child of children) {
     let finish!: (closed: boolean) => void;
     const result = new Promise<boolean>((resolve) => {
       finish = resolve;
     });
+    // oxlint-disable-next-line no-await-in-loop -- subscribe to this child's close result before touching its window
     const offResult = await parent.listen<AuxCloseResult>(AUX_CLOSED, ({ payload }) => {
       if (payload.label === child.label && !payload.closed) finish(false);
     });
+    // oxlint-disable-next-line no-await-in-loop -- register the destroyed listener before showing the window
     const offDestroyed = await child.once(TauriEvent.WINDOW_DESTROYED, () => finish(true));
     try {
+      // oxlint-disable-next-line no-await-in-loop -- window lifecycle: unminimize, then show, then focus, then close
       await child.unminimize();
+      // oxlint-disable-next-line no-await-in-loop -- window lifecycle: unminimize, then show, then focus, then close
       await child.show();
+      // oxlint-disable-next-line no-await-in-loop -- window lifecycle: unminimize, then show, then focus, then close
       await child.setFocus();
+      // oxlint-disable-next-line no-await-in-loop -- window lifecycle: unminimize, then show, then focus, then close
       await child.close();
+      // oxlint-disable-next-line no-await-in-loop -- one window at a time; a cancelled close stops the whole loop
       if (!(await result)) return false;
     } finally {
       offResult();

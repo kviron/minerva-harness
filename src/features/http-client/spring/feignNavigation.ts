@@ -4,14 +4,15 @@ import {
   activeEditor,
   editorsFor,
   iconAreaSource,
+  invalidateNavigationProviders,
   onEditorEvent,
+  registerNavigationProvider,
   useEditorRegistry,
   type EditorDocContext,
 } from "@/editor/api";
 import { docOf } from "@/editor/lsp/lsp";
 import { locationItems, navigateTo } from "@/editor/lsp/navigation";
 import { caretAnchor, openPopup, type ListPopupItem } from "@/editor/lsp/popupStore";
-import { invalidateNavigationProviders, registerNavigationProvider } from "@/editor/navigationProviders";
 import { executeAction } from "@/platform/actions";
 import { tx } from "@/platform/i18n";
 import { call, commands, onIdeEvent, type Location, type ProjectInfo } from "@/platform/ipc";
@@ -115,6 +116,7 @@ async function* currentMappings<T extends MappedMethod>(
     paths.add(path);
   for (const path of [...paths].sort()) {
     if (scope.stale()) return;
+    // oxlint-disable-next-line no-await-in-loop -- yields one parsed file at a time; staleness is checked before and after the read
     const text = await read(path).catch(() => null);
     if (scope.stale()) return;
     if (text === null || text.length > MAX_NAVIGATION_SOURCE) continue;

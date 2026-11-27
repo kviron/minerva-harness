@@ -1,12 +1,14 @@
 /** Context menu and "New" popup of the project view. */
+import { openCopyPathChooser } from "@/editor/api";
 import { executeAction, getAction } from "@/platform/actions";
+import type { PathKind } from "@/platform/copyPath";
 import { getContext } from "@/platform/context";
 import { canOpenWithSystemApp, canRevealInFileManager, fileManagerName } from "@/platform/fileManager";
 import { formatBinding, hostBinding, isMacHost, shortcutLabel } from "@/platform/keymap";
 import { projectFolder, relativePath, useProject } from "@/platform/project";
-import { currentDetectedRoots, currentRoots } from "@/platform/projectRoots";
+import { attachedProjectOf, currentDetectedRoots, currentRoots } from "@/platform/projectRoots";
 import type { MenuItem } from "@/ui";
-import { menuGroupItems, toolWindowService, type MenuGroupContext } from "@/workbench/contributions";
+import { menuGroupItems, gitMenuItems, toolWindowService, type MenuGroupContext } from "@/workbench/contributions";
 import type { FolderRole } from "@/platform/languageSettings";
 import { directoryRole, markDirectory } from "./markDirectory";
 import { fileColorMenu } from "./fileColor";
@@ -18,6 +20,7 @@ import {
   canPaste,
   copyPaths,
   copySelection,
+  pathsFor,
   delegate,
   deleteSelection,
   findFileUsages,
@@ -32,12 +35,11 @@ import {
   reformatNodes,
   reloadFromDisk,
   revealInFinder,
-  vcsArg,
 } from "./operations";
 import { canDownload } from "./download";
 import { isSameOrInside } from "./paths";
 import { useProjectTree } from "./store";
-import { tx } from "@/platform/i18n";
+import { tx, txPart } from "@/platform/i18n";
 
 /** Keys handled by the project view itself (the default keymap has no entries for them). */
 export const LOCAL_KEYS: Record<string, string> = {
@@ -152,6 +154,8 @@ function delegated(
 }
 
 type Entry = MenuItem | null | false | undefined;
+/** Where a menu opens; popups its items open appear there. */
+type MenuPoint = { x: number; y: number } | "center";
 
 /** A submenu of the present entries, or nothing when none is left (never an empty submenu). */
 function submenu(id: string, label: string, entries: Entry[], icon?: string): MenuItem | null {
@@ -160,14 +164,14 @@ function submenu(id: string, label: string, entries: Entry[], icon?: string): Me
   return { id, label, icon, submenu: items };
 }
 
-/**
- * IDEA's ProjectViewPopupMenu: New / clipboard / find / Refactor / edit /
- * Run group / Open In / Local History / Git / Compare / Mark Directory as.
- * Items that cannot apply to the selection are hidden (or disabled, like IDEA's
- * clipboard group), so the project root and Scratches get a shorter menu.
- */
-export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
-  if (nodes.some((n) => n.readOnly)) return libraryMenuItems(nodes.filter((n) => !n.group));
+/** Project view actions available for the selected files and directories. */
+/** `at`: where the menu opens, for the popups its items open (Copy Path/Reference…). */
+export function contextMenuItems(nodes: ProjectNode[], at: MenuPoint = "center"): MenuItem[] {
+  if (nodes.some((n) => n.readOnly))
+    return libraryMenuItems(
+      nodes.filter((n) => !n.group),
+      at,
+    );
   const lead = nodes[0] ?? null;
   const single = nodes.length === 1 ? lead : null;
   const nonRoot = nodes.filter((n) => !n.root);
@@ -205,7 +209,7 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
   );
 
-  // Cut / Copy / Copy Path/Reference… / Paste
+  // Clipboard and opening files.
   push(
     {
       id: "cut",
@@ -223,22 +227,7 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       disabled: !nonRoot.length,
       run: () => copySelection(false),
     },
-    {
-      id: "copyPath",
-      label: "Copy Path/Reference…",
-      submenu: [
-        {
-          id: "abs",
-          label: "Absolute Path",
-          shortcut: keyLabel("project.copyAbsolutePath"),
-          run: () => void copyPaths("absolute", nodes),
-        },
-        { id: "name", label: "File Name", run: () => void copyPaths("name", nodes) },
-        { id: "rel", label: "Path From Content Root", run: () => void copyPaths("relative", nodes) },
-        { kind: "separator" },
-        ...menuGroupItems("copyPath", menuGroupContext(nodes)),
-      ],
-    },
+    copyPathItem(nodes, at, false),
     {
       id: "paste",
       label: "Paste",
@@ -247,11 +236,6 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       disabled: !canPaste(),
       run: () => void paste(folder),
     },
-    { kind: "separator" },
-  );
-
-  // Jump to Source / Find Usages / Find in Files… / Replace in Files…
-  push(
     files.length > 0 && {
       id: "jumpToSource",
       label: "Jump to Source",
@@ -259,6 +243,10 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       shortcut: keyLabel("project.open"),
       run: () => files.forEach((f) => void openFile(f.path)),
     },
+    { kind: "separator" },
+  );
+
+  push(
     inWorkspace &&
       singleFile && {
         id: "findUsages",
@@ -271,16 +259,17 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
   );
 
-  // Refactor ›
+  const rename: Entry = single &&
+    !single.root && {
+      id: "rename",
+      label: "Rename…",
+      shortcut: keyLabel("project.rename"),
+      run: () => void openRenameDialog(single),
+    };
   push(
+    rename,
     submenu("refactor", "Refactor", [
-      single &&
-        !single.root && {
-          id: "rename",
-          label: "Rename…",
-          shortcut: keyLabel("project.rename"),
-          run: () => void openRenameDialog(single),
-        },
+      rename,
       nonRoot.length > 0 && {
         id: "move",
         label: nonRoot.length === 1 ? (nonRoot[0]!.dir ? "Move Directory…" : "Move File…") : "Move…",
@@ -301,10 +290,16 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
         run: () => void deleteSelection(nodes),
       },
     ]),
+    {
+      id: "delete",
+      label: "Delete…",
+      shortcut: keyLabel("project.delete"),
+      disabled: !nonRoot.length,
+      run: () => void deleteSelection(nodes),
+    },
     { kind: "separator" },
   );
 
-  // Reformat Code (one file at once, directories or several files through its dialog) / Optimize Imports / Delete…
   push(
     nodes.some((n) => !n.group) &&
       getAction(singleFile ? "code.reformatFile" : "code.reformatFiles") && {
@@ -320,13 +315,6 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
         shortcut: keyLabel("project.optimizeImports"),
         run: () => void delegate("code.optimizeImportsFile", { path: singleFile.path }),
       },
-    {
-      id: "delete",
-      label: "Delete…",
-      shortcut: keyLabel("project.delete"),
-      disabled: !nonRoot.length,
-      run: () => void deleteSelection(nodes),
-    },
     { kind: "separator" },
   );
 
@@ -367,13 +355,36 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
   );
 
-  // Local History › / Reload from Disk
   push(
     single &&
       submenu("history", "Local History", [
         delegated("vcs.localHistory", single.path, "Show History"),
         delegated("localHistory.putLabel", undefined, "Put Label…"),
       ]),
+  );
+
+  // Git › (`vcsAvailable` also covers repositories nested below a non-Git project root)
+  if (inWorkspace && (project?.isGit || getContext().vcsAvailable === true)) {
+    const dirs = nodes.map((n) => n.dir);
+    push(
+      submenu(
+        "git",
+        "Git",
+        [
+          // Shared with the editor and editor tab menus (IDEA keeps the per-menu groups in sync).
+          ...gitMenuItems({
+            paths: nodes.map((n) => n.path),
+            dirs,
+            file: !!singleFile,
+            ignore: nonRoot.length === nodes.length && nodes.length > 0 && nodes.every((n) => !n.placeholder),
+          }),
+        ],
+        "branch",
+      ),
+    );
+  }
+
+  push(
     {
       id: "reload",
       label: "Reload from Disk",
@@ -384,58 +395,6 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
     { kind: "separator" },
   );
 
-  // Git › (`vcsAvailable` also covers repositories nested below a non-Git project root)
-  if (inWorkspace && (project?.isGit || getContext().vcsAvailable === true)) {
-    const arg = vcsArg(nodes);
-    const dirs = nodes.some((n) => n.dir);
-    push(
-      submenu(
-        "git",
-        "Git",
-        [
-          act("vcs.commit", undefined, dirs || nodes.length > 1 ? "Commit…" : "Commit File…"),
-          act("vcs.addToVcs", arg, "Add"),
-          nonRoot.length === nodes.length &&
-            nodes.length > 0 &&
-            nodes.every((n) => !n.placeholder) &&
-            submenu("gitIgnore", "Add to .gitignore", [
-              act("vcs.ignoreShared", arg, ".gitignore"),
-              act("vcs.ignoreLocal", arg, ".git/info/exclude"),
-            ]),
-          { kind: "separator" },
-          singleFile && act("vcs.annotate", singleFile.path, "Annotate with Git Blame"),
-          act("vcs.showDiff", arg, "Show Diff"),
-          nodes.length > 0 &&
-            nodes.every((n) => !n.placeholder) &&
-            act("vcs.compareWithBranch", arg, "Compare with Branch…"),
-          singleFile && act("vcs.compareWithRevision", singleFile.path, "Compare with Revision…"),
-          nodes.length > 0 && nodes.every((n) => !n.placeholder) && act("vcs.showHistory", arg, "Show History"),
-          singleFile && act("vcs.showCurrentRevision", singleFile.path, "Show Current Revision"),
-          act("vcs.rollback", arg, "Rollback…"),
-          { kind: "separator" },
-          act("vcs.push", undefined, "Push…"),
-          act("vcs.pull", arg, "Pull…"),
-          act("vcs.fetch", undefined, "Fetch"),
-          act("vcs.merge", arg, "Merge…"),
-          act("vcs.rebase", arg, "Rebase…"),
-          { kind: "separator" },
-          act("vcs.branches", undefined, "Branches…"),
-          act("vcs.newBranch", undefined, "New Branch…"),
-          act("vcs.newTag", undefined, "New Tag…"),
-          act("vcs.resetHead", undefined, "Reset HEAD…"),
-          { kind: "separator" },
-          act("vcs.stash", undefined, "Stash Changes…"),
-          act("vcs.unstash", undefined, "Unstash Changes…"),
-          { kind: "separator" },
-          act("vcs.manageRemotes", undefined, "Manage Remotes…"),
-          act("vcs.clone", undefined, "Clone…"),
-        ],
-        "branch",
-      ),
-      { kind: "separator" },
-    );
-  }
-
   const compare = compareTarget(nodes);
   if (compare)
     push(
@@ -445,15 +404,21 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
       }),
     );
 
-  if (inProject && single?.dir && !single.root && !single.placeholder) {
+  push({ kind: "separator" });
+
+  // An attached project keeps its own excluded folders; its other roles aren't applied yet.
+  const attached = !inProject && single?.dir ? attachedProjectOf(single.path) : null;
+  if ((inProject || attached) && single?.dir && !single.root && !single.placeholder) {
     const current = directoryRole(single.path);
-    const roles: Array<[FolderRole, string, string]> = [
-      ["source", "Sources Root", "folder-source"],
-      ["test", "Test Sources Root", "folder-test"],
-      ["resources", "Resources Root", "folder-resources"],
-      ["testResources", "Test Resources Root", "folder-test-resources"],
-      ["excluded", "Excluded", "folder-excluded"],
-    ];
+    const roles: Array<[FolderRole, string, string]> = (
+      [
+        ["source", "Sources Root", "folder-source"],
+        ["test", "Test Sources Root", "folder-test"],
+        ["resources", "Resources Root", "folder-resources"],
+        ["testResources", "Test Resources Root", "folder-test-resources"],
+        ["excluded", "Excluded", "folder-excluded"],
+      ] as Array<[FolderRole, string, string]>
+    ).filter(([role]) => !attached || role === "excluded");
     push({
       id: "markAs",
       label: "Mark Directory as",
@@ -461,12 +426,14 @@ export function contextMenuItems(nodes: ProjectNode[]): MenuItem[] {
         ...roles
           .filter(([role]) => role !== current)
           .map(([role, label, icon]) => ({ id: role, label, icon, run: () => void markDirectory(single.path, role) })),
-        ...(current
+        ...(current && (!attached || current === "excluded")
           ? [
               {
                 id: "unmark",
                 label:
-                  current === "excluded" ? "Cancel Exclusion" : tx`Unmark as ${roles.find(([r]) => r === current)![1]}`,
+                  current === "excluded"
+                    ? "Cancel Exclusion"
+                    : tx`Unmark as ${txPart(roles.find(([r]) => r === current)![1])}`,
                 run: () => void markDirectory(single.path, null),
               },
             ]
@@ -492,25 +459,13 @@ function openInRightSplitItem(files: ProjectNode[]): MenuItem {
 }
 
 /** Library sources (External Libraries) are read-only: copy, find and reveal only. */
-function libraryMenuItems(nodes: ProjectNode[]): MenuItem[] {
+function libraryMenuItems(nodes: ProjectNode[], at: MenuPoint): MenuItem[] {
   if (!nodes.length) return [];
   const single = nodes.length === 1 ? nodes[0]! : null;
   const folder = single?.dir ? single.path : null;
   const items: Entry[] = [
     { id: "copy", label: "Copy", icon: "copy", shortcut: keyLabel("project.copy"), run: () => copySelection(false) },
-    {
-      id: "copyPath",
-      label: "Copy Path/Reference…",
-      submenu: [
-        {
-          id: "abs",
-          label: "Absolute Path",
-          shortcut: keyLabel("project.copyAbsolutePath"),
-          run: () => void copyPaths("absolute", nodes),
-        },
-        { id: "name", label: "File Name", run: () => void copyPaths("name", nodes) },
-      ],
-    },
+    copyPathItem(nodes, at, true),
     { kind: "separator" },
     !!folder && delegated("find.inPath", { directory: folder }, "Find in Files…", { icon: "search" }),
     !!folder && { kind: "separator" },
@@ -542,6 +497,43 @@ function libraryMenuItems(nodes: ProjectNode[]): MenuItem[] {
 
 export function revealLabel() {
   return fileManagerName();
+}
+
+/**
+ * Copy Path/Reference…: a chooser previewing what each way copies for the selection (several
+ * paths one per line), contributed links and references included. Library files have no
+ * content or source root.
+ */
+function copyPathItem(nodes: ProjectNode[], at: MenuPoint, library: boolean): Entry {
+  const row = (kind: PathKind, id: string, label: string) => {
+    const paths = pathsFor(kind, nodes);
+    return {
+      id,
+      label,
+      // A selection only partly under a source root has no source-root path.
+      preview: paths.length && paths.length === nodes.length ? paths.join("\n") : null,
+      run: () => void copyPaths(kind, nodes),
+    };
+  };
+  return {
+    id: "copyPath",
+    label: "Copy Path/Reference…",
+    run: () =>
+      openCopyPathChooser(
+        at,
+        [
+          row("absolute", "project.copyAbsolutePath", "Absolute Path"),
+          row("name", "project.copyFileName", "File Name"),
+          ...(library
+            ? []
+            : [
+                row("relative", "project.copyRelativePath", "Path From Content Root"),
+                row("source", "project.copySourceRootPath", "Path From Source Root"),
+              ]),
+        ],
+        menuGroupContext(nodes),
+      ),
+  };
 }
 
 /** What contributed menu groups see: the selected (non-placeholder) paths. */

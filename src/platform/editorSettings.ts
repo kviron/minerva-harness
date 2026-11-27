@@ -13,6 +13,8 @@ export interface TextAttributesOverride {
   italic?: boolean;
   effect?: "underline" | "wave" | "strikeout" | "none";
   effectColor?: string;
+  /** IDEA's ERROR_STRIPE_COLOR: the diff overview-lane marker of a change type. */
+  errorStripeColor?: string;
 }
 
 export interface CustomColorScheme {
@@ -42,6 +44,38 @@ export interface LanguageCodeStyle {
   alignKeyValuePairs?: boolean;
   /** PHP: align `=` of consecutive assignment statements after formatting. */
   alignConsecutiveAssignments?: boolean;
+  /** SQL › Case: Reformat Code's case for keywords and unquoted identifiers. */
+  keywordCase?: SqlWordCase;
+  identifierCase?: SqlWordCase;
+  /** Java: organize imports switches to a wildcard import once this many classes of one package are used (jdtls passthrough). */
+  classCountToUseImportWithStar?: number;
+  /** Java: organize imports switches to a wildcard static import once this many names are used (jdtls passthrough). */
+  namesCountToUseStaticImportWithStar?: number;
+  /** JavaScript / TypeScript › Punctuation (unset: tsserver's default, `ignore` / `auto`). */
+  semicolons?: "ignore" | "insert" | "remove";
+  quotes?: "auto" | "single" | "double";
+  /** JavaScript / TypeScript › Spaces, by tsserver format option (`insertSpaceAfterCommaDelimiter`). */
+  spaces?: Record<string, boolean>;
+}
+
+/** IDEA's SQL word case: To upper / To lower / Do not change. */
+export type SqlWordCase = "upper" | "lower" | "keep";
+
+export interface SqlCaseStyle {
+  keywords: SqlWordCase;
+  identifiers: SqlWordCase;
+}
+
+/** SQL › Case of Code Style; unset, keywords become upper case and identifiers stay as written (IDEA's defaults). */
+export function sqlCaseStyle(prefs: EditorExtras): SqlCaseStyle {
+  return sqlCaseOf(prefs.codeStyle.languages.sql);
+}
+
+/** The SQL › Case of the SQL code style `own`, defaults filled in. */
+export function sqlCaseOf(own: LanguageCodeStyle | undefined): SqlCaseStyle {
+  const pick = (v: unknown, def: SqlWordCase): SqlWordCase =>
+    v === "upper" || v === "lower" || v === "keep" ? v : def;
+  return { keywords: pick(own?.keywordCase, "upper"), identifiers: pick(own?.identifierCase, "keep") };
 }
 
 /**
@@ -149,6 +183,7 @@ export const EDITOR_EXTRA_DEFAULTS = {
     fileHeader: true,
     imports: true,
     docComments: false,
+    goShortBlocks: true,
   },
   tabs: {
     placement: "top",
@@ -176,6 +211,7 @@ export const EDITOR_EXTRA_DEFAULTS = {
     pairQuotes: true,
     surroundSelection: true,
     tabOutOfPair: true,
+    semicolonAtStatementEnd: true,
     simultaneousTagEditing: true,
     reformatOnPaste: "indentEachLine",
     escapeOnPaste: true,
@@ -191,11 +227,13 @@ export const EDITOR_EXTRA_DEFAULTS = {
     quickDocDelay: 500,
     nextErrorErrorsOnly: true,
     stickyLinesMax: 5,
+    stickyLinesDisabledLanguages: [] as string[],
   },
   inlay: {
     types: true,
     parameters: true,
     other: true,
+    closingLabels: true,
     disabledLanguages: [] as string[],
     codeVision: true,
     codeVisionUsages: true,
@@ -222,7 +260,15 @@ export const EDITOR_EXTRA_DEFAULTS = {
     formatterOnTag: "@formatter:on",
     formatterTagsRegexp: false,
   },
-  encodings: { global: "utf-8", project: "utf-8", properties: "iso-8859-1", nativeToAscii: false, utf8Bom: "never" },
+  encodings: {
+    global: "utf-8",
+    project: "utf-8",
+    properties: "iso-8859-1",
+    nativeToAscii: false,
+    utf8Bom: "never",
+    /** Project-relative path of a file or folder (`/` separators) to its encoding label. */
+    mappings: {} as Record<string, string>,
+  },
 };
 
 export type EditorExtras = typeof EDITOR_EXTRA_DEFAULTS;
@@ -288,6 +334,9 @@ export function validateEditorExtras(raw: unknown): EditorExtras {
   if (!DOCSTRING_FORMATS.includes(out.docstringFormat)) out.docstringFormat = "rest";
   for (const k of ["codeVisionUsagesPosition", "codeVisionAuthorPosition"] as const)
     if (!["top", "right"].includes(out.inlay[k])) out.inlay[k] = "top";
+  out.encodings.mappings = Object.fromEntries(
+    Object.entries(out.encodings.mappings).filter(([, label]) => typeof label === "string"),
+  );
   out.rainbowBracketColors = Math.min(5, Math.max(2, Math.round(out.rainbowBracketColors)));
   out.fontWeight = fontWeightOf(out.fontWeight, EDITOR_EXTRA_DEFAULTS.fontWeight);
   out.boldFontWeight = fontWeightOf(out.boldFontWeight, EDITOR_EXTRA_DEFAULTS.boldFontWeight);
@@ -341,5 +390,6 @@ export const ENCODING_CHOICES: ReadonlyArray<readonly [string, string]> = [
   ["euc-kr", "EUC-KR"],
   ["windows-1252", "windows-1252"],
   ["iso-8859-1", "ISO-8859-1"],
+  ["iso-8859-15", "ISO-8859-15"],
   ["koi8-r", "KOI8-R"],
 ];

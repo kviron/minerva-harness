@@ -544,6 +544,9 @@ pub enum AgentEntry {
         kind: String,
         status: AgentToolStatus,
         locations: Vec<IpcPath>,
+        /// Images returned by the tool, kept separately from its truncated text.
+        #[serde(default)]
+        images: Vec<AgentImage>,
         /// Text the tool reported (command output…), truncated.
         output: Option<String>,
         diffs: Vec<AgentToolDiff>,
@@ -652,6 +655,9 @@ pub struct AgentProvider {
     /// Executable and arguments actually launched, without flattening paths containing spaces.
     pub program: String,
     pub args: Vec<String>,
+    /// Settings-managed suffix of `args`; absent for launches that cannot be edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_args: Option<Vec<String>>,
     pub default_program: Option<String>,
     pub default_args: Vec<String>,
     pub login_hint: Option<String>,
@@ -660,6 +666,9 @@ pub struct AgentProvider {
     pub command_read_only_reason: Option<AgentCommandReadOnlyReason>,
     /// Whether the command was found (on `PATH`).
     pub installed: bool,
+    /// Whether OpenIDEA can run this agent's sign-in flow directly in an embedded terminal.
+    #[serde(default)]
+    pub can_sign_in: bool,
     /// The built-in command can be owned by a global npm package.
     #[serde(default)]
     pub can_check_cli_update: bool,
@@ -682,6 +691,34 @@ pub enum AgentCommandReadOnlyReason {
     PackageRunner,
     Registry,
     CustomAgent,
+}
+
+/// An authenticated `github.com` account stored in GitHub CLI (`gh`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GhAuthAccount {
+    pub login: String,
+    pub active: bool,
+}
+
+/// GitHub Copilot's default sign-in status alongside the accounts available through `gh`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotAuthStatus {
+    pub authenticated: bool,
+    pub login: Option<String>,
+    pub auth_type: Option<String>,
+    pub status_message: Option<String>,
+    pub gh_installed: bool,
+    pub gh_accounts: Vec<GhAuthAccount>,
+}
+
+/// Output and completion of an interactive sign-in PTY started by the IDE.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AgentLoginEvent {
+    Output { data: String },
+    Exited { code: Option<i32> },
 }
 
 /// Where an agent comes from.
@@ -740,6 +777,10 @@ pub struct NewAgentTask {
     /// `!` command runs in it first.
     #[serde(default)]
     pub idle: bool,
+    /// A throwaway task (Generate Commit Message): it isn't saved, so it doesn't outlive a
+    /// restart, and the agent keeps no session history of its own for it.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 /// A file the task changed: against [`AgentTask::base_commit`], or against `HEAD` in the
@@ -809,7 +850,7 @@ pub struct AgentModelCatalog {
     pub error: Option<String>,
 }
 
-/// Streamed to the window that subscribed (`AgentManager::subscribe`).
+/// Streamed to the window that subscribed (`AgentManager::subscribe_as`).
 #[derive(Clone, Debug, Serialize, Type)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum AgentEvent {
@@ -835,6 +876,16 @@ pub enum AgentEvent {
     /// Text was appended to entry `index` (an agent message or a thought): it read the first
     /// `from` UTF-16 units of its text when the previous event for it was sent.
     Append {
+        task: String,
+        subagent: Option<String>,
+        index: u32,
+        from: u32,
+        text: String,
+    },
+    /// Text was appended to the output of tool entry `index`: it read the first `from` UTF-16
+    /// units of its output when the previous event for it was sent. Any other change of the
+    /// tool (status, title, diffs…) arrives as an `Entry`.
+    ToolOutput {
         task: String,
         subagent: Option<String>,
         index: u32,
@@ -941,6 +992,8 @@ pub enum AgentSkillSource {
     Workspace,
     /// The user's `~/.agents/skills` (what `npx skills add` fills).
     User,
+    /// Contributed by an enabled OpenIDEA plugin (`[[contributes.skills]]`).
+    Plugin,
     /// The project's `.claude/skills`.
     ClaudeWorkspace,
     /// `~/.claude/skills`.
@@ -963,7 +1016,7 @@ impl AgentSkillSource {
     /// Whether skills of this source are only read, never delivered by OpenIDEA: the CLI
     /// discovers them itself, so "off" holds only where the CLI supports a native disable.
     pub fn discovered(&self) -> bool {
-        !matches!(self, Self::Workspace | Self::User)
+        !matches!(self, Self::Workspace | Self::User | Self::Plugin)
     }
 }
 
@@ -974,9 +1027,27 @@ pub struct AgentSkill {
     /// The frontmatter `name`, else the folder's name.
     pub name: String,
     pub description: String,
+    /// Optional `argument-hint` from frontmatter, completed in the `/` menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     /// Canonical folder holding `SKILL.md` (symlinks resolved, so duplicates collapse).
     pub path: IpcPath,
     pub source: AgentSkillSource,
+    /// Other skill roots whose symlinked entry resolved to this same canonical `path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_in: Vec<AgentSkillSource>,
+    /// False when frontmatter sets `user-invocable: false` (omitted from `/` completion).
+    #[serde(default = "default_true")]
+    pub user_invocable: bool,
+    /// True when frontmatter sets `disable-model-invocation: true` (defaults to `slashOnly`).
+    #[serde(default)]
+    pub disable_model_invocation: bool,
+    /// True when frontmatter sets `context: fork` (passed through natively to supporting CLIs).
+    #[serde(default)]
+    pub context_fork: bool,
+    /// Optional `paths` / `globs` patterns from frontmatter (passed through natively to supporting CLIs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     /// The `SKILL.md` passes validation (`name` matches its folder, `description` present).
     pub valid: bool,
     /// What validation found (`name` mismatch, missing or over-long description…).

@@ -1,7 +1,11 @@
-import type { Branch, BranchInfo } from "@/bindings";
+import type { Branch, BranchInfo, LogQuery } from "@/bindings";
 import { isMacHost } from "@/platform/keymap";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const vcsLog = vi.hoisted(() =>
+  vi.fn((_repo: string | null, _query: LogQuery) => Promise.resolve({ status: "ok" as const, data: [] })),
+);
 
 const repoData = vi.hoisted(() => ({
   branches: {} as Record<string, unknown[]>,
@@ -15,7 +19,7 @@ vi.mock("@/platform/ipc", async (importOriginal) => {
       ...real.commands,
       vcsBranches: (root: string) => Promise.resolve({ status: "ok", data: repoData.branches[root] ?? [] }),
       vcsTags: (root: string) => Promise.resolve({ status: "ok", data: repoData.tags[root] ?? [] }),
-      vcsLog: () => Promise.resolve({ status: "ok", data: [] }),
+      vcsLog,
       vcsConfigGet: () => Promise.resolve({ status: "ok", data: null }),
     },
   };
@@ -30,6 +34,7 @@ vi.mock("@/platform/actions", async (importOriginal) => ({
 import { ContextMenuHost } from "@/ui";
 import syncStyles from "../BranchSync.module.css";
 import { BranchesPanel } from "../log/BranchesPanel";
+import { FilterBar } from "../log/FilterBar";
 import { useBranchesPane } from "../logPaneActions";
 import { emptyFilters, useGitLog } from "../logStore";
 import { useVcs } from "../store";
@@ -63,6 +68,7 @@ const cmd = () => (isMacHost() ? { metaKey: true } : { ctrlKey: true });
 
 beforeEach(() => {
   writeText.mockClear();
+  vcsLog.mockClear();
   Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
   useVcs.setState({ root: "/p", repo: "/p", branches, branchesLoaded: true, branch: head });
   useGitLog.setState({ filters: emptyFilters() });
@@ -94,6 +100,18 @@ describe("Git Log branches pane", () => {
     fireEvent.mouseDown(screen.getByText("feature"));
     expect(useGitLog.getState().filters.branches).toEqual([]);
     expect(screen.getByText("feature").closest("[data-row]")).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("passes the selected branch to New Worktree", async () => {
+    render(
+      <>
+        <BranchesPanel />
+        <ContextMenuHost />
+      </>,
+    );
+    fireEvent.contextMenu(screen.getByText("feature"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "New Worktree from 'feature'…" }));
+    expect(execute).toHaveBeenCalledWith("vcs.newWorktree", { repo: "/p", source: "refs/heads/feature" });
   });
 
   it.each([
@@ -206,7 +224,7 @@ describe("Git Log branches pane with several repositories", () => {
       branches: aBranches,
     });
   });
-  afterEach(() => useVcs.setState({ roots: [], heads: {} }));
+  afterEach(() => useVcs.setState({ roots: [], branchRoots: {}, heads: {} }));
 
   it("lists branches once, naming the repositories of partial ones", async () => {
     render(<BranchesPanel />);
@@ -235,6 +253,32 @@ describe("Git Log branches pane with several repositories", () => {
     expect(screen.getByText("other")).toBeInTheDocument();
   });
 
+  it("groups linked worktrees together and honors an explicit worktree path filter", async () => {
+    const linked = "/p/linked";
+    const worktreeBranches = aBranches.map((branch) => ({ ...branch, current: branch.name === "dev" }));
+    repoData.branches[linked] = worktreeBranches;
+    useVcs.setState({ roots: [linked, "/p/a", "/p/b"], branchRoots: { [linked]: "/p/a" } });
+    render(
+      <>
+        <BranchesPanel />
+        <ContextMenuHost />
+      </>,
+    );
+    expect((await screen.findByText("solo")).closest("[data-row]")).toHaveTextContent("(a)");
+    expect(screen.queryByText("(a, linked)")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    expect(await screen.findAllByText("dev")).toHaveLength(2);
+    expect(screen.queryByText("linked")).toBeNull();
+
+    act(() => useGitLog.setState({ filters: { ...emptyFilters(), paths: [linked] } }));
+    expect(await screen.findByText("solo")).toBeInTheDocument();
+    expect(screen.queryByText("other")).toBeNull();
+    expect(screen.getByText("dev").closest("[data-row]")).toHaveTextContent(/dev\s*current/);
+    fireEvent.doubleClick(screen.getByText("dev"));
+    expect(useGitLog.getState().filters).toMatchObject({ branches: ["dev"], paths: [linked] });
+    expect(useGitLog.getState().filters.repositories ?? []).toEqual([]);
+  });
+
   it("keeps the current marker ahead of the repository names, which may be cut off", async () => {
     repoData.branches = { "/p/a": [b("main", { current: true }), b("dev")], "/p/b": [b("dev", { current: true })] };
     render(<BranchesPanel />);
@@ -251,12 +295,122 @@ describe("Git Log branches pane with several repositories", () => {
     expect(localStorage.getItem("openidea.vcs.branchesPane.groupByRepository")).toBe("true");
   });
 
-  it("double click filters the log to the repositories that have the branch within the visible scope", async () => {
+  it("sums merged branch counts and reveals exact counts in the tooltip and grouped rows", async () => {
+    const outgoing = { remote: "fork", branch: "dev", reference: "refs/remotes/fork/dev" };
+    repoData.branches = {
+      "/p/a": [b("dev", { behind: 2, ahead: 55, outgoing: { ...outgoing, count: 60 } })],
+      "/p/b": [b("dev", { behind: 3, ahead: 8, outgoing: { ...outgoing, count: 42 } })],
+    };
+    render(<BranchesPanel />);
+    expect(await screen.findByLabelText("102 outgoing commits in 2 repositories")).toHaveTextContent("99+");
+    expect(screen.getByLabelText("5 incoming commits in 2 repositories")).toHaveTextContent("5");
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    expect(screen.getByLabelText("60 outgoing commits")).toHaveTextContent("60");
+    expect(screen.getByLabelText("42 outgoing commits")).toHaveTextContent("42");
+    expect(screen.getByLabelText("2 incoming commits")).toHaveTextContent("2");
+    expect(screen.getByLabelText("3 incoming commits")).toHaveTextContent("3");
+  });
+
+  it("double click filters the log by branch and keeps every repository listed", async () => {
     render(<BranchesPanel />);
     fireEvent.doubleClick(await screen.findByText("solo"));
-    expect(useGitLog.getState().filters).toMatchObject({ branches: ["solo"], repositories: ["/p/a"] });
+    expect(useGitLog.getState().filters).toMatchObject({ branches: ["solo"] });
+    expect(useGitLog.getState().filters.repositories ?? []).toEqual([]);
+    expect(screen.getByText("other")).toBeInTheDocument();
     fireEvent.doubleClick(screen.getByText("dev"));
-    expect(useGitLog.getState().filters).toMatchObject({ branches: ["dev"], repositories: ["/p/a"] });
+    expect(useGitLog.getState().filters).toMatchObject({ branches: ["dev"] });
+    expect(useGitLog.getState().filters.repositories ?? []).toEqual([]);
+  });
+
+  it("double click in a repository group keeps the other repositories listed", async () => {
+    render(<BranchesPanel />);
+    await screen.findByText("solo");
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    fireEvent.doubleClick(await screen.findByText("other"));
+    expect(useGitLog.getState().filters).toMatchObject({ branches: ["other"] });
+    expect(useGitLog.getState().filters.repositories ?? []).toEqual([]);
+    expect(useGitLog.getState().filters.paths ?? []).toEqual([]);
+    expect(screen.getByText("solo")).toBeInTheDocument();
+    expect(screen.getAllByText("dev")).toHaveLength(2);
+  });
+
+  it("shows commits only from the repository of the activated branch when both have it", async () => {
+    render(<BranchesPanel />);
+    await screen.findByText("solo");
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    const [mainInA] = screen.getAllByText("main");
+    fireEvent.doubleClick(mainInA!);
+
+    await waitFor(() => expect(vcsLog).toHaveBeenCalled());
+    expect(vcsLog.mock.calls.map(([repo, query]) => [repo, query.branches])).toEqual([["/p/a", ["main"]]]);
+    expect(screen.getByText("other")).toBeInTheDocument();
+  });
+
+  it("restores both repositories when the scoped branch filter is cleared", async () => {
+    render(
+      <>
+        <FilterBar />
+        <BranchesPanel />
+      </>,
+    );
+    await screen.findByText("solo");
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    fireEvent.doubleClick(screen.getAllByText("main")[0]!);
+    await waitFor(() => expect(vcsLog).toHaveBeenCalled());
+    vcsLog.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear Branch filter" }));
+
+    await waitFor(() => expect(vcsLog).toHaveBeenCalledTimes(2));
+    expect(vcsLog.mock.calls.map(([repo, query]) => [repo, query.branches])).toEqual([
+      ["/p/a", []],
+      ["/p/b", []],
+    ]);
+  });
+
+  it("keeps the Paths filter when activating and clearing a repository branch", async () => {
+    useGitLog.setState({ filters: { ...emptyFilters(), paths: ["/p/a/src", "/p/b/test"] } });
+    render(
+      <>
+        <FilterBar />
+        <BranchesPanel />
+      </>,
+    );
+    await screen.findByText("solo");
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    fireEvent.doubleClick(screen.getAllByText("main")[0]!);
+
+    await waitFor(() => expect(vcsLog).toHaveBeenCalled());
+    expect(vcsLog.mock.calls.map(([repo, query]) => [repo, query.paths])).toEqual([["/p/a", ["/p/a/src"]]]);
+    vcsLog.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Clear Branch filter" }));
+    await waitFor(() => expect(vcsLog).toHaveBeenCalledTimes(2));
+    expect(vcsLog.mock.calls.map(([repo, query]) => [repo, query.paths])).toEqual([
+      ["/p/a", ["/p/a/src"]],
+      ["/p/b", ["/p/b/test"]],
+    ]);
+  });
+
+  it("queries only the selected branch in each repository when several are selected", async () => {
+    render(<BranchesPanel />);
+    await screen.findByText("solo");
+    fireEvent.click(screen.getByRole("button", { name: "Group by Repository" }));
+    fireEvent.mouseDown(screen.getAllByText("main")[0]!);
+    fireEvent.mouseDown(screen.getAllByText("dev")[1]!, cmd());
+    fireEvent.keyDown(screen.getByRole("tree", { name: "Branches" }), { key: "Enter" });
+
+    await waitFor(() => expect(vcsLog).toHaveBeenCalledTimes(2));
+    expect(vcsLog.mock.calls.map(([repo, query]) => [repo, query.branches])).toEqual([
+      ["/p/a", ["main"]],
+      ["/p/b", ["dev"]],
+    ]);
+  });
+
+  it("keeps a repository filter chosen elsewhere when a branch is double-clicked", async () => {
+    act(() => useGitLog.setState({ filters: { ...emptyFilters(), repositories: ["/p/b"] } }));
+    render(<BranchesPanel />);
+    fireEvent.doubleClick(await screen.findByText("other"));
+    expect(useGitLog.getState().filters).toMatchObject({ branches: ["other"], repositories: ["/p/b"] });
   });
 
   it("a branch in several repositories gets the common menu", async () => {

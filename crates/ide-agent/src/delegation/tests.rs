@@ -523,7 +523,7 @@ async fn native_host_dispatch_case(agent: &str) {
     })
     .await
     .unwrap();
-    assert!(manager.task(&handle.session_id).unwrap().state.lock().turn.is_none());
+    assert!(manager.task(&handle.session_id).unwrap().state.lock().turns.iter().all(Option::is_none));
     snapshot.previous_handle = Some(handle.clone());
     snapshot.handle = None;
     snapshot.activation_id = "followup-activation".into();

@@ -173,16 +173,20 @@ describe("format on save provider isolation", () => {
     }
   });
 
-  it("formats on save for the languages whose Prettier or oxfmt Run on save is on", () => {
+  it("formats on save for the languages whose Prettier, oxfmt or Biome Run on save is on", () => {
     const settings = (languages: Settings["languages"], formatOnSave = false) =>
       ({ editor: { formatOnSave }, languages }) as Settings;
     const oxfmt = settings({ oxfmt: { runOnSave: true, languages: ["typescript"] } });
     expect(formatsOnSave(oxfmt, "typescript")).toBe(true);
     expect(formatsOnSave(oxfmt, "markdown")).toBe(false);
     expect(formatsOnSave(settings({ prettier: { runOnSave: true } }), "markdown")).toBe(true);
+    expect(formatsOnSave(settings({ biome: { runOnSave: true } }), "json")).toBe(true);
+    expect(formatsOnSave(settings({ biome: { runOnSave: true } }), "markdown")).toBe(false);
     expect(formatsOnSave(settings({ ruff: { runOnSave: true } }), "python")).toBe(true);
     expect(formatsOnSave(settings({ ruff: { runOnSave: true } }), "typescript")).toBe(false);
     expect(formatsOnSave(settings({}), "typescript")).toBe(false);
+    // dprint's configuration decides which files it formats.
+    expect(formatsOnSave(settings({ dprint: { runOnSave: true } }), "toml")).toBe(true);
     expect(formatsOnSave(settings({}, true), "rust")).toBe(true);
     expect(formatsOnSave(null, "typescript")).toBe(false);
   });

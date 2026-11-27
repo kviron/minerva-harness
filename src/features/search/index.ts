@@ -4,7 +4,7 @@
  * window, the Structure tool window + File Structure popup, and bookmarks.
  */
 import { lazyComponent, lazyWhen } from "@/ui";
-import { activeEditor, registerEditorContribution } from "@/editor/api";
+import { activeEditor, focusedCellEditor, registerEditorContribution } from "@/editor/api";
 import { executeAction, registerActions } from "@/platform/actions";
 import { onFilesMoved, pendingFileMoves } from "@/platform/fileOps";
 import { call, commands, IpcError, isTauri, onIdeEvent } from "@/platform/ipc";
@@ -47,7 +47,7 @@ import {
 } from "./find/windowStore";
 import { cycleSwitcher, hideRecentPopup, showRecentPopup, useRecentPopup } from "./recent/store";
 import { useFileStructurePopup } from "./structure/popupStore";
-import { useOutline, useStructureOptions } from "./structure/store";
+import { useOutline, useStructureHeaderMenu, useStructureOptions } from "./structure/store";
 import { tx } from "@/platform/i18n";
 
 async function removeMissingBookmarks(removed: readonly string[]) {
@@ -92,7 +92,10 @@ function editorSelectionText(): string | null {
 }
 
 /** The active editor's caret line (and where to show a popup for it). */
-function caretLine(): { path: string; line: number; text: string; at?: { x: number; y: number } } | null {
+export function caretLine(): { path: string; line: number; text: string; at?: { x: number; y: number } } | null {
+  // A notebook cell editor has no line in a bookmarkable file yet: no bookmark rather
+  // than the last text tab's caret (the notebook's own lines are a later step).
+  if (focusedCellEditor()) return null;
   const handle = activeEditor();
   if (!handle) return null;
   const head = handle.view.state.selection.main.head;
@@ -168,23 +171,31 @@ export function activate(): void | (() => void) {
 
     registerOverlay({
       id: "search.everywhere",
-      component: lazyWhen(useEverywhereOpen, () =>
-        import("./everywhere/SearchEverywhere").then((m) => m.SearchEverywhereOverlay),
+      component: lazyWhen(
+        useEverywhereOpen,
+        () => import("./everywhere/SearchEverywhere").then((m) => m.SearchEverywhereOverlay),
+        { prefetch: true },
       ),
     }),
     registerOverlay({
       id: "search.recent",
-      component: lazyWhen(useRecentOpen, () => import("./recent/RecentPopups").then((m) => m.RecentPopupsOverlay)),
+      component: lazyWhen(useRecentOpen, () => import("./recent/RecentPopups").then((m) => m.RecentPopupsOverlay), {
+        prefetch: true,
+      }),
     }),
     registerOverlay({
       id: "search.findInFiles",
-      component: lazyWhen(useFindOpen, () => import("./find/FindInFiles").then((m) => m.FindInFilesOverlay)),
+      component: lazyWhen(useFindOpen, () => import("./find/FindInFiles").then((m) => m.FindInFilesOverlay), {
+        prefetch: true,
+      }),
     }),
     registerOverlay({ id: "search.scopes", component: ScopesDialogOverlay }),
     registerOverlay({
       id: "search.fileStructure",
-      component: lazyWhen(useFileStructureOpen, () =>
-        import("./structure/StructureView").then((m) => m.FileStructureOverlay),
+      component: lazyWhen(
+        useFileStructureOpen,
+        () => import("./structure/StructureView").then((m) => m.FileStructureOverlay),
+        { prefetch: true },
       ),
     }),
     registerOverlay({ id: "search.bookmarks", component: BookmarkPopupsOverlay }),
@@ -198,6 +209,9 @@ export function activate(): void | (() => void) {
       secondary: true,
       order: 20,
       component: lazyComponent(() => import("./structure/StructureView").then((m) => m.StructureView)),
+      headerActions: lazyComponent(() => import("./structure/StructureView").then((m) => m.StructureHeaderActions)),
+      headerMenu: useStructureHeaderMenu,
+      plainTitle: true,
     }),
     registerToolWindow({
       id: "bookmarks",
@@ -207,6 +221,7 @@ export function activate(): void | (() => void) {
       anchor: "left",
       secondary: true,
       order: 30,
+      stripe: "onUse",
       component: lazyComponent(() => import("./bookmarks/BookmarksView").then((m) => m.BookmarksView)),
       headerActions: lazyComponent(() => import("./bookmarks/BookmarksView").then((m) => m.BookmarksActions)),
       useBadge: () => null,

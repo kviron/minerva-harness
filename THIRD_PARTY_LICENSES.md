@@ -6,6 +6,30 @@
 [Simple Icons](https://github.com/simple-icons/simple-icons), retrieved through
 Iconify (`simple-icons:angular`, `simple-icons:astro`, `simple-icons:cplusplus`, `simple-icons:dart`, `simple-icons:deepseek`, `simple-icons:django`, `simple-icons:dotnet`, `simple-icons:elixir`, `simple-icons:express`, `simple-icons:fastapi`, `simple-icons:flask`, `simple-icons:flutter`, `simple-icons:go`, `simple-icons:haskell`, `simple-icons:html5`, `simple-icons:kotlin`, `simple-icons:ktor`, `simple-icons:laravel`, `simple-icons:nestjs`, `simple-icons:nextdotjs`, `simple-icons:nodedotjs`, `simple-icons:nuxt`, `simple-icons:openjdk`, `simple-icons:phoenixframework`, `simple-icons:php`, `simple-icons:python`, `simple-icons:quarkus`, `simple-icons:ruby`, `simple-icons:rubyonrails`, `simple-icons:rust`, `simple-icons:scala`, `simple-icons:springboot`, `simple-icons:svelte`, `simple-icons:swift`, `simple-icons:symfony`, `simple-icons:vite`, `simple-icons:zig`) and filled with the brand colors (the standard icon grey for black logos). Licensed under [CC0 1.0 Universal](https://github.com/simple-icons/simple-icons/blob/develop/LICENSE.md).
 
+## DuckDB symbol
+
+DuckDB is a trademark of the DuckDB Foundation. The data source icon uses the
+light and dark symbols from the [DuckDB Design Manual](https://duckdb.org/design/manual/#logo-usage).
+The SVG paths and colors are preserved. See the [DuckDB trademark guidelines](https://duckdb.org/trademark_guidelines.html).
+
+## Agent logos
+
+The `src/ui/openidea/agents/` logos of agents listed in the
+[ACP agent registry](https://github.com/agentclientprotocol/registry) (`agoragentic-acp`, `amp-acp`,
+`antigravity-acp`, `autohand`, `bob`, `cline`, `codebuddy-code`, `cortex-code`, `corust-agent`,
+`crow-cli`, `deepagents`, `devin`, `dimcode`, `dirac`, `factory-droid`, `fast-agent`, `glm-acp-agent`,
+`grok-build`, `harn`, `junie`, `kilo`, `kimchi`, `minimax-code`, `minion-code`, `muse-code`, `nova`,
+`pi-acp`, `poolside`, `sigit`, `stakpak`, `vtcode`) are the registry's icons, with a root `fill`
+moved onto a group. The registry is licensed under Apache-2.0; the logos remain trademarks of
+their owners.
+
+## Microsoft ConPTY
+
+`crates/ide-core/resources/conpty/` contains the unmodified Microsoft Windows Console
+ConPTY runtime 1.25.260930003, embedded in Windows builds. Copyright (c) Microsoft
+Corporation. Licensed under MIT; see its [license](crates/ide-core/resources/conpty/LICENSE)
+and [package provenance](crates/ide-core/resources/conpty/README.md).
+
 ## Project Lombok
 
 `java/lombok/lombok-1.18.48-openidea.3.jar` contains Project Lombok v1.18.48 with the Equinox
@@ -35,7 +59,8 @@ icon set, copied unmodified (some renamed) from JetBrains' open-source repositor
   → `maven/`); `plugins/gradle` (`icons/expui/gradle` → `toolwindows/gradle`,
   `icons/expui/gradleLoadChanges` → `build/gradleLoadChanges`,
   `icons/expui/gradle`, `icons/gradleSubproject` → `gradle/`);
-  `platform/external-system-impl` (`icons/newui/task` → `externalSystem/task`).
+  `platform/external-system-impl` (`icons/newui/task` → `externalSystem/task`);
+  `platform/dvcs-impl` (`icons/new/cherryPick` → `vcs/cherryPick`).
   Copyright 2000-2026 JetBrains s.r.o. and contributors. Apache License 2.0 (below).
 - [intellij-plugins](https://github.com/JetBrains/intellij-plugins) (each plugin
   carries its own licence): `protobuf/protoeditor-core` (`newui/protoFile` →
@@ -65,7 +90,7 @@ At render time `src/ui/icons.tsx` may recolour monochrome icons to `currentColor
 These icons of [flutter-intellij](https://github.com/flutter/flutter-intellij) (commit `d02813ad5890`) are used
 under the BSD 3-Clause License:
 
-- `src/ui/expui/flutter/*.svg`: the DevTools tool window icons, copied unmodified from
+- `src/ui/expui/flutter/*.svg`: the Flutter tool window icons, copied unmodified from
   `resources/icons/expui/`.
 - `src/ui/expui/flutter/widget@2x.png` and `widget_private@2x.png`: the Flutter outline's widget
   icons, `resources/icons/custom/class@2x.png` and `method@2x.png`, renamed, content unmodified.
@@ -130,6 +155,7 @@ languages whose JetBrains icons are not open source (Go, Ruby, Dart, Lua, Zig,
 Svelte, …). Those using the page-with-corner-badge layout (`goMod`, `goWork`,
 `dotenv`, `readme`, `lock`, `license`) reuse the page outline of the Apache-2.0
 expui `fileTypes/h.svg`; that outline is modified from the original by JetBrains.
+`goTest` adds a scaled copy of the Apache-2.0 expui `nodes/test.svg` as its badge.
 `src/ui/openidea/runConfigurations/springBoot*.svg` (the Spring Boot run configuration
 leaf) is OpenIDEA's own drawing.
 

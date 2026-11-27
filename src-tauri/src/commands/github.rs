@@ -52,8 +52,13 @@ pub async fn gh_availability(
     state: State<'_, AppState>,
     repo: Option<PathBuf>,
 ) -> IdeResult<GhAvailability> {
+    let project = state.project(window.label())?;
     let root = root(&window, &state, repo)?;
-    blocking(move || Ok(ide_github::availability(&root))).await
+    blocking(move || {
+        ide_host::github_auth::apply_to_project(&project);
+        Ok(ide_github::availability(&root))
+    })
+    .await
 }
 
 #[desktop_command(trust = trusted)]
@@ -133,11 +138,14 @@ pub async fn gh_pr_create(
     on_output: Channel<String>,
 ) -> IdeResult<String> {
     let root = root(&window, &state, repo)?;
+    let git = state.project(window.label())?.git_executable();
     let cancel = state.begin_request(request);
     let dir = root.clone();
     let result = blocking(move || {
-        ide_github::create(&dir, &pr, &cancel, &|line| {
-            let _ = on_output.send(line);
+        ide_vcs::with_git_executable(git.as_deref(), || {
+            ide_github::create(&dir, &pr, &cancel, &|line| {
+                let _ = on_output.send(line);
+            })
         })
     })
     .await;
@@ -207,10 +215,14 @@ pub async fn gh_pr_prepare_diff(
     on_output: Channel<String>,
 ) -> IdeResult<PrDiffRevisions> {
     let root = root(&window, &state, repo)?;
+    let git = state.project(window.label())?.git_executable();
     let cancel = state.begin_request(request);
     let result = blocking(move || {
-        ide_github::prepare_diff(&root, number, &head_oid, &base_oid, &base_ref, &name_with_owner, &cancel, &|line| {
+        let output = |line: String| {
             let _ = on_output.send(line);
+        };
+        ide_vcs::with_git_executable(git.as_deref(), || {
+            ide_github::prepare_diff(&root, number, &head_oid, &base_oid, &base_ref, &name_with_owner, &cancel, &output)
         })
     })
     .await;

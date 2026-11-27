@@ -267,6 +267,9 @@ impl crate::Host {
             if let Some(phpstan) = &project.phpstan {
                 phpstan.interrupt();
             }
+            if let Some(watch) = &project.tsc_watch {
+                watch.apply(&self.runtime);
+            }
             if !trusted {
                 if let Some(plugins) = self.plugin_host() {
                     plugins.withdraw_project_run_targets(&project.root);
@@ -279,14 +282,22 @@ impl crate::Host {
                     self.environment.spawn_post_start(cmd, project.root.clone(), project.sink.clone());
                 }
                 self.environment.direnv_opened(&project.root, &project.sink);
+                {
+                    let p = project.clone();
+                    self.runtime.spawn_blocking(move || {
+                        crate::github_auth::apply_to_project(&p);
+                    });
+                }
                 project.lsp.set_execution_allowed(true);
                 project.lsp.prewarm_java_configuration();
             } else {
                 self.environment.project_closed();
                 self.environment.direnv_closed(&project.root);
+                crate::github_auth::clear_project_env(&project);
                 project.agents.shutdown();
                 project.flutter.stop();
                 project.devtools.stop();
+                project.widget_preview.stop();
                 self.processes.kill_project(&project.root);
                 project.notebooks.restrict().await;
                 let windows: Vec<_> = self

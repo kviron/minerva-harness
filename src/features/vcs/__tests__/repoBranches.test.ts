@@ -122,8 +122,11 @@ describe("commonBranches", () => {
   });
 
   it("is current only when checked out everywhere", () => {
-    const common = commonBranches([[b("dev", { current: true })], [b("dev")]]);
-    expect(common.local).toEqual([{ name: "dev", remote: false, current: false, favorite: false, upstream: false }]);
+    const members = [b("dev", { current: true }), b("dev")];
+    const common = commonBranches(members.map((branch) => [branch]));
+    expect(common.local).toEqual([
+      { name: "dev", remote: false, current: false, favorite: false, upstream: false, members },
+    ]);
   });
 
   it("marks a common branch with an upstream in any repository", () => {
@@ -154,6 +157,15 @@ describe("buildMultiRepoRows", () => {
       "  dev (current)",
       "  main",
       "> Common Remote Branches",
+    ]);
+  });
+
+  it("lists the current repository first, keeping the others' order and colours", () => {
+    const rows = summary(buildMultiRepoRows({ ...input, current: "/p/ology-gateway", query: "" }));
+    expect(rows.filter((r) => r.startsWith("repo"))).toEqual([
+      "repo ology-gateway [dev] c3",
+      "repo ology-collect [dev] c1",
+      "repo ology-dependencies [dev] c2",
     ]);
   });
 

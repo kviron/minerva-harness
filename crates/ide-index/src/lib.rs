@@ -8,7 +8,8 @@ use ide_language::{LanguageRegistry, Syntax};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,6 +25,12 @@ mod worker;
 pub use filter::walk_skips;
 pub use worker::MAX_SYMBOL_FILE;
 use worker::{Job, MAX_RECENT, Shared};
+
+/// Stack of the indexing threads. Parsing and outlining a deeply nested file (generated
+/// code, a big JSON or minified script) recurse as deep as the file nests; the 2 MiB a Rust
+/// thread gets by default overflowed on Windows and took the whole IDE down (#5739). Only
+/// what a thread touches is committed, so the reservation costs address space, not memory.
+const INDEX_STACK: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -92,15 +99,18 @@ pub struct ProjectIndex {
 }
 
 /// Folders indexed alongside the internal state root.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct IndexRoots {
     pub include_root: bool,
     pub folders: Vec<PathBuf>,
+    /// Folders with exclude globs of their own (an attached project's), relative to the folder;
+    /// the other folders share the project's.
+    pub excludes: std::collections::BTreeMap<PathBuf, Vec<String>>,
 }
 
 impl From<Vec<PathBuf>> for IndexRoots {
     fn from(folders: Vec<PathBuf>) -> Self {
-        Self { include_root: true, folders }
+        Self { include_root: true, folders, ..Default::default() }
     }
 }
 
@@ -146,6 +156,7 @@ impl ProjectIndex {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("openidea-index".into())
+                .stack_size(INDEX_STACK)
                 .spawn(move || shared.run(scan))
                 .map_err(|e| ide_core::IdeError::internal(format!("cannot start indexer: {e}")))?
         };
@@ -277,6 +288,28 @@ impl ProjectIndex {
         files.into_iter().map(|file| file.path.clone()).collect()
     }
 
+    /// Find exact basenames across the indexed workspace in a single pass.
+    pub fn files_with_names(&self, names: &HashSet<&OsStr>) -> Vec<PathBuf> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+        self.shared
+            .data
+            .read()
+            .files
+            .iter()
+            .flatten()
+            .filter(|file| !file.ignored && file.path.file_name().is_some_and(|name| names.contains(name)))
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    /// Exact folder names in the project scope, including empty folders absent from file search.
+    /// Run off the caller's request thread because discovering those folders walks the disk.
+    pub fn directories_with_names(&self, names: &HashSet<&OsStr>) -> Vec<PathBuf> {
+        if names.is_empty() { Vec::new() } else { self.shared.filter().directories_with_names(names) }
+    }
+
     /// Up to `limit` indexed files below `dir` (VCS-ignored ones left out) whose path relative to
     /// `dir` satisfies `matches`: a file list without walking the disk. `None` while nothing is
     /// indexed yet (first scan without a cache).
@@ -356,6 +389,11 @@ impl ProjectIndex {
         limit: usize,
     ) -> Vec<SymbolMatch> {
         matching::symbols_named_within(&self.shared.data.read(), name, kind, roots, limit)
+    }
+
+    /// Symbols of `kind` whose name starts with `prefix`, by path then position.
+    pub fn symbols_prefixed(&self, prefix: &str, kind: SymbolKind, limit: usize) -> Vec<SymbolMatch> {
+        matching::symbols_prefixed(&self.shared.data.read(), prefix, kind, limit)
     }
 
     /// Symbols named exactly one of `names` whose file is inside `root`, at most `limit` per name.
@@ -510,7 +548,7 @@ impl Drop for ProjectIndex {
 mod tests;
 
 /// Synthetic in-memory index for benchmarks (`benches/index.rs`); not a stable API.
-#[doc(hidden)]
+#[cfg(any(test, feature = "bench-support"))]
 pub mod bench_support {
     use super::*;
     use crate::data::{FileEntry, FileRecord, IndexData, StoredSymbol};

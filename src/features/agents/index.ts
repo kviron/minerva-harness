@@ -1,11 +1,12 @@
 /**
  * Coding agents (Claude Code, Codex, Gemini CLI over ACP, run by `ide-agent`): the
  * Agents tool window lists tasks by what they need from the user, a task opens as an
- * editor tab (conversation + changed files), and New Task is an editor page.
+ * editor tab (its changed files in a Changes tab beside it), and New Task is an editor page.
  */
 import { createElement } from "react";
 import { registerActions } from "@/platform/actions";
 import { useProject } from "@/platform/project";
+import { tx } from "@/platform/i18n";
 import { clearContext, setContext } from "@/platform/context";
 import { onWorkflowSettingsChange, workflowSettings } from "@/platform/workflowSettings";
 import { executeAction } from "@/platform/actions";
@@ -27,8 +28,18 @@ import {
 } from "@/workbench/contributions";
 import { AgentsStatus } from "./AgentsStatus";
 import { activateSettingsPages } from "./settingsPages";
-import { HOME_KIND, MCP_PAGE, REGISTRY_PAGE, SESSION_KIND, TASK_DRAG, TOOL_WINDOW, providerIcon } from "./model";
+import {
+  CHANGES_KIND,
+  HOME_KIND,
+  MCP_PAGE,
+  REGISTRY_PAGE,
+  SESSION_KIND,
+  TASK_DRAG,
+  TOOL_WINDOW,
+  providerIcon,
+} from "./model";
 import { sendPaths, sendSelection, trackEditorCopies } from "./references";
+import { copyAgentReferenceActions, registerCopyAgentReference } from "./copyReference";
 import { diagnoseTestFailure, isTestFailure } from "./testFailure";
 import { focusedSession, inputSession } from "./sessionFocus";
 import { cycleFocusedEffort } from "./effortFocus";
@@ -52,6 +63,7 @@ import { taskActions, useAgentsHeaderMenu } from "./taskActions";
 import { replyActions } from "./replyActions";
 import { WorkspaceMode, setWorkspaceMode } from "./WorkspaceMode";
 import { activateAgentNavigation } from "./AgentNavigation";
+import { copyImageAction } from "./imageActions";
 import { activateTaskWindows, moveTaskToWindow, prepareTaskWindowInput, taskTabClosed } from "./taskWindows";
 import { auxiliaryWindow } from "@/platform/auxWindow";
 
@@ -114,6 +126,8 @@ export function activate(): () => void {
     trackPromptHistory(),
     activateSettingsPages(),
     trackEditorCopies(),
+    registerActions(copyAgentReferenceActions),
+    registerCopyAgentReference(),
     registerAgentContextSource({
       id: "changes",
       title: "Changes",
@@ -152,7 +166,7 @@ export function activate(): () => void {
       icon: "toolwindow-agents",
       anchor: "right",
       order: 0.5,
-      component: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsView)),
+      component: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsView), { prefetch: true }),
       headerMenu: useAgentsHeaderMenu,
       plainTitle: true,
       headerActions: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsHeaderActions)),
@@ -172,7 +186,7 @@ export function activate(): () => void {
     }),
     registerEditorKind({
       kind: SESSION_KIND,
-      component: lazyComponent(() => import("./SessionEditor").then((m) => m.SessionEditor)),
+      component: lazyComponent(() => import("./SessionEditor").then((m) => m.SessionEditor), { prefetch: true }),
       title: (input) => {
         const data = input.data as { task: string; title?: string };
         return useAgents.getState().tasks.get(data.task)?.title ?? data.title ?? "Agent Task";
@@ -185,6 +199,13 @@ export function activate(): () => void {
       trailing: (input) => createElement(TaskStatusMark, { task: (input.data as { task: string }).task }),
       // Tabs of tasks deleted meanwhile are closed when the tasks load (`connect`).
       restorable: true,
+      canNavigate: (input, open) => {
+        if (open) return true;
+        const task = (input.data as { task?: string } | undefined)?.task;
+        if (!task) return false;
+        const s = useAgents.getState();
+        return !s.loaded || s.tasks.has(task);
+      },
       onTabClose: (tabId) => clearAgentTabFontZoom(tabId),
       prepareWindowInput: prepareTaskWindowInput,
       onClose: (input) => {
@@ -200,8 +221,26 @@ export function activate(): () => void {
       keepAlive: true,
     }),
     registerEditorKind({
+      kind: CHANGES_KIND,
+      component: lazyComponent(() => import("./session/ChangesTab").then((m) => m.ChangesTab)),
+      title: (input) => {
+        const title = useAgents.getState().tasks.get((input.data as { task: string }).task)?.title;
+        return title ? tx("Changes: {task}").replace("{task}", title) : tx("Changes");
+      },
+      icon: () => "diff",
+      restorable: true,
+      canNavigate: (input, open) => {
+        if (open) return true;
+        const task = (input.data as { task?: string } | undefined)?.task;
+        if (!task) return false;
+        const s = useAgents.getState();
+        return !s.loaded || s.tasks.has(task);
+      },
+      onClose: (input) => releaseClosedTaskCache((input.data as { task: string }).task),
+    }),
+    registerEditorKind({
       kind: HOME_KIND,
-      component: lazyComponent(() => import("./HomeEditor").then((m) => m.HomeEditor)),
+      component: lazyComponent(() => import("./HomeEditor").then((m) => m.HomeEditor), { prefetch: true }),
       title: () => "New Agent Task",
       icon: (input) => {
         const task = useAgents.getState().tasks.get((input.data as { task: string }).task);
@@ -228,7 +267,7 @@ export function activate(): () => void {
     registerStatusItem({ id: "agents.status", align: "right", priority: 3, title: "Agents", component: AgentsStatus }),
     registerMenuGroup({
       id: "agents.send",
-      menus: ["editor", "projectView"],
+      menus: ["editor", "editorTab", "projectView"],
       order: 80,
       items: (menu, { paths, dirs }) =>
         paths.length && !paths.some(isVirtualUri) && agentsHere()
@@ -236,7 +275,8 @@ export function activate(): () => void {
               {
                 kind: "action",
                 action: "agents.sendToAgent",
-                arg: menu === "projectView" ? paths.map((p, i) => (dirs?.[i] ? `${p}/` : p)) : undefined,
+                // The editor sends its selection; a tab or the Project view sends the files.
+                arg: menu === "editor" ? undefined : paths.map((p, i) => (dirs?.[i] ? `${p}/` : p)),
               },
             ]
           : [],
@@ -265,6 +305,7 @@ export function activate(): () => void {
       },
       ...taskActions,
       ...replyActions,
+      copyImageAction,
       {
         id: "agents.findInConversation",
         title: "Find in Conversation",
@@ -348,7 +389,7 @@ export function activate(): () => void {
       {
         id: "agents.addAgent",
         title: "More Agents…",
-        description: "Opens Settings › Tools › Agents: installs, updates or removes agents from the ACP Registry.",
+        description: "Install, update, or remove agents from the ACP Registry.",
         category: "Agents",
         icon: "plugin",
         keywords: ["agent", "acp", "registry", "install", "update"],
@@ -356,12 +397,11 @@ export function activate(): () => void {
       },
       {
         id: "agents.mcpServers",
-        title: "External MCP Servers…",
-        description:
-          "Opens Settings › Agents › External MCP Servers: configures the User and Workspace MCP servers coding agents use.",
+        title: "MCP Connections…",
+        description: "Configure the MCP servers that agents can use.",
         category: "Agents",
         icon: "settings",
-        keywords: ["mcp", "model context protocol", "servers", "tools", "agent"],
+        keywords: ["mcp", "model context protocol", "servers", "tools", "agent", "External MCP Servers"],
         run: () => void executeAction("file.settings", MCP_PAGE),
       },
       {

@@ -44,7 +44,11 @@ describe("title bar gear menu", () => {
     expect(keymap.map((i) => i.label)).toContain("Mine");
     expect(keymap.filter((i) => i.checked).map((i) => i.label)).toEqual(["macOS"]);
     // View Mode only switches the existing modes.
-    expect((items[7] as Sub).submenu.map((i) => i.action)).toEqual(["editor.toggleZen", "window.toggleFullScreen"]);
+    expect((items[7] as Sub).submenu.map((i) => i.action)).toEqual([
+      "editor.toggleZen",
+      "view.toggleZenMode",
+      "window.toggleFullScreen",
+    ]);
   });
 
   it("lists every widget with a checkbox in Customize Main Toolbar", () => {
@@ -86,6 +90,19 @@ describe("title bar gear menu", () => {
     fireEvent.click(screen.getByText("Theme"));
     fireEvent.click(await screen.findByText("High Contrast"));
     expect(useThemeOverride.getState().theme).toBe("dark-hc");
+  });
+});
+
+describe("project widget while a project opens", () => {
+  it("names the opening project before it is open", () => {
+    const saved = useProject.getState();
+    useProject.setState({ project: null, openingPath: "/work/new-project" });
+    try {
+      render(<TitleBar />);
+      expect(screen.getByRole("button", { name: "new-project" })).toBeInTheDocument();
+    } finally {
+      useProject.setState(saved);
+    }
   });
 });
 

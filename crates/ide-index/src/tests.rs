@@ -379,6 +379,23 @@ fn binary_and_huge_files_are_listed_without_symbols() {
 }
 
 #[test]
+fn binary_files_are_classified_from_their_head_and_text_is_read_past_it() {
+    let fx = Fixture::new(&[("img/logo.rs", "")]);
+    let mut binary = b"fn head() {}\0".to_vec();
+    binary.extend(std::iter::repeat_n(b'x', 64 * 1024));
+    std::fs::write(fx.root.join("img/logo.rs"), &binary).unwrap();
+    let long = format!("{}fn past_the_sniff() {{}}\n", "// pad\n".repeat(2000));
+    assert!(long.len() > 8192);
+    fx.write("src/long.rs", &long);
+    let idx = fx.open();
+    assert_eq!(symbols(&idx, "past_the_sniff", SymbolFilter::All), vec!["past_the_sniff"]);
+    assert!(symbols(&idx, "head", SymbolFilter::All).is_empty());
+    let data = idx.shared.data.read();
+    let logo = data.files.iter().flatten().find(|entry| entry.rel.as_ref() == "img/logo.rs").unwrap();
+    assert_eq!(logo.hash, [0; 32], "a binary file is not read whole to be hashed");
+}
+
+#[test]
 fn go_to_file_finds_ignored_files_but_not_their_symbols() {
     let fx = Fixture::new(&[
         (".gitignore", ".env\n*.local.ts\ndist/\n"),
@@ -659,6 +676,37 @@ fn css_selectors_are_found_by_exact_name() {
 }
 
 #[test]
+fn css_custom_properties_are_listed_with_their_values_and_follow_edits() {
+    let f = Fixture::new(&[
+        ("theme/light.css", ":root {\n  --bg: #fff;\n  --gap:\n    4px  8px;\n}\n"),
+        ("theme/dark.scss", "[data-theme=dark] { .x { --bg: rgb(0 0 0) !important; } }\n"),
+        ("theme/extra.less", ".a { --ring: var(--bg); color: red; }\n"),
+    ]);
+    let idx = f.open();
+    let vars = |idx: &ProjectIndex| -> Vec<(String, String, Option<String>)> {
+        idx.symbols_prefixed("--", SymbolKind::Variable, 100)
+            .into_iter()
+            .map(|m| (m.rel_path, m.name, m.container))
+            .collect()
+    };
+    assert_eq!(
+        vars(&idx),
+        vec![
+            ("theme/dark.scss".into(), "--bg".into(), Some("rgb(0 0 0) !important".into())),
+            ("theme/extra.less".into(), "--ring".into(), Some("var(--bg)".into())),
+            ("theme/light.css".into(), "--bg".into(), Some("#fff".into())),
+            ("theme/light.css".into(), "--gap".into(), Some("4px 8px".into())),
+        ]
+    );
+    let light = f.root.join("theme/light.css");
+    std::fs::write(&light, ":root { --fg: #222; }\n").unwrap();
+    idx.update(std::slice::from_ref(&light), &[]);
+    assert!(idx.wait_idle(WAIT));
+    let names: Vec<String> = vars(&idx).into_iter().filter(|v| v.0 == "theme/light.css").map(|v| v.1).collect();
+    assert_eq!(names, vec!["--fg".to_string()]);
+}
+
+#[test]
 fn symbols_named_within_keeps_out_of_root_matches_from_evicting_a_root() {
     let f = Fixture::new(&[
         ("a/w.rs", "struct Decoder;\nstruct Decoder;\n"),
@@ -825,7 +873,7 @@ fn workspace_scope_excludes_state_from_scans_updates_and_cached_results() {
     let idx = ProjectIndex::open(
         &fx.root,
         &fx.cache,
-        crate::IndexRoots { include_root: false, folders: vec![member.clone()] },
+        crate::IndexRoots { include_root: false, folders: vec![member.clone()], ..Default::default() },
         Vec::new(),
         Arc::new(LanguageRegistry::load(None).unwrap()),
         Arc::new(Syntax::new()),
@@ -841,7 +889,7 @@ fn workspace_scope_excludes_state_from_scans_updates_and_cached_results() {
     assert!(idx.wait_idle(WAIT));
     assert!(symbols(&idx, "hidden", SymbolFilter::All).is_empty());
     assert_eq!(symbols(&idx, "visible", SymbolFilter::All), ["visible"]);
-    idx.set_scope(crate::IndexRoots { include_root: false, folders: Vec::new() }, Vec::new());
+    idx.set_scope(crate::IndexRoots { include_root: false, folders: Vec::new(), ..Default::default() }, Vec::new());
     assert!(idx.wait_idle(WAIT));
     assert!(idx.find_files("", 100).is_empty());
 }
@@ -1104,7 +1152,7 @@ fn repository_rule_changes_refresh_members_of_an_unindexed_container() {
     let idx = ProjectIndex::open(
         &fx.root,
         &fx.cache,
-        IndexRoots { include_root: false, folders: vec![fx.root.join("member")] },
+        IndexRoots { include_root: false, folders: vec![fx.root.join("member")], ..Default::default() },
         vec![],
         Arc::new(LanguageRegistry::load(None).unwrap()),
         Arc::new(Syntax::new()),
@@ -1245,4 +1293,67 @@ fn queries_during_streaming_scan_do_not_deadlock() {
     });
 
     done_rx.recv_timeout(Duration::from_secs(60)).expect("concurrent index queries deadlocked with streaming scan");
+}
+
+#[test]
+fn reconciling_a_few_changed_files_does_not_show_indexing() {
+    let fx = sample();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink: SharedSink = {
+        let events = events.clone();
+        Arc::new(move |e: IdeEvent| events.lock().push(e))
+    };
+    let idx = fx.open_with(sink);
+    let announced = |events: &Mutex<Vec<IdeEvent>>| {
+        events
+            .lock()
+            .iter()
+            .filter(|e| matches!(e, IdeEvent::IndexState { indexing: true, .. } | IdeEvent::Task { done: false, .. }))
+            .count()
+    };
+    let settle = || {
+        assert!(idx.wait_idle(WAIT));
+        // The touched folders are reconciled once the snapshot delay has passed.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(idx.wait_idle(WAIT));
+    };
+
+    // A program appending to its log in the project, as a debugged Spring app does.
+    events.lock().clear();
+    let log = fx.write("logs/app.log", "start\n");
+    for i in 0..3 {
+        std::fs::write(&log, format!("line {i}\n").repeat(i + 1)).unwrap();
+        idx.update(std::slice::from_ref(&log), &[]);
+        settle();
+    }
+    assert_eq!(announced(&events), 0, "a log being written must not show Indexing");
+    assert!(files(&idx, "app.log").contains(&"logs/app.log".to_owned()), "the log is still indexed");
+}
+
+/// #5749: a file at the project root changing must not re-walk the whole project when the
+/// touched folders are reconciled, yet folders that appear or vanish there are still picked up.
+#[test]
+fn reconciling_a_root_change_lists_only_that_folder() {
+    let fx = sample();
+    let idx = fx.open();
+
+    // Written behind the index's back, deep in a folder it already knows.
+    fx.write("src/order/Unreported.java", "class Unreported {}\n");
+    // A new folder, a vanished one and an unreported file next to the changed root file.
+    fx.write("fresh/deep/Fresh.java", "class Fresh {}\n");
+    std::fs::remove_dir_all(fx.root.join("docs")).unwrap();
+    fx.write("Unlisted.txt", "x\n");
+    let log = fx.write("app.log", "line\n");
+    idx.update(std::slice::from_ref(&log), &[]);
+    assert!(idx.wait_idle(WAIT));
+    // The touched folders are reconciled once the snapshot delay has passed.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(idx.wait_idle(WAIT));
+
+    assert!(files(&idx, "app.log").contains(&"app.log".to_owned()), "the changed file is indexed");
+    assert!(files(&idx, "Unlisted").contains(&"Unlisted.txt".to_owned()), "the root folder is listed");
+    assert!(files(&idx, "Fresh").contains(&"fresh/deep/Fresh.java".to_owned()), "a new folder is walked");
+    assert!(files(&idx, "maintenance").is_empty(), "a vanished folder's files are dropped");
+    assert!(files(&idx, "main.rs").contains(&"src/main.rs".to_owned()), "other folders keep their files");
+    assert!(files(&idx, "Unreported").is_empty(), "known subfolders are not re-walked");
 }

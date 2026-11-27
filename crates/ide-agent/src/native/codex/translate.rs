@@ -107,6 +107,8 @@ pub(super) struct ModelInfo {
     /// `(effort, description)`.
     pub efforts: Vec<(String, String)>,
     pub default_effort: Option<String>,
+    pub fast_tier: Option<String>,
+    pub default_service_tier: Option<String>,
     pub is_default: bool,
     pub hidden: bool,
 }
@@ -133,6 +135,22 @@ pub(super) fn models_of(list: &Value) -> Vec<ModelInfo> {
                     })
                     .collect(),
                 default_effort: str_of(m, "defaultReasoningEffort"),
+                fast_tier: m
+                    .get("serviceTiers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tier| tier.get("id").and_then(Value::as_str))
+                    .chain(
+                        m.get("additionalSpeedTiers")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str),
+                    )
+                    .find(|tier| is_fast_tier(tier))
+                    .map(str::to_owned),
+                default_service_tier: str_of(m, "defaultServiceTier"),
                 is_default: m.get("isDefault").and_then(Value::as_bool) == Some(true),
                 hidden: m.get("hidden").and_then(Value::as_bool) == Some(true),
                 id,
@@ -147,6 +165,9 @@ pub(super) struct Settings {
     /// A model id from `model/list`, or the one the thread reported.
     pub model: String,
     pub effort: Option<String>,
+    pub service_tier: Option<String>,
+    /// No choice preserves the runtime's default; false explicitly selects Standard.
+    pub fast_override: Option<bool>,
     pub mode: Mode,
     /// Codex's Default/Plan collaboration mode. It is sent with each turn because it is
     /// part of the turn contract rather than the sandbox permission mode above.
@@ -168,6 +189,12 @@ impl Settings {
         let mut s = Settings {
             model,
             effort: str_of(result, "reasoningEffort"),
+            service_tier: match result.get("serviceTier") {
+                // A live thread can explicitly report Standard even when the catalog defaults to Fast.
+                Some(Value::Null) => Some("default".into()),
+                _ => str_of(result, "serviceTier"),
+            },
+            fast_override: None,
             mode: Mode::of(
                 result.get("approvalPolicy").unwrap_or(&Value::Null),
                 result.get("sandbox").unwrap_or(&Value::Null),
@@ -215,6 +242,16 @@ impl Settings {
                 }
                 self.effort = Some(value.to_owned());
             }
+            SERVICE_TIER => {
+                if !models.iter().any(|m| m.id == self.model && m.fast_tier.is_some()) {
+                    return Err(format!("{} has no Fast mode", self.model));
+                }
+                self.fast_override = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(format!("unknown Fast mode {value}")),
+                });
+            }
             MODE => self.mode = Mode::parse(value).ok_or_else(|| format!("unknown mode {value}"))?,
             COLLABORATION_MODE => {
                 if !matches!(value, DEFAULT_COLLABORATION_MODE | PLAN_COLLABORATION_MODE) {
@@ -227,16 +264,32 @@ impl Settings {
         }
         Ok(())
     }
+
+    /// `turn/start.serviceTier`: omission inherits; "default" explicitly resets Fast.
+    pub fn service_tier_override<'a>(&self, models: &'a [ModelInfo]) -> Option<&'a str> {
+        match self.fast_override {
+            Some(true) => Some(
+                models.iter().find(|m| m.id == self.model).and_then(|m| m.fast_tier.as_deref()).unwrap_or("default"),
+            ),
+            Some(false) => Some("default"),
+            None => None,
+        }
+    }
 }
 
 pub(super) const MODEL: &str = "model";
 pub(super) const EFFORT: &str = "reasoning_effort";
+pub(super) const SERVICE_TIER: &str = "service_tier";
 pub(super) const MODE: &str = "mode";
 pub(super) const COLLABORATION_MODE: &str = "collaboration_mode";
 pub(super) const DEFAULT_COLLABORATION_MODE: &str = "default";
 pub(super) const PLAN_COLLABORATION_MODE: &str = "plan";
 
-/// ACP `configOptions`: model, reasoning effort (for models that have it) and mode.
+fn is_fast_tier(tier: &str) -> bool {
+    matches!(tier, "fast" | "priority")
+}
+
+/// ACP `configOptions`: model, its supported settings and session modes.
 pub(super) fn config_options(models: &[ModelInfo], s: &Settings) -> Value {
     let mut model_values: Vec<Value> = models
         .iter()
@@ -261,6 +314,16 @@ pub(super) fn config_options(models: &[ModelInfo], s: &Settings) -> Value {
         out.push(json!({
             "id": EFFORT, "name": "Reasoning", "category": "thought_level", "type": "select",
             "currentValue": effort, "options": values,
+        }));
+    }
+    if let Some(model) = models.iter().find(|m| m.id == s.model && m.fast_tier.is_some()) {
+        let fast = s.fast_override.unwrap_or_else(|| {
+            s.service_tier.as_deref().or(model.default_service_tier.as_deref()).is_some_and(is_fast_tier)
+        });
+        out.push(json!({
+            "id": SERVICE_TIER, "name": "Fast", "category": "model_config", "type": "select",
+            "currentValue": if fast { "true" } else { "false" },
+            "options": [select_value("false", "Standard", None), select_value("true", "Fast", None)],
         }));
     }
     out.push(json!({
@@ -358,34 +421,16 @@ pub(super) fn user_input(prompt: &Value) -> Vec<Value> {
             }
             "resource" => {
                 let r = b.get("resource")?;
-                let path = uri_path(r.get("uri").and_then(Value::as_str).unwrap_or_default());
+                let path = crate::images::uri_path(r.get("uri").and_then(Value::as_str).unwrap_or_default());
                 let text = r.get("text").and_then(Value::as_str)?;
                 Some(json!({ "type": "text", "text": format!("<file path=\"{path}\">\n{text}\n</file>") }))
             }
-            "resource_link" => Some(json!({ "type": "text", "text": uri_path(b.get("uri")?.as_str()?) })),
+            "resource_link" => {
+                Some(json!({ "type": "text", "text": crate::images::uri_path(b.get("uri")?.as_str()?) }))
+            }
             _ => None,
         })
         .collect()
-}
-
-/// The path of a `file://` URI (percent-decoded); other URIs as they are.
-fn uri_path(uri: &str) -> String {
-    let Some(rest) = uri.strip_prefix("file://") else { return uri.to_owned() };
-    let bytes = rest.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && let Some(b) = rest.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(b);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A `session/update` notification's `update` for content.
@@ -477,6 +522,9 @@ pub(super) fn tool_call(item: &Value, done: bool, cwd: Option<&str>, output: Opt
         "imageView" => {
             let path = item.get("path").and_then(Value::as_str).unwrap_or_default();
             call.insert("locations".into(), json!([{ "path": path }]));
+            if done && let Some(image) = crate::images::from_file(std::path::Path::new(path)) {
+                call.insert("content".into(), json!([image_content(&image)]));
+            }
             (format!("View {}", display_path(path, cwd)), "read")
         }
         "collabAgentToolCall" => {
@@ -492,7 +540,12 @@ pub(super) fn tool_call(item: &Value, done: bool, cwd: Option<&str>, output: Opt
         }
         "contextCompaction" => ("Compact the conversation".to_owned(), "other"),
         "sleep" => ("Wait".to_owned(), "other"),
-        "imageGeneration" => ("Generate an image".to_owned(), "other"),
+        "imageGeneration" => {
+            if done && let Some(image) = generated_image(item) {
+                call.insert("content".into(), json!([image_content(&image)]));
+            }
+            ("Generate an image".to_owned(), "other")
+        }
         _ => return None,
     };
     call.insert("sessionUpdate".into(), json!(if done { "tool_call_update" } else { "tool_call" }));
@@ -501,6 +554,19 @@ pub(super) fn tool_call(item: &Value, done: bool, cwd: Option<&str>, output: Opt
     call.insert("kind".into(), json!(kind));
     call.insert("status".into(), json!(tool_status(item, done)));
     Some(Value::Object(call))
+}
+
+fn image_content(image: &crate::model::AgentImage) -> Value {
+    json!({ "type": "content", "content": crate::images::content(image) })
+}
+
+/// A generated image: inline (base64 PNG) or, when codex saved it, the file.
+fn generated_image(item: &Value) -> Option<crate::model::AgentImage> {
+    if let Some(data) = item.get("result").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+        let image = crate::model::AgentImage { mime_type: "image/png".into(), data: data.into(), name: None };
+        return Some(crate::model::AgentImage { mime_type: image.media_type().into(), ..image });
+    }
+    crate::images::from_file(std::path::Path::new(item.get("savedPath")?.as_str()?))
 }
 
 /// The output of a running command, as a `tool_call_update`.
@@ -866,9 +932,23 @@ pub(super) fn history(thread: &Value, cwd: Option<&str>) -> Vec<Value> {
                                 "user_message_chunk",
                                 c.get("text").and_then(Value::as_str).unwrap_or_default(),
                             )),
-                            Some("image") => out.push(json!({ "sessionUpdate": "user_message_chunk",
-                                "content": { "type": "resource_link", "uri": c.get("url"), "name": "image" } })),
-                            Some("localImage" | "mention" | "skill") => {
+                            Some("image") => {
+                                let url = c.get("url").and_then(Value::as_str).unwrap_or_default();
+                                let content = crate::images::from_uri(url).map_or_else(
+                                    || json!({ "type": "resource_link", "uri": url, "name": "image" }),
+                                    |image| crate::images::content(&image),
+                                );
+                                out.push(json!({ "sessionUpdate": "user_message_chunk", "content": content }));
+                            }
+                            Some("localImage") => {
+                                let path = c.get("path").and_then(Value::as_str).unwrap_or_default();
+                                out.push(match crate::images::from_file(std::path::Path::new(path)) {
+                                    Some(image) => json!({ "sessionUpdate": "user_message_chunk",
+                                        "content": crate::images::content(&image) }),
+                                    None => chunk("user_message_chunk", path),
+                                });
+                            }
+                            Some("mention" | "skill") => {
                                 let path = c.get("path").and_then(Value::as_str).unwrap_or_default();
                                 out.push(chunk("user_message_chunk", path));
                             }

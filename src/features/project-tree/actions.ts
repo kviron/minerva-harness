@@ -1,13 +1,15 @@
 /** Actions of the project view (Find Action, keymap, other features via `executeAction`). */
 import { activeEditor } from "@/editor/api";
-import { getAction, registerActions, type Action } from "@/platform/actions";
+import { executeAction, getAction, registerActions, type Action } from "@/platform/actions";
 import { getContext } from "@/platform/context";
+import { FILE_COLOR_NAMES } from "@/platform/fileColors";
 import { canRevealInFileManager, revealInFileManagerLabel } from "@/platform/fileManager";
 import { dirname, useProject } from "@/platform/project";
 import { showContextMenu, type MenuItem } from "@/ui";
 import { maybeEditorService, menuGroupItems, toolWindowService } from "@/workbench/contributions";
-import { OPTION_LABELS, SORT_LABELS } from "./HeaderActions";
+import { OPTION_LABELS, SORT_LABELS, flipToggle, isToggled } from "./HeaderActions";
 import { compareTarget, newMenuItems, revealLabel } from "./contextMenu";
+import { LABELS, setFileColor } from "./fileColor";
 import { openNewPopup } from "./newPopupModel";
 import type { ProjectNode } from "./model";
 import {
@@ -41,9 +43,12 @@ import { showNewPopup, treeHandle } from "./ProjectView";
 import { lastFileRefactoring, undoFileRefactoring } from "./fileRefactor";
 import {
   VIEW_MODES,
+  canRevealInProjectTree,
   collapseAll,
   currentModel,
   expandAll,
+  expandSelected,
+  hasVisibleSelection,
   modeShows,
   reloadAll,
   revealPath,
@@ -51,7 +56,7 @@ import {
   setViewOption,
   useProjectTree,
 } from "./store";
-import { tx } from "@/platform/i18n";
+import { tx, txPart } from "@/platform/i18n";
 
 const FOCUS = "projectViewFocus";
 const OPEN = "projectOpen";
@@ -105,12 +110,14 @@ function showProjectView(focus: boolean) {
 }
 
 /** Selects `path` (default: the active editor's file) in the project view. */
-export function selectInProjectView(path?: string | null, focus = true) {
+export function selectInProjectView(path?: string | null, focus = true, expand = false) {
   const target = path ?? maybeEditorService()?.activePath() ?? null;
   if (!target) return false;
-  if (!modeShows(target)) setViewMode("project");
+  // Hidden from the Project pane (Show Scratches and Consoles off), a scratch shows in its own pane.
+  if (!modeShows(target))
+    setViewMode(modeShows(target, "project") || !modeShows(target, "scratches") ? "project" : "scratches");
   showProjectView(focus);
-  return revealPath(target, focus, true);
+  return revealPath(target, focus, true, expand);
 }
 
 /**
@@ -187,17 +194,17 @@ export function registerProjectActions(): () => void {
 
   const toggles: Action[] = OPTION_LABELS.map(([key, label]) => ({
     id: `project.option.${key}`,
-    title: tx`Project View: ${label}`,
+    title: tx`Project View: ${txPart(label)}`,
     category: "View",
     // IDEA's former name of Always Select Opened File.
     keywords: ["project", "tree", "toggle", ...(key === "autoscrollFromSource" ? ["autoscroll from source"] : [])],
-    toggled: () => useProjectTree.getState().options[key],
-    run: () => setViewOption(key, !useProjectTree.getState().options[key]),
+    toggled: () => isToggled(key),
+    run: () => flipToggle(key),
   }));
 
   const modes: Action[] = VIEW_MODES.map(([mode, label]) => ({
     id: `project.viewMode.${mode}`,
-    title: tx`Project View: Show ${label}`,
+    title: tx`Project View: Show ${txPart(label)}`,
     category: "View",
     when: OPEN,
     keywords: ["project", "pane", "scope", "view as"],
@@ -209,7 +216,7 @@ export function registerProjectActions(): () => void {
 
   const sorts: Action[] = SORT_LABELS.map(([sortBy, label]) => ({
     id: `project.sortBy.${sortBy}`,
-    title: tx`Project View: ${label}`,
+    title: tx`Project View: ${txPart(label)}`,
     category: "View",
     keywords: ["project", "tree", "sort", "order"],
     toggled: () => useProjectTree.getState().options.sortBy === sortBy,
@@ -226,7 +233,12 @@ export function registerProjectActions(): () => void {
       keywords: ["locate", "reveal", "show in"],
       run: ({ arg }) => {
         const path = typeof arg === "string" ? arg : (arg as { path?: string } | undefined)?.path;
-        if (path) return void selectInProjectView(path);
+        const opts =
+          typeof arg === "object" && arg ? (arg as { expand?: boolean; revealOutside?: boolean }) : undefined;
+        if (path) {
+          if (opts?.revealOutside && !canRevealInProjectTree(path)) return revealInFinder(nodesFrom(path));
+          return void selectInProjectView(path, true, !!opts?.expand);
+        }
         const target = maybeEditorService()?.activePath() ?? leadNode()?.path;
         if (target) showSelectIn(target);
       },
@@ -546,6 +558,16 @@ export function registerProjectActions(): () => void {
       },
     },
     {
+      id: "project.expandSelected",
+      title: "Expand Selected",
+      category: "Project View",
+      icon: "expand-all",
+      when: OPEN,
+      keyWhen: FOCUS,
+      enabled: () => hasVisibleSelection(),
+      run: expandSelected,
+    },
+    {
       id: "project.collapseAll",
       title: "Collapse All",
       category: "Project View",
@@ -569,5 +591,28 @@ export function registerProjectActions(): () => void {
     ...toggles,
     ...modes,
     ...sorts,
+    // File Color of a single path (the project view's submenu; the editor tab menu references
+    // these ids with a path argument instead of importing this feature).
+    ...FILE_COLOR_NAMES.map((name): Action => ({
+      id: `file.${name}`,
+      title: LABELS[name],
+      category: "Project View",
+      hidden: true,
+      run: ({ arg }) => void setFileColor(String(arg), false, name),
+    })),
+    {
+      id: "file.clearColor",
+      title: "Clear File Color",
+      category: "Project View",
+      hidden: true,
+      run: ({ arg }) => void setFileColor(String(arg), false, null),
+    },
+    {
+      id: "file.editColors",
+      title: "Edit File Colors…",
+      category: "Project View",
+      hidden: true,
+      run: () => void executeAction("file.settings", "fileColors"),
+    },
   ]);
 }

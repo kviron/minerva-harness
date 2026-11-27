@@ -116,7 +116,7 @@ pub(crate) async fn discover(
                 let options = translate::config_options(&models, &settings);
                 let levels = crate::config::options_of(&json!({ "configOptions": options }))
                     .into_iter()
-                    .filter(|o| o.category.as_deref() == Some("thought_level"))
+                    .filter(|o| matches!(o.category.as_deref(), Some("thought_level" | "model_config")))
                     .collect();
                 (model.id.clone(), levels)
             })
@@ -399,6 +399,13 @@ fn apply_thread_config(params: &Value, request: &mut Value) {
     if !config.as_object().is_some_and(|m| m.is_empty()) {
         request["config"] = config;
     }
+    // The workspace's other roots join the thread's own: they are where `workspace-write`
+    // may write and what the model is told the workspace holds.
+    if let Some(extra) = params.get("additionalDirectories").and_then(Value::as_array).filter(|a| !a.is_empty())
+        && let Some(cwd) = params.get("cwd").filter(|c| c.is_string())
+    {
+        request["runtimeWorkspaceRoots"] = std::iter::once(cwd).chain(extra).cloned().collect();
+    }
 }
 
 impl CodexShim {
@@ -480,7 +487,7 @@ impl CodexShim {
                 "loadSession": true,
                 "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true },
                 "mcpCapabilities": { "http": false, "sse": false, "stdio": true },
-                "sessionCapabilities": { "fork": {}, "close": {} },
+                "sessionCapabilities": { "fork": {}, "close": {}, "additionalDirectories": {} },
                 "_meta": { "openidea": { "rollback": true, "steer": true } },
             },
             "agentInfo": { "name": "codex", "title": "Codex", "version": version },
@@ -572,8 +579,14 @@ impl CodexShim {
             scoped_files::configure_thread(&mut request);
             request["dynamicTools"] = scoped_files::definitions();
         }
+        // Not written to `~/.codex/sessions`, so it isn't listed among the past threads.
+        if params.pointer("/_meta/openidea/ephemeral").and_then(Value::as_bool) == Some(true) {
+            request["ephemeral"] = json!(true);
+        }
         let result = self.call("thread/start", request).await?;
-        let (id, options) = self.open_thread(&result, &models, None);
+        let mut settings = Settings::of(&result, &models);
+        settings.fast_override = params.pointer("/_meta/openidea/codexFast").and_then(Value::as_bool);
+        let (id, options) = self.open_thread(&result, &models, Some(settings));
         if id.is_empty() {
             return Err(error(codes::INTERNAL_ERROR, "codex started no thread"));
         }
@@ -620,7 +633,9 @@ impl CodexShim {
         if delegated_session(params) && result.pointer("/thread/id").and_then(Value::as_str) != Some(id) {
             return Err(error(codes::INTERNAL_ERROR, "Codex resumed a different thread"));
         }
-        let (_, options) = self.open_thread(&result, &models, None);
+        let mut settings = Settings::of(&result, &models);
+        settings.fast_override = params.pointer("/_meta/openidea/codexFast").and_then(Value::as_bool);
+        let (_, options) = self.open_thread(&result, &models, Some(settings));
         if scoped_files && let Some(thread) = self.state.lock().threads.get_mut(id) {
             thread.scoped_files = true;
         }
@@ -776,6 +791,9 @@ impl CodexShim {
                     }
                     if let Some(effort) = &s.effort {
                         request["effort"] = json!(effort);
+                    }
+                    if let Some(tier) = s.service_tier_override(&models) {
+                        request["serviceTier"] = json!(tier);
                     }
                 }
                 if delegated_read_only {
@@ -1910,3 +1928,6 @@ fn mcp_text(response: &Value) -> String {
         .collect::<Vec<_>>();
     format!("MCP servers:\n{}", lines.join("\n"))
 }
+
+#[cfg(test)]
+mod reconnect_tests;

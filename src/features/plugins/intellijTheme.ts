@@ -9,6 +9,7 @@
  * and so does the command line (`scripts/theme/import-intellij-theme.ts`).
  */
 
+import { iclsColor } from "../../platform/iclsColor.ts";
 import { DARCULA_TOKENS } from "./intellijDarcula.ts";
 
 /** OpenIDEA token ← IntelliJ `ui` keys, first present wins. `*.prop` wildcards apply too. */
@@ -117,6 +118,7 @@ export const ICLS_COLORS: Record<string, string[]> = {
   ADDED_LINES_COLOR: ["--gutter-added"],
   DELETED_LINES_COLOR: ["--gutter-deleted"],
   CONSOLE_BACKGROUND_KEY: ["--bg-console"],
+  DIFF_SEPARATOR_WAVE: ["--diff-separator-wave"],
 };
 
 type Part = "FOREGROUND" | "BACKGROUND" | "EFFECT_COLOR" | "ERROR_STRIPE_COLOR";
@@ -161,6 +163,12 @@ export const ICLS_ATTRIBUTES: Record<string, Array<[Part, string]>> = {
   DEFAULT_PARAMETER: [["FOREGROUND", "--syn-param"]],
   DEFAULT_GLOBAL_VARIABLE: [["FOREGROUND", "--syn-global"]],
   DEFAULT_PREDEFINED_SYMBOL: [["FOREGROUND", "--syn-builtin"]],
+  // Java annotations (drawn with --syn-decorator, as decorators are) take the annotation key; DEFAULT_METADATA
+  // only stands in for it (see `convertIcls`).
+  ANNOTATION_NAME_ATTRIBUTES: [
+    ["FOREGROUND", "--syn-annotation"],
+    ["FOREGROUND", "--syn-decorator"],
+  ],
   DEFAULT_METADATA: [
     ["FOREGROUND", "--syn-annotation"],
     ["FOREGROUND", "--syn-decorator"],
@@ -303,19 +311,15 @@ function resolveColor(value: string, named: Map<string, string>, depth = 0): str
   return ref !== undefined && depth < 8 ? resolveColor(ref, named, depth + 1) : null;
 }
 
-/** `.icls` hex: RGB without `#`, leading zeros dropped (`"0"` is black, `"ff"` is #0000ff). */
-function iclsColor(value: string): string | null {
-  const v = value.trim().toLowerCase();
-  if (!/^[0-9a-f]{1,8}$/.test(v)) return null;
-  return `#${v.length <= 6 ? v.padStart(6, "0") : v.padStart(8, "0")}`;
-}
+/** IntelliJ's bundled schemes, which set ANNOTATION_NAME_ATTRIBUTES themselves. */
+const BUNDLED_PARENTS = new Set(["Default", "Darcula"]);
 
 const attr = (tag: string, name: string) => new RegExp(`${name}="([^"]*)"`).exec(tag)?.[1];
 
 /** Parses the colours and attributes of an `.icls` file into tokens. */
 export function convertIcls(xml: string): { name: string; dark: boolean | null; tokens: Record<string, string> } {
   const tokens: Record<string, string> = {};
-  const set = (names: string[], color: string | null) => {
+  const set = (names: string[], color: string | undefined) => {
     if (color) for (const n of names) tokens[n] ??= color;
   };
   const schemeTag = /<scheme\b[^>]*>/.exec(xml)?.[0] ?? "";
@@ -345,16 +349,19 @@ export function convertIcls(xml: string): { name: string; dark: boolean | null; 
     }
     attributes.set(m[1]!, parts);
   }
-  const textForeground = iclsColor(attributes.get("TEXT")?.get("FOREGROUND") ?? "");
+  // The annotation key falls back to DEFAULT_METADATA only where neither the file nor its bundled parent
+  // (both set it) defines it, as for imported schemes (`platform/icls.ts`).
+  const metadataUnused = attributes.has("ANNOTATION_NAME_ATTRIBUTES") || BUNDLED_PARENTS.has(parent);
+  const textForeground = iclsColor(attributes.get("TEXT")?.get("FOREGROUND"));
   for (const [key, parts] of attributes) {
     const map = ICLS_ATTRIBUTES[key];
-    if (!map) continue;
+    if (!map || (key === "DEFAULT_METADATA" && metadataUnused)) continue;
     // `<value />` defines the key without colours, so the parent scheme's don't apply: it shows as plain text.
     if (empty.has(key)) {
       for (const [part, token] of map) if (part === "FOREGROUND") set([token], textForeground);
       continue;
     }
-    for (const [part, token] of map) set([token], iclsColor(parts.get(part) ?? ""));
+    for (const [part, token] of map) set([token], iclsColor(parts.get(part)));
     // FONT_TYPE: 1 bold, 2 italic, 3 bold italic.
     if (key === "DEFAULT_LINE_COMMENT" && parts.has("FONT_TYPE")) {
       tokens["--syn-comment-style"] = Number(parts.get("FONT_TYPE")) & 2 ? "italic" : "normal";
@@ -362,7 +369,9 @@ export function convertIcls(xml: string): { name: string; dark: boolean | null; 
   }
   if (parent === "Darcula") {
     // IntelliJ replaces a parent's attribute as a whole: what the file names, even empty or by baseAttributes, wins.
-    const keys = [...body.matchAll(/<option name="([^"]+)"/g)].map((m) => m[1]!);
+    const keys = [...body.matchAll(/<option name="([^"]+)"/g)]
+      .map((m) => m[1]!)
+      .filter((key) => key !== "DEFAULT_METADATA");
     const own = new Set(keys.flatMap((key) => (ICLS_ATTRIBUTES[key] ?? []).map(([, t]) => t)));
     for (const [token, value] of Object.entries(DARCULA_TOKENS)) if (!own.has(token)) tokens[token] ??= value;
   }

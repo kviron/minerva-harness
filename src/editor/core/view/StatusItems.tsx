@@ -14,6 +14,7 @@ import {
   Menu,
   Popup,
   SelectListbox,
+  showContextMenu,
   badgeKind,
   fileIconName,
   revealHorizontally,
@@ -33,6 +34,7 @@ import { editorController, isTextInput, useEditorStatus, useGotoLine, useTabs } 
 import { languageInfo } from "../cm/languages";
 import { useDocMeta, useOutline, type DocMeta } from "../model/document";
 import { symbolChain } from "./outline";
+import { siblingSegment } from "./navBar";
 import { NavChildrenPopup } from "./NavBarPopup";
 import type { NavSegment } from "./navBar";
 import styles from "./EditorArea.module.css";
@@ -166,9 +168,15 @@ function updateBreadcrumbEdges(row: HTMLDivElement) {
 function BreadcrumbStrip({
   trail,
   activateOnDown = false,
+  onActivateAltDown,
   children,
   ...props
-}: ComponentPropsWithoutRef<"nav"> & { trail: string; activateOnDown?: boolean }) {
+}: ComponentPropsWithoutRef<"nav"> & {
+  trail: string;
+  activateOnDown?: boolean;
+  /** Alt+Down on a focused crumb opens its chooser (the crumb's element is passed). */
+  onActivateAltDown?: (crumb: HTMLElement) => void;
+}) {
   const strip = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const row = strip.current;
@@ -189,10 +197,16 @@ function BreadcrumbStrip({
     <nav
       {...props}
       onKeyDown={(e) => {
-        if (e.altKey || e.ctrlKey || e.metaKey) return;
         const buttons = [...(strip.current?.querySelectorAll("button") ?? [])];
         const index = buttons.indexOf(e.target as HTMLButtonElement);
         if (index < 0) return;
+        if (e.altKey && !e.ctrlKey && !e.metaKey && e.key === "ArrowDown" && onActivateAltDown) {
+          e.preventDefault();
+          e.stopPropagation();
+          onActivateAltDown?.(buttons[index]!);
+          return;
+        }
+        if (e.altKey || e.ctrlKey || e.metaKey) return;
         let next: number;
         if (e.key === "ArrowLeft") next = Math.max(0, index - 1);
         else if (e.key === "ArrowRight") next = Math.min(buttons.length - 1, index + 1);
@@ -248,7 +262,8 @@ function CrumbNav({
         const current = i === segments.length - 1;
         const icon = s.nav?.kind === "dir" && !s.nav.root && !current ? undefined : s.icon;
         return (
-          <Fragment key={i}>
+          // oxlint-disable-next-line react/no-array-index-key -- the `…` crumb and the last directory crumb can share a title; position disambiguates them
+          <Fragment key={`${i}:${s.title}`}>
             {i > 0 && <Icon name="chevron-right" size={12} className={styles.statusSep} />}
             <BarButton
               className={styles.crumbButton}
@@ -353,6 +368,7 @@ export function CodeBreadcrumbs({
   const editorSettings = useProject((s) => s.settings?.editor);
   const language = useDocMeta((s) => s[path]?.language);
   const outline = useOutline((s) => s[path]);
+  const [popup, setPopup] = useState<{ nav: NavSegment; anchor: HTMLElement } | null>(null);
   let chain = useCaretSymbols(path, outline);
   if (!chain) {
     // Not the active editor (another split): its own caret, as of this render.
@@ -372,28 +388,56 @@ export function CodeBreadcrumbs({
       ? monoFontFamily(family, fallbackFont, "var(--font-mono)")
       : undefined;
   const fontSize = editorSettings?.fontSize ?? undefined;
+  const navigate = (item: OutlineItem) =>
+    void editorController().openFile(path, {
+      selection: { line: item.selection_range.start.line, col: item.selection_range.start.col },
+    });
+  // IDEA's breadcrumb chooser lives off the click: right-click or Alt+Down on a
+  // crumb lists its siblings (Navigation Bar only).
+  const chooseSiblings = (i: number, anchor: HTMLElement) => {
+    if (!outline) return;
+    setPopup({ nav: siblingSegment(path, chain, i), anchor });
+  };
+  const crumbMenu = (
+    i: number,
+    crumb: HTMLElement,
+    e: { clientX: number; clientY: number; preventDefault: () => void },
+  ) => {
+    e.preventDefault();
+    if (outline)
+      showContextMenu(e, [{ id: "chooseSymbol", label: "Choose Symbol…", run: () => chooseSiblings(i, crumb) }]);
+  };
   return (
     <BreadcrumbStrip
       trail={JSON.stringify([path, fontFamily, fontSize, ...chain.map((item) => item.name)])}
       style={{ fontFamily, fontSize }}
       className={clsx(styles.codeCrumbs, position === "top" ? styles.codeCrumbsTop : styles.codeCrumbsBottom)}
       aria-label={tx("Code breadcrumbs")}
+      onActivateAltDown={(crumb) => chooseSiblings(Number(crumb.dataset.crumbIndex), crumb)}
     >
       {chain.map((item, i) => (
         <BarButton
-          key={i}
+          key={`${item.name}:${item.detail ?? ""}:${item.selection_range.start.line}:${item.selection_range.start.col}`}
+          data-crumb-index={i}
           className={styles.crumbButton}
           tooltip={item.detail ?? item.name}
           aria-current={i === chain.length - 1 ? "location" : undefined}
-          onClick={() =>
-            void editorController().openFile(path, {
-              selection: { line: item.selection_range.start.line, col: item.selection_range.start.col },
-            })
-          }
+          onClick={() => navigate(item)}
+          onContextMenu={(e) => crumbMenu(i, e.currentTarget, e)}
         >
           <span className={styles.crumbLabel}>{item.name}</span>
         </BarButton>
       ))}
+      {popup && (
+        <NavChildrenPopup
+          key={`${popup.nav.kind}:${popup.nav.path}:${popup.nav.label}`}
+          segment={popup.nav}
+          anchor={popup.anchor}
+          openAbove={position === "bottom"}
+          label={tx("Choose a symbol")}
+          onClose={() => setPopup(null)}
+        />
+      )}
     </BreadcrumbStrip>
   );
 }
@@ -417,6 +461,11 @@ export function CaretStatus() {
 }
 
 const EOL_LABEL: Record<LineEnding, string> = { lf: "LF", crLf: "CRLF", cr: "CR" };
+const EOL_CHOICES: { id: LineEnding; label: string }[] = [
+  { id: "crLf", label: "Windows (\\r\\n)" },
+  { id: "lf", label: "Unix and macOS (\\n)" },
+  { id: "cr", label: "Classic Mac OS (\\r)" },
+];
 
 export function LineEndingStatus() {
   const meta = useActiveMeta();
@@ -454,12 +503,12 @@ export function LineEndingStatus() {
         onClose={() => setOpen(false)}
         anchor={ref}
         placement="top-end"
-        aria-label="Line separator"
-        items={(["lf", "crLf", "cr"] as LineEnding[]).map((le) => ({
-          id: le,
-          label: `${EOL_LABEL[le]} – ${le === "lf" ? "Unix and macOS (\\n)" : le === "crLf" ? "Windows (\\r\\n)" : "Classic Mac OS (\\r)"}`,
-          checked: meta.lineEnding === le ? true : undefined,
-          run: () => choose(le),
+        title="Line Separator"
+        items={EOL_CHOICES.map(({ id, label }) => ({
+          id,
+          label,
+          checked: meta.lineEnding === id ? true : undefined,
+          run: () => choose(id),
         }))}
       />
     </>
@@ -485,12 +534,20 @@ function EncodingPicker({ meta }: { meta: DocMeta }) {
     setTarget(null);
     const model = editorController().manager.get(meta.path);
     if (!model || !(reload ? canReload : canConvert)) return;
-    void editorController()
-      .manager.backend.setEncoding(meta.doc, encoding, reload)
+    const { backend } = editorController().manager;
+    void backend
+      .setEncoding(meta.doc, encoding, reload)
       .then((enc) => {
         model.setMeta({ encoding: enc.encoding, hasBom: enc.hasBom, ...(reload ? {} : { dirty: true }) });
         // Reopening the tab must fetch the re-decoded contents, not the old cache.
         if (reload && isVirtualUri(meta.path)) invalidateVirtualDocument(meta.path);
+        backend.rememberEncoding?.(meta.doc).catch((e: unknown) =>
+          notifications().notify({
+            level: "warning",
+            title: tx("The encoding was not saved to the project settings"),
+            body: e instanceof Error ? e.message : String(e),
+          }),
+        );
       })
       .catch((e: unknown) =>
         notifications().notify({

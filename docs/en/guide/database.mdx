@@ -20,12 +20,23 @@ Open it from **Tools › Database** or **View › Tool Windows › Database**. T
 | ClickHouse | ClickHouse (over HTTP)                                                                       |
 | Snowflake  | Snowflake (over HTTPS, see below)                                                            |
 | SQLite     | SQLite                                                                                       |
+| DuckDB     | DuckDB (official JDBC driver)                                                                |
 
 Presets set the default port and, where needed, SSL (for example Redshift, Neon and Supabase require SSL).
 
-## Custom JDBC drivers
+## DuckDB
 
-Choose **New › Data Source › Custom JDBC**, then **Manage Drivers…**. Add a named profile with the vendor's driver JAR, any dependency JARs, the fully qualified driver class, and an optional JDBC URL template. OpenIDEA reads the driver classes declared in the selected JARs. You can choose a different class or enter its full name manually. Use `{host}`, `{port}`, `{database}` or `{file}` in a template to get matching connection fields, or edit the JDBC URL directly. Only import drivers you trust. OpenIDEA loads their code in a separate process using an installed Java 17 or newer runtime.
+Choose **New › Data Source › DuckDB**. In **Manage Drivers…**, add the [official DuckDB JDBC JAR](https://duckdb.org/docs/stable/clients/java) and save the profile. OpenIDEA fills in the driver class and URL template. A Java 17 or newer runtime is required.
+
+Choose **File** to open an existing database or create a new file, **In memory** for a temporary database that lasts until disconnect, or **JDBC URL** to enter a DuckDB URL directly. To inspect an existing file without changing it, enable **Read-only** in **Options**. The official driver applies this setting when it opens the file.
+
+## JDBC drivers
+
+For presets with a built-in driver, **Driver** defaults to **Built-in** in the **General** tab. Use **Manage Drivers…** to view or add JDBC profiles for that data source type. Select the profile from **Driver** to use JDBC while keeping the source type and icon. **Go to Driver** opens the selected profile and its JAR list. Choose **New › Data Source › Custom JDBC** for databases without a preset, or open its **Manage Drivers…** to see all profiles and change their associated types.
+
+Add a named profile with the vendor's driver JAR, any dependency JARs, the fully qualified driver class, and an optional JDBC URL template. OpenIDEA reads the driver classes declared in the selected JARs. You can choose a different class or enter its full name manually. Use `{host}`, `{port}`, `{database}` or `{file}` in a template to get matching connection fields, or edit the JDBC URL directly. Only import drivers you trust. OpenIDEA loads their code in a separate process using an installed Java 17 or newer runtime.
+
+When switching to JDBC, configure TLS and driver-specific settings in the JDBC URL or **Advanced** properties. If the built-in source used an SSH tunnel, configure an equivalent route for the JDBC connection. JDBC uses auto-commit. Review the built-in startup script, default schema, and time zone, and configure equivalent settings supported by your JDBC driver or database. For enforced read-only access, use a database account with read-only privileges. Enter a separate JDBC password when converting a Snowflake source that used key pair, token, or browser authentication and your JDBC driver needs a password.
 
 Select the profile, enter the vendor's JDBC URL, and use the **User**, **Password**, and **Advanced** fields for credentials and driver properties. The URL and Advanced properties are stored in the data source configuration. Put credentials in the password field to use the existing OS credential store. On Linux, saving a password requires a running Secret Service. You can also enter the password for the current session. The **Read-only** option asks the JDBC driver for a read-only connection. Use a database account with read-only privileges to enforce it. Cancelling a query keeps the session and its temporary tables when the driver stops the statement. If the driver does not respond within three seconds, OpenIDEA closes the session. A submitted statement can still finish on the server. **Test Connection** reports the database product and version. Schema, table and column browsing use JDBC metadata; the SQL console supports auto-commit queries and updates. Vendor-specific DDL, execution plans and table-grid writes are unavailable for custom drivers.
 
@@ -38,7 +49,7 @@ Profiles are reused across projects. If a project file changes a connection's UR
 Click **+** in the Database tool window (or press `⌘N` / `Alt+Insert` there) and choose:
 
 - **Data Source ›** a preset from the list above.
-- **Data Source from File…** to open a SQLite file.
+- **Data Source from File…** to open a DuckDB (`.duckdb`) or SQLite file.
 - **Data Source from URL…** to paste a URL such as `postgresql://user@localhost:5432/db`. Schemes like `mysql://`, `mariadb://`, `sqlserver://`, `oracle://`, `clickhouse://`, `sqlite:path` and `jdbc:` URLs are accepted.
 - **Import from Clipboard** to read a connection URL from the clipboard.
 
@@ -103,8 +114,12 @@ Double-click a table to edit its data, a data source to open its console, and a 
 | Duplicate (data source)                    | `⌘D`             | `Ctrl+D`           |
 | Generate DDL to Clipboard                  | `⌘⌥⇧G`           | `Ctrl+Alt+Shift+G` |
 | Generate DDL to Query Console              | `⌘⌥⇧B`           | `Ctrl+Alt+Shift+B` |
+| Diagrams › Show Diagram                    | `⌘⌥⇧U`           | `Ctrl+Alt+Shift+U` |
+| Diagrams › Show Diagram Popup              | `⌘⌥U`            | `Ctrl+Alt+U`       |
 
 These keys work while the Database tree has focus. The context menu also has **Truncate…**, **Run SQL Script…** (runs every statement of a `.sql` file), **Import Data from File…**, **Go to Referenced Table** (on foreign keys), SQL templates (select, insert, update, delete) and **Remove Data Source…**.
+
+**Diagrams › Show Diagram** opens an ER diagram of the selected tables, or of every table of a selected schema (up to 50), in an editor tab; **Show Diagram Popup** shows it over the window. Columns carry key icons and `UK` (unique key) / `IX` (index) markers, and the foreign keys between the shown tables are drawn as links (dashed when the column is nullable). Drag tables to arrange them (`⌘`/`Ctrl`/`Shift`-click selects several), drag the background or scroll to pan, and zoom with `⌘`/`Ctrl`+wheel or the toolbar. A table's chevron collapses it to its header; its context menu hides it or jumps to it in the Database tree (also double-click, `Enter` or `F4`). The arrangement, hidden and collapsed tables are remembered for that set of tables; **Apply Layout** lays them out again, and **Export to Image…** saves a PNG or SVG.
 
 **Modify Table…** and **New › Table** open a dialog to add, drop or change columns (name, data type, not null, primary key, default) with a live SQL preview. SQLite can only rename or drop existing columns. ClickHouse tables can't be modified this way.
 
@@ -146,7 +161,8 @@ With focus on a result tab or inside a result, use `⇧⌘]` / `⇧⌘[` in the 
 Closing a selected result activates its left neighbor, or its right neighbor if there is no result on the left. When no results remain, **Output** is selected. Closing an inactive result keeps the current selection.
 
 - **Table** or **Chart** view (bar or line, with X/Y columns and an aggregation).
-- Paging with page sizes 10 to 1,000; click the row count to count all rows.
+- Paging with page sizes 10 to 1,000; click the row count to count all rows. Paging forward continues the running query instead of reading the earlier rows again; a result you stop paging for 30 seconds, or close, releases it.
+- A cell longer than 8,192 characters of a read-only query shows its start with a **truncated** tag. Copying it, editing it, opening it in the side panel (**Load whole value**) or exporting the page reads the whole value first. Local filter, search and sort see only the start.
 - **Search in results** and a per-column local filter on the loaded rows.
 - A side panel with **Record**, **Value** and **Aggregates** (count, distinct, nulls, sum, average, median, min, max).
 - JSON values get a JSON editor with **Reformat** and **Open in Window**.

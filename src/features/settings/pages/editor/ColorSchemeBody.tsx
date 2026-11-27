@@ -5,7 +5,16 @@ import { SCHEME_SUBPAGES, languagePageId } from "./colorSchemeMeta";
  * italic / effects editor, and a live preview. Edits are staged in
  * `editor.colorOverrides[scheme][attribute]`; `editor/core` injects them.
  */
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import {
   Button,
   Checkbox,
@@ -37,10 +46,11 @@ import { Row, Select } from "../../components/Form";
 import { useSetting } from "../../components/context";
 import styles from "./Editor.module.css";
 import { executeAction, registerActions } from "@/platform/actions";
-import { call, commands } from "@/platform/ipc";
+import { readDesktopText, writeDesktopText } from "@/platform/desktopFiles";
 import { ask, confirm, showError } from "@/workbench/messages";
+import { useContributions } from "@/workbench/contributions";
 import { parseIcls, SchemeParseError, importScheme, deleteScheme, exportIcls } from "@/platform/icls";
-import { tx, useTx } from "@/platform/i18n";
+import { tx, txPart, useTx } from "@/platform/i18n";
 import { selectPage } from "../../model/staging";
 
 type Overrides = Record<string, Record<string, TextAttributesOverride>>;
@@ -135,6 +145,7 @@ function previewVars(
       k.startsWith("--border-") ||
       k.startsWith("--ansi-") ||
       k.startsWith("--git-") ||
+      k.startsWith("--diff-") ||
       k.startsWith("--wave-") ||
       k.startsWith("--editor-") ||
       k === "--caret"
@@ -183,14 +194,19 @@ function tokenStyle(attr: AttributeDef | undefined): CSSProperties {
   const italic = t === "comment" ? "var(--syn-comment-style)" : attr.defaultItalic ? "italic" : "inherit";
   const bold = attr.defaultBold ? "var(--fw-code-bold, 700)" : "inherit";
   const effect = attr.defaultEffect === "underline" ? "underline" : "none";
+  // An inheriting token shows its parent's values while its own are unset.
+  const v = (suffix: string, fallback?: string) =>
+    attr.inherit
+      ? `var(--syn-${t}${suffix}, var(--syn-${attr.inherit}${suffix}${fallback ? `, ${fallback}` : ""}))`
+      : `var(--syn-${t}${suffix}${fallback ? `, ${fallback}` : ""})`;
   return {
-    color: `var(--syn-${t})`,
-    fontWeight: `var(--syn-${t}-bold, ${bold})` as CSSProperties["fontWeight"],
-    fontStyle: `var(--syn-${t}-italic, ${italic})`,
-    backgroundColor: `var(--syn-${t}-bg, transparent)`,
-    textDecoration: `var(--syn-${t}-effect, ${effect})`,
+    color: v(""),
+    fontWeight: v("-bold", bold) as CSSProperties["fontWeight"],
+    fontStyle: v("-italic", italic),
+    backgroundColor: v("-bg", "transparent"),
+    textDecoration: v("-effect", effect),
     // WebKit takes a decoration with a style or colour only through the prefixed property.
-    ...({ WebkitTextDecoration: `var(--syn-${t}-effect, ${effect})` } as CSSProperties),
+    ...({ WebkitTextDecoration: v("-effect", effect) } as CSSProperties),
   };
 }
 
@@ -208,6 +224,7 @@ function revealPreviewAttr(attrId: string, ids: Set<string>, reveal: (id: string
 }
 
 type Seg = [string, string?];
+
 interface CodeSample {
   code: Seg[][];
   /** Line shown with the caret-row background. */
@@ -372,6 +389,17 @@ const SAMPLES: Record<string, CodeSample> = {
         ["predefined", "predefined"],
         [", ", "operator"],
         ["local", "identifier"],
+        [", ", "operator"],
+        ["true", "literalKeyword"],
+        [")", "operator"],
+      ],
+      [
+        ["    ", "text"],
+        ["String", "predefinedType"],
+        [".", "operator"],
+        ["format", "predefinedFunction"],
+        ["(", "operator"],
+        ["null", "literalKeyword"],
         [")", "operator"],
       ],
       [
@@ -879,6 +907,98 @@ const SAMPLES: Record<string, CodeSample> = {
       [["}", "go.operator"]],
     ],
   },
+  "JavaScript and TypeScript": {
+    code: [
+      [["// TypeScript", "javascript.lineComment"]],
+      [
+        ["const ", "javascript.keyword"],
+        ["KINDS", "javascript.globalVariable"],
+        [" = [", "javascript.operator"],
+        ['"single', "javascript.string"],
+        ["\\n", "javascript.escape"],
+        ['"', "javascript.string"],
+        ["];", "javascript.operator"],
+      ],
+      [
+        ["type ", "javascript.keyword"],
+        ["Pair", "javascript.typeAlias"],
+        ["<", "javascript.operator"],
+        ["T", "javascript.typeParameter"],
+        ["> = [", "javascript.operator"],
+        ["T", "javascript.typeParameter"],
+        [", ", "javascript.operator"],
+        ["T", "javascript.typeParameter"],
+        ["];", "javascript.operator"],
+      ],
+      [
+        ["@Component", "javascript.decorator"],
+        ["({ ", "javascript.operator"],
+        ["selector", "javascript.field"],
+        [": ", "javascript.operator"],
+        ['"app-quiz"', "javascript.string"],
+        [" })", "javascript.operator"],
+      ],
+      [
+        ["export class ", "javascript.keyword"],
+        ["Quiz", "javascript.className"],
+        [" implements ", "javascript.keyword"],
+        ["Named", "javascript.interface"],
+        [" {", "javascript.operator"],
+      ],
+      [
+        ["  ", "text"],
+        ["store", "javascript.field"],
+        [" = ", "javascript.operator"],
+        ["inject", "javascript.globalFunction"],
+        ["(", "javascript.operator"],
+        ["Store", "javascript.className"],
+        [");", "javascript.operator"],
+      ],
+      [
+        ["  static ", "javascript.keyword"],
+        ["empty", "javascript.staticMethod"],
+        ["() { ", "javascript.operator"],
+        ["return new ", "javascript.keyword"],
+        ["Quiz", "javascript.className"],
+        ["(); }", "javascript.operator"],
+      ],
+      [
+        ["  ", "text"],
+        ["count", "javascript.instanceMethod"],
+        ["(", "javascript.operator"],
+        ["n", "javascript.parameter"],
+        [": ", "javascript.operator"],
+        ["number", "javascript.keyword"],
+        [") {", "javascript.operator"],
+      ],
+      [
+        ["    const ", "javascript.keyword"],
+        ["total", "javascript.identifier"],
+        [" = ", "javascript.operator"],
+        ["n", "javascript.parameter"],
+        [" + ", "javascript.operator"],
+        ["KINDS", "javascript.globalVariable"],
+        [".", "javascript.operator"],
+        ["length", "javascript.field"],
+        [" * ", "javascript.operator"],
+        ["2", "javascript.number"],
+        [";", "javascript.operator"],
+      ],
+      [
+        ["    return ", "javascript.keyword"],
+        ["this", "javascript.keyword"],
+        [".", "javascript.operator"],
+        ["store", "javascript.field"],
+        [".", "javascript.operator"],
+        ["add", "javascript.instanceMethod"],
+        ["(", "javascript.operator"],
+        ["total", "javascript.identifier"],
+        [");", "javascript.operator"],
+      ],
+      [["  }", "javascript.operator"]],
+      [["}", "javascript.operator"]],
+    ],
+  },
   Kotlin: {
     code: [
       [["// Kotlin", "kotlin.lineComment"]],
@@ -890,7 +1010,7 @@ const SAMPLES: Record<string, CodeSample> = {
         ["val", "kotlin.keyword"],
         [" name", "kotlin.parameter"],
         [": ", "text"],
-        ["String", "kotlin.className"],
+        ["String", "kotlin.predefinedType"],
         [")", "kotlin.operator"],
         [" {", "kotlin.operator"],
       ],
@@ -921,9 +1041,24 @@ const SAMPLES: Record<string, CodeSample> = {
       ],
       [
         ["    ", "text"],
-        ["println", "kotlin.predefined"],
+        ["println", "kotlin.predefinedFunction"],
         ["(", "kotlin.operator"],
         ["name", "kotlin.identifier"],
+        [" ?: ", "kotlin.operator"],
+        ["null", "kotlin.literalKeyword"],
+        [")", "kotlin.operator"],
+      ],
+      [
+        ["    ", "text"],
+        ["log", "kotlin.packageCall"],
+        ["(", "kotlin.operator"],
+        ["name", "kotlin.identifier"],
+        [".", "kotlin.operator"],
+        ["shout", "kotlin.extensionCall"],
+        ["(), ", "kotlin.operator"],
+        ["Mood", "kotlin.className"],
+        [".", "kotlin.operator"],
+        ["HAPPY", "kotlin.enumEntry"],
         [")", "kotlin.operator"],
       ],
       [["}", "kotlin.operator"]],
@@ -993,6 +1128,90 @@ const SAMPLES: Record<string, CodeSample> = {
       ],
       [["    }", "csharp.operator"]],
       [["}", "csharp.operator"]],
+    ],
+  },
+  "C/C++": {
+    code: [
+      [
+        ["#include ", "cpp.keyword"],
+        ["<iostream>", "cpp.string"],
+      ],
+      [["// Greets the user", "cpp.lineComment"]],
+      [
+        ["#define ", "cpp.keyword"],
+        ["LOG", "cpp.metadata"],
+        ["(msg) ", "cpp.operator"],
+        ["std", "cpp.packageReference"],
+        ["::", "cpp.operator"],
+        ["cout", "cpp.predefined"],
+        [" << msg", "cpp.operator"],
+      ],
+      [],
+      [
+        ["namespace ", "cpp.keyword"],
+        ["app", "cpp.packageReference"],
+        [" {", "cpp.operator"],
+      ],
+      [
+        ["constexpr ", "cpp.keyword"],
+        ["std", "cpp.packageReference"],
+        ["::", "cpp.operator"],
+        ["size_t", "cpp.predefinedType"],
+        [" MaxRetries", "cpp.constant"],
+        [" = ", "cpp.operator"],
+        ["3", "cpp.number"],
+        [";", "cpp.operator"],
+      ],
+      [],
+      [
+        ["class ", "cpp.keyword"],
+        ["Greeter", "cpp.className"],
+        [" {", "cpp.operator"],
+      ],
+      [["public:", "cpp.keyword"]],
+      [
+        ["    void ", "cpp.keyword"],
+        ["greet", "cpp.functionDeclaration"],
+        ["(", "cpp.operator"],
+        ["int ", "cpp.keyword"],
+        ["count", "cpp.parameter"],
+        [") ", "cpp.operator"],
+        ["const", "cpp.keyword"],
+        [" {", "cpp.operator"],
+      ],
+      [
+        ["        ", "text"],
+        ["LOG", "cpp.metadata"],
+        ["(", "cpp.operator"],
+        ['"Hello, ', "cpp.string"],
+        ["\\n", "cpp.escape"],
+        ['"', "cpp.string"],
+        [");", "cpp.operator"],
+      ],
+      [
+        ["        ", "text"],
+        ["format", "cpp.functionCall"],
+        ["(", "cpp.operator"],
+        ["name_", "cpp.field"],
+        [", ", "cpp.operator"],
+        ["count", "cpp.parameter"],
+        [", ", "cpp.operator"],
+        ["nullptr", "cpp.literalKeyword"],
+        [");", "cpp.operator"],
+      ],
+      [["    }", "cpp.operator"]],
+      [],
+      [["private:", "cpp.keyword"]],
+      [
+        ["    ", "text"],
+        ["std", "cpp.packageReference"],
+        ["::", "cpp.operator"],
+        ["string", "cpp.predefinedType"],
+        [" name_", "cpp.field"],
+        [";", "cpp.operator"],
+      ],
+      [["};", "cpp.operator"]],
+      [["}", "cpp.operator"]],
     ],
   },
   PHP: {
@@ -1103,7 +1322,15 @@ function AttributeEditor({
         inherited={inherited.background}
         onChange={attr.bg || (attr.token && !attr.italicOnly) ? (c) => set({ background: c }) : undefined}
       />
-      {!attr.italicOnly && (
+      {attr.stripe && (
+        <ColorRow
+          label={tx("Error stripe mark")}
+          value={v.errorStripeColor}
+          inherited={inherited.errorStripeColor}
+          onChange={(c) => set({ errorStripeColor: c })}
+        />
+      )}
+      {!attr.italicOnly && !attr.stripe && (
         <>
           <ColorRow
             label="Effects"
@@ -1175,7 +1402,7 @@ function ColorInput({
       <Input
         mono
         className={styles.swatchInput}
-        aria-label={tx`${label} hex`}
+        aria-label={tx`${txPart(label)} hex`}
         value={draft ?? value}
         invalid={draft !== null && !HEX_COLOR.test(draft)}
         onChange={(e) => {
@@ -1321,11 +1548,16 @@ function GitPreview({
         <div className={styles.gitSectionTitle}>{tx("Editor inline blame")}</div>
         <div className={styles.gitEditor}>
           {GIT_EDITOR_LINES.map((line, i) => (
-            <div key={i} className={`${styles.previewLine} ${line.blame ? styles.previewCaretLine : ""}`}>
+            <div
+              // oxlint-disable-next-line react/no-array-index-key -- sample lines repeat; position is the identity
+              key={i}
+              className={`${styles.previewLine} ${line.blame ? styles.previewCaretLine : ""}`}
+            >
               <span className={styles.previewGutter}>{i + 1}</span>
               <code>
                 {line.segs.map(([text, attrId], j) => (
                   <span
+                    // oxlint-disable-next-line react/no-array-index-key -- coloured segments repeat; position is the identity
                     key={j}
                     style={tokenStyle(attrId ? A(attrId) : undefined)}
                     className={attrId ? styles.clickable : undefined}
@@ -1363,6 +1595,7 @@ function GitPreview({
                 <span className={styles.gitSuffix}>
                   {suffixOf(root).map((s, j) => (
                     <span
+                      // oxlint-disable-next-line react/no-array-index-key -- suffix segments repeat; position is the identity
                       key={j}
                       className={`${styles.gitSuffixSegment} ${styles.clickable}`}
                       style={tokenStyle(A(s.attr))}
@@ -1381,6 +1614,93 @@ function GitPreview({
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * A static three-pane merge view (left parent / result / right parent) rendered through the
+ * `mergeSchemePreview` editor kind — the same real CodeMirror diff decorations a merge view
+ * uses, so the colours here are exactly the colours users get. Clicking a coloured line
+ * selects its scheme attribute; the long unchanged stretch shows the folded wave separator.
+ * Heads stay the same length so one fold range fits all panes, and every difference is
+ * visible without scrolling: the heads carry the modification and the deletion, the result
+ * gains `return value` right after the fold (an insertion isolated by shared lines, since
+ * an adjacent delete+insert or a document-edge difference collapses into a modification).
+ */
+const DIFF_HEAD_A = ["bar(123)", "def foo(self):", "    # Left changes", "    pass"];
+const DIFF_HEAD_RESULT = ["class MyClass", "value = 123", "def foo(self):", "    pass"];
+const DIFF_HEAD_B = ["class MyClass", "value = 123", "def foo(self):", "    pass"];
+const DIFF_UNCHANGED = Array.from({ length: 16 }, (_, i) => `        # unchanged context ${i + 1}`);
+const DIFF_PARENT_A = [
+  ...DIFF_HEAD_A,
+  ...DIFF_UNCHANGED,
+  "    print('mid')",
+  "    print('end')",
+  "def bar(self, a, b):",
+  "    print a",
+  "    print b",
+].join("\n");
+const DIFF_RESULT = [
+  ...DIFF_HEAD_RESULT,
+  ...DIFF_UNCHANGED,
+  "    print('mid')",
+  "    return value",
+  "    print('end')",
+  "def bar(self, a, b):",
+  "    print a",
+  "    print b",
+].join("\n");
+const DIFF_PARENT_B = [
+  ...DIFF_HEAD_B,
+  ...DIFF_UNCHANGED,
+  "    print('mid')",
+  "    print('end')",
+  "def bar(self, a, b):",
+  "    print a",
+  "    print b",
+].join("\n");
+function diffMergeInput(): import("@/workbench/contributions").EditorInput {
+  return {
+    kind: "mergeSchemePreview",
+    key: "color-scheme-diff-preview",
+    data: {
+      path: "untitled:diff-merge-preview.py",
+      left: DIFF_PARENT_A,
+      result: DIFF_RESULT,
+      right: DIFF_PARENT_B,
+      labels: [tx("Left"), tx("Result"), tx("Right")],
+      attrs: {
+        inserted: "diffInserted",
+        deleted: "diffDeleted",
+        modified: "diffChanged",
+        wave: "diffSeparatorWave",
+      },
+      fold: { from: 5, to: 20, label: tx("16 unchanged lines") },
+    },
+  };
+}
+
+function DiffMergePreview({
+  vars,
+  ids,
+  reveal,
+}: {
+  vars: CSSProperties;
+  ids: Set<string>;
+  reveal: (attrId: string) => void;
+}) {
+  const previewViewer = useContributions((s) => s.editorKinds.get("mergeSchemePreview"));
+  const input = useMemo(() => diffMergeInput(), []);
+  const onClick = (e: MouseEvent<HTMLDivElement>) => {
+    const attr = (e.target as HTMLElement).closest<HTMLElement>("[data-diattr]")?.dataset.diattr;
+    if (attr) revealPreviewAttr(attr, ids, reveal);
+  };
+  return (
+    <div className={styles.diffPreview} style={vars} aria-label={tx("Color scheme preview")} onClick={onClick}>
+      <Suspense fallback={<div className={styles.diffLoading}>{tx("Loading preview…")}</div>}>
+        {previewViewer && <previewViewer.component input={input} />}
+      </Suspense>
     </div>
   );
 }
@@ -1519,7 +1839,7 @@ export function ColorSchemePage({
             .split(/[\\/]/)
             .at(-1)
             ?.replace(/\.[^.]+$/, "") || "Imported scheme";
-        const parsed = parseIcls(await call(commands.fsReadText(path)), fallbackName);
+        const parsed = parseIcls(await readDesktopText(path), fallbackName);
         let overwrite = false;
         if (schemes.some((s) => s.name === parsed.scheme.name)) {
           const canOverwrite = Object.values(customs).some((s) => s.name === parsed.scheme.name);
@@ -1550,10 +1870,7 @@ export function ColorSchemePage({
             filters: [{ name: tx("IntelliJ Color Scheme"), extensions: ["icls"] }],
           }));
         if (!path) return;
-        const bytes = Array.from(new TextEncoder().encode(exportIcls(id, customs, mine)));
-        // The save dialog already confirmed replacing an existing file.
-        await call(commands.fsDelete(path)).catch(() => {});
-        await call(commands.fsCreateFileBytes(path, bytes));
+        await writeDesktopText(path, exportIcls(id, customs, mine));
         setReport(tx("Scheme exported."));
       },
       delete: async () => {
@@ -1637,7 +1954,7 @@ export function ColorSchemePage({
         </div>
       )}
       {scheme === "theme-default" && (
-        <div className={styles.note}>{tx`Follows the IDE theme: currently ${schemeName}.`}</div>
+        <div className={styles.note}>{tx`Follows the IDE theme: currently ${txPart(schemeName)}.`}</div>
       )}
       {redGreen && (id === "dark" || id === "light") && (
         <div className={styles.note}>
@@ -1701,10 +2018,16 @@ export function ColorSchemePage({
           <SplitPanel defaultSize="38%" minSize="88px">
             {scopes[0] === "Git" ? (
               <GitPreview vars={vars} ids={ids} reveal={reveal} />
+            ) : scopes[0] === "Diff & Merge" ? (
+              <DiffMergePreview vars={vars} ids={ids} reveal={reveal} />
             ) : (
               <pre className={styles.schemePreview} style={vars} aria-label={tx("Color scheme preview")}>
                 {sample.code.map((line, i) => (
-                  <div key={i} className={`${styles.previewLine} ${i === sample.caret ? styles.previewCaretLine : ""}`}>
+                  <div
+                    // oxlint-disable-next-line react/no-array-index-key -- sample lines repeat; position is the identity
+                    key={i}
+                    className={`${styles.previewLine} ${i === sample.caret ? styles.previewCaretLine : ""}`}
+                  >
                     <span className={styles.previewGutter}>{i + 1}</span>
                     <code>
                       {line.map(([text, attrId], j) => {
@@ -1712,6 +2035,7 @@ export function ColorSchemePage({
                         const inPage = attr !== undefined && ids.has(attrId!);
                         return (
                           <span
+                            // oxlint-disable-next-line react/no-array-index-key -- coloured segments repeat; position is the identity
                             key={j}
                             style={tokenStyle(attr)}
                             className={attr ? styles.clickable : undefined}

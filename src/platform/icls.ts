@@ -10,6 +10,7 @@ import {
 } from "./colorScheme";
 import { isBuiltinTheme, themeKind } from "./themes";
 import type { CustomColorScheme, CustomColorSchemes, TextAttributesOverride } from "./editorSettings";
+import { iclsColor } from "./iclsColor";
 import { DARCULA_ATTRIBUTES } from "./iclsDarcula";
 
 // Many language keys share the editor's language-default tokens.
@@ -39,6 +40,8 @@ const ATTRIBUTE_NAMES: Record<string, string> = {
   DEFAULT_DOC_COMMENT_TAG: "docCommentTag",
   DEFAULT_DOC_COMMENT_TAG_VALUE: "docCommentTagValue",
   DEFAULT_DOC_MARKUP: "docCommentMarkup",
+  // Java's annotation key outranks the default it falls back to.
+  ANNOTATION_NAME_ATTRIBUTES: "metadata",
   DEFAULT_METADATA: "metadata",
   DEFAULT_OPERATION_SIGN: "operator",
   DEFAULT_PARENTHS: "operator",
@@ -116,7 +119,9 @@ Object.assign(ATTRIBUTE_NAMES, {
   KOTLIN_MUTABLE_VARIABLE: "kotlin.identifier",
   KOTLIN_PACKAGE_PROPERTY: "kotlin.field",
   KOTLIN_SYNTHETIC_EXTENSION_PROPERTY: "kotlin.field",
-  KOTLIN_EXTENSION_FUNCTION_CALL: "kotlin.functionCall",
+  KOTLIN_EXTENSION_FUNCTION_CALL: "kotlin.extensionCall",
+  KOTLIN_PACKAGE_FUNCTION_CALL: "kotlin.packageCall",
+  KOTLIN_ENUM_ENTRY: "kotlin.enumEntry",
   KOTLIN_NAMED_ARGUMENT: "kotlin.parameter",
   KOTLIN_OBJECT: "kotlin.className",
   JAVA_DOC_TAG: "java.docCommentTag",
@@ -125,6 +130,12 @@ Object.assign(ATTRIBUTE_NAMES, {
   KDOC_TAG_NAME: "kotlin.docCommentTag",
   KDOC_LINK: "kotlin.docCommentTagValue",
   CLASS_NAME_ATTRIBUTES: "className",
+  // IDEA DiffColors (Diff & Merge page): Import/export the four change types by their
+  // exchange names, so a scheme exported here carries the same keys IDEA reads.
+  DIFF_MODIFIED: "diffChanged",
+  DIFF_INSERTED: "diffInserted",
+  DIFF_DELETED: "diffDeleted",
+  DIFF_CONFLICT: "diffConflict",
   PHP_KEYWORD: "php.keyword",
   PHP_VAR: "php.identifier",
   PHP_PARAMETER: "php.parameter",
@@ -188,7 +199,8 @@ Object.assign(ATTRIBUTE_NAMES, {
   "PY.OPERATION_SIGN": "pyOperationSign",
 });
 
-// WebStorm's JavaScript keys; TypeScript repeats them with a TS. prefix. Language Defaults serve both.
+// WebStorm's JavaScript keys; TypeScript repeats them with a TS. prefix. Both colour the JavaScript and
+// TypeScript page.
 const SCRIPT_KEYS: Record<string, string> = {
   KEYWORD: "keyword",
   NUMBER: "number",
@@ -210,24 +222,25 @@ const SCRIPT_KEYS: Record<string, string> = {
   "EXPORTED.VARIABLE": "globalVariable",
   INSTANCE_MEMBER_VARIABLE: "field",
   STATIC_MEMBER_VARIABLE: "constant",
-  GLOBAL_FUNCTION: "functionDeclaration",
+  GLOBAL_FUNCTION: "globalFunction",
   LOCAL_FUNCTION: "functionDeclaration",
   EXPORTED_FUNCTION: "functionDeclaration",
-  INSTANCE_MEMBER_FUNCTION: "functionDeclaration",
-  STATIC_MEMBER_FUNCTION: "functionDeclaration",
+  INSTANCE_MEMBER_FUNCTION: "instanceMethod",
+  STATIC_MEMBER_FUNCTION: "staticMethod",
   CLASS: "className",
   EXPORTED_CLASS: "className",
-  INTERFACE: "className",
-  "TYPE.ALIAS": "className",
-  TYPE_PARAMETER: "className",
-  DECORATOR: "metadata",
+  INTERFACE: "interface",
+  "TYPE.ALIAS": "typeAlias",
+  TYPE_PARAMETER: "typeParameter",
+  DECORATOR: "decorator",
   OPERATION_SIGN: "operator",
 };
 // WebStorm colours a function's calls with its declaration's key.
 const ALSO_CALLS = new Set<string>();
 for (const prefix of ["JS.", "TS."])
   for (const [name, id] of Object.entries(SCRIPT_KEYS)) {
-    ATTRIBUTE_NAMES[prefix + name] = id;
+    // Bad character and RegExp have no page of their own here.
+    ATTRIBUTE_NAMES[prefix + name] = ATTRIBUTES.some((a) => a.id === `javascript.${id}`) ? `javascript.${id}` : id;
     if (id === "functionDeclaration") ALSO_CALLS.add(prefix + name);
   }
 
@@ -245,6 +258,7 @@ const COLOR_NAMES: Record<string, [string, "foreground" | "background"]> = {
   RIGHT_MARGIN_COLOR: ["rightMargin", "foreground"],
   METHOD_SEPARATORS_COLOR: ["methodSeparator", "foreground"],
   CONSOLE_BACKGROUND_KEY: ["consoleBackground", "background"],
+  DIFF_SEPARATOR_WAVE: ["diffSeparatorWave", "foreground"],
 };
 
 Object.assign(ATTRIBUTE_NAMES, {
@@ -285,17 +299,22 @@ for (const id of [
 // its fallback's. TypeScript keys win over JavaScript (TS.* falls back to JS.*), then Python, then the
 // shared defaults; within a language, the key listed first above. DEFAULT_DOT, _COMMA and _SEMICOLON are
 // not mapped: the one punctuation colour here would spread them to every brace and operator.
+/** ANNOTATION_NAME_ATTRIBUTES as IntelliJ's bundled Default and Darcula schemes set it. */
+const PARENT_ANNOTATIONS: Record<string, string> = { Default: "#808000", Darcula: "#bbb529" };
 const KEY_ORDER = new Map(Object.keys(ATTRIBUTE_NAMES).map((name, i) => [name, i]));
 const LANGUAGE_PRECEDENCE = ["TS.", "JS.", "PY."];
 const precedence = (name: string) => {
   const language = LANGUAGE_PRECEDENCE.findIndex((prefix) => name.startsWith(prefix));
   return (language < 0 ? LANGUAGE_PRECEDENCE.length : language) * KEY_ORDER.size + KEY_ORDER.get(name)!;
 };
+// Keys that also colour another attribute as its fallback. TypeScript's interface falls back to the
+// language default Interface name, as it does in WebStorm; an explicit JS./TS.INTERFACE outranks it.
+const ALSO_TARGETS: Record<string, string> = { DEFAULT_INTERFACE_NAME: "javascript.interface" };
 const targets = (name: string): string[] =>
   Object.hasOwn(ATTRIBUTE_NAMES, name)
     ? ALSO_CALLS.has(name)
-      ? [ATTRIBUTE_NAMES[name]!, "functionCall"]
-      : [ATTRIBUTE_NAMES[name]!]
+      ? [ATTRIBUTE_NAMES[name]!, "javascript.functionCall"]
+      : [ATTRIBUTE_NAMES[name]!, ...(Object.hasOwn(ALSO_TARGETS, name) ? [ALSO_TARGETS[name]!] : [])]
     : [];
 
 // IntelliJ's EFFECT_TYPE codes. The box (0) and faded text (6) have no counterpart here; the bold and the
@@ -313,8 +332,11 @@ const EFFECT_CODES: Partial<Record<NonNullable<TextAttributesOverride["effect"]>
   strikeout: "3",
 };
 const children = (el: Element, tag: string) => Array.from(el.children).filter((e) => e.tagName === tag);
-const color = (v: string | null): string | undefined =>
-  v && /^[0-9a-f]{1,6}$/i.test(v) ? `#${v.padStart(6, "0").toLowerCase()}` : undefined;
+// Schemes here have no alpha: an RRGGBBAA value is left out, as before.
+const color = (v: string | null): string | undefined => {
+  const c = iclsColor(v);
+  return c?.length === 7 ? c : undefined;
+};
 
 function attributeEntries(section: Element): Element[] {
   const entries = children(section, "option");
@@ -432,13 +454,17 @@ export function parseIcls(
                   ? "background"
                   : name === "EFFECT_COLOR"
                     ? "effectColor"
-                    : undefined;
+                    : name === "ERROR_STRIPE_COLOR"
+                      ? "errorStripeColor"
+                      : undefined;
             const supported =
               field === "foreground"
                 ? !!attr.fg
                 : field === "background"
                   ? !!attr.bg || !!attr.token
-                  : !!attr.effect || !!attr.token;
+                  : field === "errorStripeColor"
+                    ? !!attr.stripe
+                    : !!attr.effect || !!attr.token;
             if (field && c && supported) {
               merge(id, { [field]: c });
               applied++;
@@ -466,6 +492,10 @@ export function parseIcls(
     const own = new Set([...entries.keys()].flatMap((name) => (name ? targets(name) : [])));
     for (const [id, value] of Object.entries(DARCULA_ATTRIBUTES)) if (!own.has(id)) attributes[id] ??= { ...value };
   }
+  // Both bundled parents set Java's annotation key itself, so a file that leaves it out shows the parent's
+  // colour there, not its own DEFAULT_METADATA.
+  if (Object.hasOwn(PARENT_ANNOTATIONS, parentName) && !entries.has("ANNOTATION_NAME_ATTRIBUTES"))
+    attributes.metadata = { bold: false, italic: false, foreground: PARENT_ANNOTATIONS[parentName]! };
   const bg = attributes.text?.background;
   const rgb = bg ? [1, 3, 5].map((i) => parseInt(bg.slice(i, i + 2), 16)) : [255, 255, 255];
   const dark = rgb[0]! * 0.299 + rgb[1]! * 0.587 + rgb[2]! * 0.114 < 128;
@@ -545,6 +575,7 @@ export function exportIcls(
     ...(attr.fg && isHexColor(tokens.get(attr.fg)) ? { foreground: tokens.get(attr.fg) } : {}),
     ...(attr.bg && isHexColor(tokens.get(attr.bg)) ? { background: tokens.get(attr.bg) } : {}),
     ...(attr.effect && isHexColor(tokens.get(attr.effect)) ? { effectColor: tokens.get(attr.effect) } : {}),
+    ...(attr.stripe && isHexColor(tokens.get(attr.stripe)) ? { errorStripeColor: tokens.get(attr.stripe) } : {}),
     ...tokenEffect(attr),
     ...custom?.attributes[attr.id],
     ...overrides[attr.id],
@@ -558,7 +589,8 @@ export function exportIcls(
   }
   const text = values(ATTRIBUTES.find((a) => a.id === "text")!);
   for (const attr of ATTRIBUTES) {
-    if (attr.language && !custom?.attributes[attr.id] && !overrides[attr.id]) continue;
+    // Language and inheriting attributes left unset follow another key, as they do in IntelliJ.
+    if ((attr.language || attr.inherit) && !custom?.attributes[attr.id] && !overrides[attr.id]) continue;
     const key = Object.keys(ATTRIBUTE_NAMES).find((key) => ATTRIBUTE_NAMES[key] === attr.id);
     if (!key) continue;
     const v = values(attr);
@@ -570,6 +602,7 @@ export function exportIcls(
       ["FOREGROUND", "foreground"],
       ["BACKGROUND", "background"],
       ["EFFECT_COLOR", "effectColor"],
+      ["ERROR_STRIPE_COLOR", "errorStripeColor"],
     ] as const)
       if (isHexColor(v[field])) opts.push(`<option name="${key}" value="${exportColor(v[field]!)}" />`);
     if (attr.token) opts.push(`<option name="FONT_TYPE" value="${(v.bold ? 1 : 0) + (v.italic ? 2 : 0)}" />`);

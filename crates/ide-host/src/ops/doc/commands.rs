@@ -1,16 +1,13 @@
 use crate::Host;
+use crate::ops::blocking;
+use crate::project::Project;
 use ide_command::command;
-use ide_core::{DocId, IdeError, IdeResult, OutlineItem, Range};
+use ide_core::{DocId, IdeEvent, IdeResult, OutlineItem, Range, TextEdit};
 use ide_language::{FoldRange, SyntaxHighlights};
 use ide_text::LineEnding;
-use ide_workspace::{DocumentEncoding, DocumentInfo, DocumentLanguage, HistoryEntry};
-use std::path::PathBuf;
-
-/// Runs blocking work (disk I/O, parsing, large copies) on the blocking pool,
-/// keeping it off the main thread and the async runtime's workers.
-pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> IdeResult<T> + Send + 'static) -> IdeResult<T> {
-    tokio::task::spawn_blocking(f).await.map_err(|e| IdeError::internal(e.to_string()))?
-}
+use ide_workspace::settings::SettingsScope;
+use ide_workspace::{DocumentEncoding, DocumentInfo, DocumentLanguage, FileDefaults, HistoryEntry};
+use std::path::{Path, PathBuf};
 
 /// Opens a read-only virtual document (see `lsp_virtual_document`) as an
 /// editor buffer, so syntax features and language-server requests work in it.
@@ -71,6 +68,49 @@ pub async fn doc_set_encoding(
     host.blocking(move || project.documents.set_encoding(doc, &encoding, reload)).await
 }
 
+/// Keeps the encoding the user chose for a project file in the project's File Encodings
+/// mappings, so the file opens in it again. A converted document is kept once it is saved:
+/// until then its file is still in the old encoding. Nothing is kept for a document without
+/// a file in the project.
+#[command(trust = always)]
+pub async fn doc_remember_encoding(host: &Host, window: &str, doc: DocId) -> IdeResult<()> {
+    let project = host.project(window)?;
+    blocking(move || {
+        let info = project.documents.snapshot(doc)?;
+        if info.uri.is_some() || project.documents.keep_encoding_when_saved(doc)? {
+            return Ok(());
+        }
+        remember_encoding(&project, &info.path, &info.encoding)
+    })
+    .await
+}
+
+/// Keeps the encodings of the converted documents a save has just written.
+pub(super) fn remember_saved_encodings(project: &Project) {
+    for (path, encoding) in project.documents.take_saved_encodings() {
+        if let Err(e) = remember_encoding(project, &path, &encoding) {
+            tracing::warn!("the encoding of {} was not kept: {e}", path.display());
+        }
+    }
+}
+
+fn remember_encoding(project: &Project, path: &Path, encoding: &str) -> IdeResult<()> {
+    const MAPPINGS: &str = "editor.encodings.mappings";
+    if project.light {
+        return Ok(());
+    }
+    let Some(file) = ide_workspace::file_defaults::mapping_key(&project.root, path) else {
+        return Ok(());
+    };
+    if project.settings.effective().editor.encodings.mappings.get(&file).is_some_and(|kept| kept == encoding) {
+        return Ok(());
+    }
+    let settings = project.settings.set_map_entry(SettingsScope::Project, MAPPINGS, &file, encoding.into())?;
+    project.documents.set_file_defaults(FileDefaults::from_settings(&settings, Some(&project.root)));
+    project.sink.emit(IdeEvent::SettingsChanged { key: MAPPINGS.into() });
+    Ok(())
+}
+
 #[command(trust = always)]
 pub async fn doc_set_bom(host: &Host, window: &str, doc: DocId, has_bom: bool) -> IdeResult<DocumentEncoding> {
     // Adds or removes the BOM on a UTF-8 document; the change is written on save.
@@ -86,8 +126,8 @@ pub async fn doc_set_line_ending(host: &Host, window: &str, doc: DocId, line_end
 
 /// Structure view: LSP document symbols when available (with tree-sitter
 /// visibility and type-alias kinds), tree-sitter otherwise.
-/// Tree-sitter answers come from the per-document tree cache (incremental
-/// re-parse); large documents get no syntax structure.
+/// Normal files reuse the per-document tree cache. Large Markdown files use
+/// the syntax parser's size limit for heading outlines.
 #[command(trust = always)]
 pub async fn doc_outline(host: &Host, window: &str, doc: DocId) -> IdeResult<Vec<OutlineItem>> {
     let project = host.project(window)?;
@@ -123,7 +163,7 @@ pub async fn doc_outline(host: &Host, window: &str, doc: DocId) -> IdeResult<Vec
                 }
                 items
             }
-            None if snap.large => Vec::new(),
+            None if snap.large && snap.language.as_str() != "markdown" => Vec::new(),
             None => syntax(),
         })
     })
@@ -195,6 +235,29 @@ pub async fn doc_python_facts(host: &Host, window: &str, doc: DocId) -> IdeResul
     blocking(move || Ok(syntax.python_facts(&snap.language, &snap.text))).await
 }
 
+/// Rearrange Code: the edits that put the document's class members in arrangement order (Python
+/// for now); none when they already are or the language has no arrangement.
+#[command(trust = always)]
+pub async fn doc_rearrange(host: &Host, window: &str, doc: DocId) -> IdeResult<Vec<TextEdit>> {
+    let project = host.project(window)?;
+    let syntax = host.syntax();
+    let snap = project.documents.text_snapshot(doc)?;
+    blocking(move || {
+        let Some(rearranged) = syntax.rearranged(&snap.language, &snap.text) else { return Ok(Vec::new()) };
+        let text = ide_text::Document::new(&snap.text);
+        Ok(text
+            .diff(&rearranged)
+            .changes
+            .into_iter()
+            .map(|c| TextEdit {
+                range: Range::new(text.offset_to_pos(c.from), text.offset_to_pos(c.to)),
+                new_text: c.insert,
+            })
+            .collect())
+    })
+    .await
+}
+
 /// Extend Selection (⌥↑): syntax ranges around `offset`, innermost first.
 /// Large documents fall back to word / line / document ranges.
 #[command(trust = always)]
@@ -244,6 +307,8 @@ ide_command::domain!(
     doc_open_virtual,
     doc_outline,
     doc_python_facts,
+    doc_rearrange,
+    doc_remember_encoding,
     doc_selection_ranges,
     doc_set_bom,
     doc_set_encoding,

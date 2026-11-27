@@ -153,7 +153,8 @@ for line in sys.stdin:
         cursor = request['params']['cursor']
         model = 'one' if cursor is None else 'two'
         result = {'data': [{'id': model, 'isDefault': cursor is None,
-            'defaultReasoningEffort': 'low', 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}]}],
+            'defaultReasoningEffort': 'low', 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}],
+            'serviceTiers': [{'id': 'fast', 'name': 'Fast', 'description': ''}] if cursor is None else []}],
             'nextCursor': 'second-page' if cursor is None else None}
     else:
         raise RuntimeError('must not create a thread or prompt: ' + method)
@@ -168,6 +169,7 @@ for line in sys.stdin:
         driver: crate::provider::Driver::Codex,
         command: script.to_string_lossy().into_owned(),
         args: Vec::new(),
+        additional_args_len: 0,
         env: Vec::new(),
         login_hint: String::new(),
         source: crate::AgentSource::Builtin,
@@ -181,6 +183,9 @@ for line in sys.stdin:
         .collect();
     assert_eq!(models, ["one", "two"]);
     assert_eq!(found.levels.keys().map(String::as_str).collect::<Vec<_>>(), ["one", "two"]);
+    assert!(found.config.iter().any(|o| o.id == SERVICE_TIER));
+    assert!(found.levels["one"].iter().any(|o| o.id == SERVICE_TIER));
+    assert!(found.levels["two"].iter().all(|o| o.id != SERVICE_TIER));
     let requests = std::fs::read_to_string(tmp.path().join("requests")).unwrap();
     let requests: Vec<Value> = requests.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
     assert_eq!(
@@ -205,6 +210,72 @@ for line in sys.stdin:
 
 // ---- Pure translations -------------------------------------------------------------
 
+#[test]
+fn fast_is_offered_only_when_the_model_advertises_it() {
+    for capability in [
+        json!({ "additionalSpeedTiers": ["fast"] }),
+        json!({ "serviceTiers": [{ "id": "fast", "name": "Fast", "description": "" }] }),
+        json!({ "serviceTiers": [{ "id": "priority", "name": "Fast", "description": "" }] }),
+    ] {
+        let mut model = json!({ "id": "supported", "isDefault": true });
+        model.as_object_mut().unwrap().extend(capability.as_object().unwrap().clone());
+        let models = models_of(&json!({ "data": [model, { "id": "unsupported" }] }));
+        let mut settings = Settings::of(&json!({}), &models);
+        let options = config_options(&models, &settings);
+        let fast = options.as_array().unwrap().iter().find(|o| o["id"] == "service_tier").expect("Fast option");
+        assert_eq!(fast["category"], "model_config");
+        assert_eq!(fast["currentValue"], "false");
+        assert!(settings.set(&models, "service_tier", "true").is_ok());
+        assert!(settings.set(&models, "service_tier", "invalid").is_err());
+        let selected = settings.service_tier_override(&models).map(str::to_owned);
+        settings.set(&models, "model", "unsupported").unwrap();
+        assert!(config_options(&models, &settings).as_array().unwrap().iter().all(|o| o["id"] != "service_tier"));
+        assert!(settings.set(&models, "service_tier", "true").is_err());
+        assert_eq!(settings.service_tier_override(&models), Some("default"));
+        settings.set(&models, "model", "supported").unwrap();
+        assert_eq!(settings.service_tier_override(&models), selected.as_deref());
+        let options = config_options(&models, &settings);
+        assert_eq!(
+            options.as_array().unwrap().iter().find(|o| o["id"] == SERVICE_TIER).unwrap()["currentValue"],
+            "true"
+        );
+    }
+    for capability in [json!({}), json!({ "additionalSpeedTiers": [] }), json!({ "serviceTiers": [] })] {
+        let mut model = json!({ "id": "old", "isDefault": true });
+        model.as_object_mut().unwrap().extend(capability.as_object().unwrap().clone());
+        let models = models_of(&json!({ "data": [model] }));
+        let settings = Settings::of(&json!({}), &models);
+        assert!(config_options(&models, &settings).as_array().unwrap().iter().all(|o| o["id"] != "service_tier"));
+    }
+}
+
+#[test]
+fn fast_defaults_do_not_become_user_overrides() {
+    let models = models_of(&json!({ "data": [{
+        "id": "m", "isDefault": true, "defaultServiceTier": "fast",
+        "serviceTiers": [{ "id": "fast", "name": "Fast", "description": "" }]
+    }] }));
+    for (reported, current) in [
+        (json!({}), "true"),
+        (json!({ "serviceTier": null }), "false"),
+        (json!({ "serviceTier": "fast" }), "true"),
+        (json!({ "serviceTier": "priority" }), "true"),
+        (json!({ "serviceTier": "default" }), "false"),
+    ] {
+        let mut settings = Settings::of(&reported, &models);
+        let options = config_options(&models, &settings);
+        assert_eq!(
+            options.as_array().unwrap().iter().find(|o| o["id"] == SERVICE_TIER).unwrap()["currentValue"],
+            current
+        );
+        assert_eq!(settings.service_tier_override(&models), None);
+        settings.set(&models, SERVICE_TIER, "true").unwrap();
+        assert_eq!(settings.service_tier_override(&models), Some("fast"));
+        settings.set(&models, SERVICE_TIER, "false").unwrap();
+        assert_eq!(settings.service_tier_override(&models), Some("default"));
+    }
+}
+
 fn models() -> Vec<ModelInfo> {
     models_of(&json!({"data": [
         {"id": "big", "model": "big", "displayName": "Big", "description": "d", "hidden": false, "isDefault": true,
@@ -228,6 +299,8 @@ fn settings_follow_the_thread_and_the_models() {
         Settings {
             model: "big".into(),
             effort: Some("low".into()),
+            service_tier: None,
+            fast_override: None,
             mode: Mode::Ask,
             collaboration_mode: DEFAULT_COLLABORATION_MODE.into(),
             collaboration_mode_override: None,
@@ -517,6 +590,39 @@ fn history_replays_turns() {
 }
 
 #[test]
+fn viewed_generated_and_attached_images_carry_their_pixels() {
+    let dir = tempfile::tempdir().unwrap();
+    let png = dir.path().join("shot.png");
+    std::fs::write(&png, b"\x89PNG\r\n").unwrap();
+    let png_path = png.to_str().unwrap();
+    let encoded = "iVBORw0K";
+    let view = json!({"id": "v", "type": "imageView", "path": png_path});
+    assert!(tool_call(&view, false, None, None).unwrap().get("content").is_none());
+    let image = &tool_call(&view, true, None, None).unwrap()["content"][0]["content"];
+    assert_eq!((image["type"].as_str(), image["data"].as_str()), (Some("image"), Some(encoded)));
+    let missing = json!({"id": "v", "type": "imageView", "path": dir.path().join("gone.png")});
+    assert!(tool_call(&missing, true, None, None).unwrap().get("content").is_none());
+    let inline = json!({"id": "g", "type": "imageGeneration", "status": "completed", "result": encoded});
+    let image = &tool_call(&inline, true, None, None).unwrap()["content"][0]["content"];
+    assert_eq!((image["mimeType"].as_str(), image["data"].as_str()), (Some("image/png"), Some(encoded)));
+    let saved =
+        json!({"id": "g", "type": "imageGeneration", "status": "completed", "fileId": "f", "savedPath": png_path});
+    assert_eq!(tool_call(&saved, true, None, None).unwrap()["content"][0]["content"]["data"], encoded);
+
+    let thread = json!({"turns": [{"items": [{"type": "userMessage", "id": "u", "content": [
+        {"type": "image", "url": "data:image/jpeg;base64,/9j/"},
+        {"type": "image", "url": "https://example.com/a.png"},
+        {"type": "localImage", "path": png_path},
+        {"type": "localImage", "path": "/gone.png"}
+    ]}]}]});
+    let contents: Vec<Value> = history(&thread, None).into_iter().map(|u| u["content"].clone()).collect();
+    assert_eq!(contents[0], json!({"type": "image", "mimeType": "image/jpeg", "data": "/9j/"}));
+    assert_eq!(contents[1]["type"], "resource_link");
+    assert_eq!(contents[2], json!({"type": "image", "mimeType": "image/png", "data": encoded}));
+    assert_eq!(contents[3], json!({"type": "text", "text": "/gone.png"}));
+}
+
+#[test]
 fn history_preserves_async_questions_with_stable_answer_ids() {
     let updates = history(
         &json!({"turns": [{"items": [{
@@ -662,6 +768,7 @@ enum Scenario {
     Simple,
     Journaled,
     MultiTurn,
+    ServiceTier { first: Option<bool>, second: Option<bool> },
     Approvals,
     UsageLimit,
     Subagent,
@@ -681,6 +788,7 @@ impl Scenario {
             Scenario::Steer => "steer",
             Scenario::Simple | Scenario::Journaled => "simple",
             Scenario::MultiTurn => "multi_turn",
+            Scenario::ServiceTier { .. } => "multi_turn",
             Scenario::Approvals => "approvals",
             Scenario::UsageLimit => "usage_limit",
             Scenario::Subagent => "subagent",
@@ -802,6 +910,16 @@ async fn drive(scenario: Scenario, acp: &Peer, client: &Client, cwd: &str, threa
             out.push(("model", request(acp, "session/set_config_option", set(MODEL, "gpt-5.5")).await));
             out.push(("effort", request(acp, "session/set_config_option", set(EFFORT, "high")).await));
             out.push(("second", request(acp, "session/prompt", prompt("Reply with: two")).await));
+        }
+        Scenario::ServiceTier { first, second } => {
+            for (label, choice) in [("first", first), ("second", second)] {
+                if let Some(fast) = choice {
+                    request(acp, "session/set_config_option", set(SERVICE_TIER, if fast { "true" } else { "false" }))
+                        .await
+                        .expect("the model advertises Fast");
+                }
+                out.push((label, request(acp, "session/prompt", prompt("Reply with: hi")).await));
+            }
         }
         Scenario::Approvals => {
             client.answers.lock().extend([Some("accept"), None]);
@@ -1486,6 +1604,44 @@ fn thread_names_are_the_first_line_of_the_reply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fast_selection_reaches_the_first_and_next_turn_and_standard_clears_it() {
+    for (first, second, expected) in [
+        (Some(true), Some(false), [Some("fast"), Some("default")]),
+        (Some(false), Some(true), [Some("default"), Some("fast")]),
+        (Some(true), None, [Some("fast"), Some("fast")]),
+        (None, None, [None, None]),
+    ] {
+        let scenario = Scenario::ServiceTier { first, second };
+        let mut transcript = load(scenario.file());
+        for (out, frame) in &mut transcript.frames {
+            if *out {
+                continue;
+            }
+            if let Some(models) = frame.pointer_mut("/result/data").and_then(Value::as_array_mut) {
+                for model in models {
+                    model["serviceTiers"] = json!([{ "id": "fast", "name": "Fast", "description": "" }]);
+                    model["defaultServiceTier"] = json!("fast");
+                }
+            }
+            if frame.pointer("/result/thread").is_some() {
+                frame["result"]["serviceTier"] = json!("fast");
+            }
+        }
+        let (results, _client, frames, _meta, _codex) = replay_transcript(scenario, transcript).await;
+        assert!(result(&results, "first").is_ok());
+        assert!(result(&results, "second").is_ok());
+        let starts = sent(&frames, "turn/start");
+        assert_eq!(starts.len(), 2);
+        for (start, expected) in starts.iter().zip(expected) {
+            assert_eq!(start["params"].get("serviceTier"), expected.map(|value| json!(value)).as_ref());
+            assert!(start["params"].get("serviceTierForTurn").is_none());
+        }
+        assert!(sent(&frames, "turn/settings/update").is_empty());
+        assert!(sent(&frames, "config/value/write").is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn settings_apply_to_the_next_turn() {
     let (results, client, frames, _) = replay(Scenario::MultiTurn).await;
     let session = session_of(&results, "new");
@@ -2063,4 +2219,52 @@ fn skills_become_commands_with_their_invocation_names() {
     assert_eq!(commands[0].name, "$review");
     assert!(skill_commands(&json!({"data": []})).unwrap()["availableCommands"].as_array().unwrap().is_empty());
     assert!(skill_commands(&json!({})).is_none());
+}
+
+#[test]
+fn workspace_roots_join_the_thread_roots() {
+    let params = json!({ "cwd": "/w/api", "mcpServers": [], "additionalDirectories": ["/w/web"] });
+    let mut request = json!({});
+    apply_thread_config(&params, &mut request);
+    assert_eq!(request["runtimeWorkspaceRoots"], json!(["/w/api", "/w/web"]));
+    let mut request = json!({});
+    apply_thread_config(&json!({ "cwd": "/w/api", "mcpServers": [] }), &mut request);
+    assert!(request.get("runtimeWorkspaceRoots").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ephemeral_session_starts_an_ephemeral_thread() {
+    for ephemeral in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let server = Arc::new(TrustServer {
+            cwd: cwd.clone(),
+            disabled: false,
+            other_project: false,
+            write_error: false,
+            overridden: false,
+            calls: Mutex::default(),
+        });
+        let client = Arc::new(Client::default());
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (read, write) = tokio::io::split(theirs);
+        let native = Peer::connect_framed(read, write, server.clone(), Framing::Lines);
+        let acp = attach(client.clone(), |events| {
+            let (read, write) = tokio::io::split(ours);
+            Ok(Peer::connect_framed(read, write, events, Framing::Lines))
+        })
+        .unwrap();
+        request(&acp, "initialize", json!({})).await.unwrap();
+        let mut params = json!({"cwd": cwd, "mcpServers": []});
+        if ephemeral {
+            params["_meta"] = json!({"openidea": {"ephemeral": true}});
+        }
+        request(&acp, "session/new", params).await.unwrap();
+        let calls = server.calls.lock();
+        let (_, start) = calls.iter().find(|(m, _)| m == "thread/start").unwrap();
+        assert_eq!(start.get("ephemeral"), ephemeral.then_some(&Value::Bool(true)), "{start}");
+        drop(calls);
+        acp.kill();
+        native.kill();
+    }
 }

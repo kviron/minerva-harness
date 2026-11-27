@@ -1,12 +1,10 @@
 import type { AgentTask } from "@/bindings";
-import type { Action } from "@/platform/actions";
+import { executeActionFrom, type Action } from "@/platform/actions";
 import { tx } from "@/platform/i18n";
-import { auxiliaryWindow } from "@/platform/auxWindow";
-import { useProject } from "@/platform/project";
 import type { MenuItem } from "@/ui";
 import { confirm, showError, confirmChecked } from "@/workbench/messages";
 import { promptInput } from "@/workbench/inputDialogs";
-import { hasTaskTerminal, isBusy } from "./model";
+import { isBusy } from "./model";
 import { groupNameError, type OrganizeGroup } from "./organize";
 import { agentProviderId } from "./providerOptions";
 import {
@@ -26,11 +24,13 @@ import {
   openTaskInEditorLocation,
   renameTask,
   setSessionLocation,
+  setTasksUnread,
   showImportSessions,
   stopDelegationTree,
   undockTask,
   useAgents,
 } from "./store";
+import { focusedTaskListSelection } from "./taskListFocus";
 
 /** The Agents tool window's options menu: where conversations open, a new list group, importing sessions. */
 export function useAgentsHeaderMenu(): MenuItem[] {
@@ -45,10 +45,11 @@ export function useAgentsHeaderMenu(): MenuItem[] {
   ];
 }
 
-const canArchive = (task: AgentTask) => !isBusy(task.status) && task.status !== "archived";
+export const canArchive = (task: AgentTask) => !isBusy(task.status) && task.status !== "archived";
 const canFork = (task: AgentTask) => canArchive(task) && !!task.capabilities?.fork;
 
 function resolveTasks(arg: unknown): AgentTask[] {
+  if (arg == null) arg = focusedTaskListSelection();
   if (!Array.isArray(arg)) return [];
   return [...new Set(arg)].flatMap((id: unknown) => {
     const task = typeof id === "string" ? useAgents.getState().tasks.get(id) : undefined;
@@ -60,6 +61,7 @@ async function runTasks(tasks: AgentTask[], run: (task: AgentTask) => Promise<un
   const errors: string[] = [];
   for (const task of tasks) {
     try {
+      // oxlint-disable-next-line no-await-in-loop -- archive/unarchive/delete mutate shared task and worktree state one task at a time
       await run(task);
     } catch (error) {
       errors.push(`${task.title}: ${error instanceof Error ? error.message : String(error)}`);
@@ -135,10 +137,9 @@ async function confirmRemoveGroup(group: string) {
     deleteTaskGroup(group);
 }
 
-/** Pins and unpins of the selected tasks, then where they go. */
-function arrangeMenu(tasks: AgentTask[], ids: string[]): MenuItem[] {
-  const { groups, groupOf, pinned } = useAgents.getState().organize;
-  const isPinned = new Set(pinned);
+/** Pins and unpins of the selected tasks. */
+function pinMenu(tasks: AgentTask[]): MenuItem[] {
+  const isPinned = new Set(useAgents.getState().organize.pinned);
   const toPin = tasks.filter((t) => !isPinned.has(t.id));
   const toUnpin = tasks.filter((t) => isPinned.has(t.id));
   return [
@@ -164,18 +165,38 @@ function arrangeMenu(tasks: AgentTask[], ids: string[]): MenuItem[] {
           },
         ] satisfies MenuItem[])
       : []),
+  ];
+}
+
+/** Marks the tasks unread, or read when they all are unread already. */
+function unreadMenu(ids: string[]): MenuItem[] {
+  const unread = useAgents.getState().unread;
+  const allUnread = ids.every((id) => unread.has(id));
+  return [
     {
-      kind: "item",
-      id: "move-to-group",
-      label: "Move to Group",
-      icon: "folder",
-      submenu: groupSubmenu(
-        ids,
-        groups,
-        ids.map((id) => groupOf[id]),
-      ),
+      kind: "action",
+      action: allUnread ? "agents.markTasksRead" : "agents.markTasksUnread",
+      label: allUnread ? "Mark as Read" : "Mark as Unread",
+      icon: "",
+      arg: ids,
     },
   ];
+}
+
+/** Where the selected tasks go. */
+function groupMenuItem(ids: string[]): MenuItem {
+  const { groups, groupOf } = useAgents.getState().organize;
+  return {
+    kind: "item",
+    id: "move-to-group",
+    label: "Group",
+    icon: "folder",
+    submenu: groupSubmenu(
+      ids,
+      groups,
+      ids.map((id) => groupOf[id]),
+    ),
+  };
 }
 
 /** The groups to move the tasks into; the one they all belong to is checked. */
@@ -196,7 +217,7 @@ function groupSubmenu(ids: string[], groups: OrganizeGroup[], current: Array<str
           {
             kind: "item",
             id: "group:none",
-            label: "Remove from Group",
+            label: "No Group",
             run: () => moveTasksToGroup(ids, null),
           },
         ] satisfies MenuItem[])
@@ -230,11 +251,11 @@ export const taskActions: Action[] = [
   },
   {
     id: "agents.importSessions",
-    title: "Import Sessions from Other Apps…",
+    title: "Import Sessions…",
     category: "Agents",
     icon: "download",
     when: "projectOpen",
-    keywords: ["import", "claude", "codex", "history", "transcript"],
+    keywords: ["import", "other apps", "claude", "codex", "history", "transcript"],
     run: showImportSessions,
   },
   {
@@ -330,6 +351,8 @@ export const taskActions: Action[] = [
     title: "Archive Agent Tasks",
     category: "Agents",
     hidden: true,
+    // Without an argument the shortcut archives the task list's selection.
+    keyWhen: "agentTaskListFocus",
     run: ({ arg }) =>
       runTasks(resolveTasks(arg).filter(canArchive), (task) => archiveTask(task.id), tx("Cannot archive agent tasks")),
   },
@@ -375,6 +398,28 @@ export const taskActions: Action[] = [
       ),
   },
   {
+    id: "agents.markTasksUnread",
+    title: "Mark Agent Tasks as Unread",
+    category: "Agents",
+    hidden: true,
+    run: ({ arg }) =>
+      setTasksUnread(
+        resolveTasks(arg).map((task) => task.id),
+        true,
+      ),
+  },
+  {
+    id: "agents.markTasksRead",
+    title: "Mark Agent Tasks as Read",
+    category: "Agents",
+    hidden: true,
+    run: ({ arg }) =>
+      setTasksUnread(
+        resolveTasks(arg).map((task) => task.id),
+        false,
+      ),
+  },
+  {
     id: "agents.newTaskGroup",
     title: "New Agent Task Group",
     category: "Agents",
@@ -402,42 +447,40 @@ export const taskActions: Action[] = [
   },
 ];
 
-export function taskMenu(tasks: AgentTask[]): MenuItem[] {
+/**
+ * The task rows' menu. `below` lists the tasks under a single selected one in its section,
+ * for Archive All Below.
+ */
+export function taskMenu(tasks: AgentTask[], below: AgentTask[] = []): MenuItem[] {
   if (!tasks.length) return [];
   const ids = tasks.map((task) => task.id);
   const task = tasks[0]!;
-  const projectRoot = task.projectRoot ?? useProject.getState().project?.root ?? null;
   const multiple = tasks.length > 1;
   const archived = tasks.filter((task) => task.status === "archived").length;
   const archivable = tasks.filter(canArchive).length;
+  const archivableBelow = multiple ? [] : below.filter(canArchive);
   return [
+    ...pinMenu(tasks),
     ...(!multiple
       ? ([
           { kind: "action", action: "agents.renameTask", label: "Rename…", icon: "edit", arg: task.id },
-          ...(!auxiliaryWindow()
-            ? ([{ kind: "action", action: "agents.moveToNewWindow", arg: task.id }] satisfies MenuItem[])
-            : []),
-          ...(hasTaskTerminal(task, projectRoot)
-            ? ([
-                { kind: "action", action: "terminal.openAt", label: "Terminal", icon: "terminal", arg: task.cwd },
-              ] satisfies MenuItem[])
-            : []),
-          ...(task.capabilities?.fork && task.status !== "archived"
-            ? ([
-                {
-                  kind: "action",
-                  action: "agents.forkTask",
-                  label: "Fork",
-                  icon: "branch",
-                  arg: task.id,
-                  disabled: !canFork(task),
-                },
-              ] satisfies MenuItem[])
-            : []),
-          { kind: "separator" },
         ] satisfies MenuItem[])
       : []),
-    ...arrangeMenu(tasks, ids),
+    ...unreadMenu(ids),
+    { kind: "separator" },
+    ...(!multiple && task.capabilities?.fork && task.status !== "archived"
+      ? ([
+          {
+            kind: "action",
+            action: "agents.forkTask",
+            label: "Fork",
+            icon: "branch",
+            arg: task.id,
+            disabled: !canFork(task),
+          },
+        ] satisfies MenuItem[])
+      : []),
+    groupMenuItem(ids),
     { kind: "separator" },
     ...(archived
       ? ([
@@ -453,9 +496,26 @@ export function taskMenu(tasks: AgentTask[]): MenuItem[] {
       kind: "action",
       action: "agents.archiveTasks",
       label: multiple ? tx`Archive (${archivable})` : "Archive",
+      icon: "archive",
       arg: ids,
       disabled: !archivable,
     },
+    ...(archivableBelow.length
+      ? ([
+          {
+            kind: "item",
+            id: "archive-below",
+            label: "Archive All Below",
+            icon: "archive",
+            run: () =>
+              void executeActionFrom(
+                "menu",
+                "agents.archiveTasks",
+                archivableBelow.map((t) => t.id),
+              ),
+          },
+        ] satisfies MenuItem[])
+      : []),
     {
       kind: "action",
       action: "agents.deleteTasks",

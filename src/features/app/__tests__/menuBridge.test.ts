@@ -4,6 +4,7 @@ import { _resetI18nForTests, setLocale } from "@/platform/i18n";
 import { useKeymap } from "@/platform/keymap";
 import * as ipc from "@/platform/ipc";
 import { resetDistractionFree, setDistractionFree } from "@/workbench/distractionFree";
+import { useFullscreen } from "@/workbench/zenMode";
 import { registerStatusItem, registerToolWindow } from "@/workbench/contributions";
 import { useProject } from "@/platform/project";
 import { _reloadLayouts, saveLayout } from "@/workbench/toolwindows/layouts";
@@ -182,6 +183,48 @@ describe("menu state from the frontend", () => {
     setContext("testMenuEditor", false);
     offs.forEach((d) => d());
   });
+
+  it("re-pushes menu config when switching Java files, and skips non-Java switches", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(ipc, "isTauri").mockReturnValue(true);
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(ipc.commands, "appBuildInfo").mockRejectedValue(new Error("No build info in tests"));
+    const configure = vi.spyOn(ipc.commands, "menuConfigure").mockResolvedValue();
+    vi.spyOn(ipc.commands, "menuModel").mockResolvedValue([]);
+    vi.spyOn(ipc.commands, "menuSetDisabled").mockResolvedValue();
+    const dispose = installMenuBridge();
+    try {
+      await vi.advanceTimersByTimeAsync(120);
+      configure.mockClear();
+
+      setContext("editorPath", "/p/src/A.java");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(configure).toHaveBeenCalledTimes(1);
+      expect(configure.mock.calls.at(-1)![0].labels["menu.build.compileFile"]).toBe("Recompile 'A.java'");
+      configure.mockClear();
+
+      setContext("editorPath", "/p/src/B.java");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(configure).toHaveBeenCalledTimes(1);
+      expect(configure.mock.calls.at(-1)![0].labels["menu.build.compileFile"]).toBe("Recompile 'B.java'");
+      configure.mockClear();
+
+      setContext("editorPath", "/p/pom.xml");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(configure).toHaveBeenCalledTimes(1);
+      expect(configure.mock.calls.at(-1)![0].labels["menu.build.compileFile"]).toBe("Recompile");
+      configure.mockClear();
+
+      setContext("editorPath", "/p/README.md");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(configure).not.toHaveBeenCalled();
+    } finally {
+      dispose();
+      clearContext("editorPath");
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
 });
 
 afterEach(() => {
@@ -223,6 +266,7 @@ describe("menu config", () => {
     const mac = buildMenuConfig("macos");
     expect(mac.accelerators["file.save"]).toBe("Meta+S");
     expect(mac.accelerators["navigate.gotoFile"]).toBe("Shift+Meta+O");
+    expect(mac.accelerators["build.compileFile"]).toBe("Shift+Meta+F9");
     expect(mac.accelerators["navigate.searchEverywhere"]).toBeUndefined();
   });
 
@@ -288,6 +332,41 @@ describe("window-scoped menu labels", () => {
     setDistractionFree(true);
     expect(buildMenuConfig("macos").labels["menu.editor.toggleZen"]).toBe("Exit Distraction Free Mode");
     resetDistractionFree();
+  });
+
+  it("flips Enter / Exit Zen Mode only while Distraction Free Mode and full screen are both on", () => {
+    const label = () => buildMenuConfig("macos").labels["menu.view.toggleZenMode"];
+    expect(label()).toBe("Enter Zen Mode");
+    setDistractionFree(true);
+    expect(label()).toBe("Enter Zen Mode");
+    useFullscreen.setState({ on: true });
+    expect(label()).toBe("Exit Zen Mode");
+    setDistractionFree(false);
+    expect(label()).toBe("Enter Zen Mode");
+    useFullscreen.setState({ on: false });
+    resetDistractionFree();
+  });
+
+  it("formats Recompile with the active local Java filename across locales", async () => {
+    try {
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("Recompile");
+      setContext("editorPath", "/p/src/Main.java");
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("Recompile 'Main.java'");
+      setContext("editorPath", "/p/pom.xml");
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("Recompile");
+      setContext("editorPath", "jdt://contents/rt.jar/java/lang/String.java");
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("Recompile");
+      setContext("editorPath", "untitled:Untitled-1.java");
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("Recompile");
+
+      await setLocale("zh");
+      setContext("editorPath", null);
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("重新编译");
+      setContext("editorPath", "/p/src/Main.java");
+      expect(buildMenuConfig("macos").labels["menu.build.compileFile"]).toBe("重新编译 'Main.java'");
+    } finally {
+      clearContext("editorPath");
+    }
   });
 });
 
