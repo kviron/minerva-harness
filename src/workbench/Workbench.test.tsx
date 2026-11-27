@@ -398,12 +398,12 @@ describe("tool window split areas", () => {
         showToolWindow("plugin.k8s.view:kubernetes", true);
         toggleMaximizeToolWindow("plugin.k8s.view:kubernetes");
       });
-      expect(screen.getByText("editor-surface").parentElement).toHaveAttribute("hidden");
+      expect(screen.getByText("editor-surface")).not.toBeVisible();
       expect(container.querySelector('[data-anchor="left"]')).toHaveAttribute("hidden");
 
       act(() => disposeK8s());
 
-      expect(screen.getByText("editor-surface").parentElement).not.toHaveAttribute("hidden");
+      expect(screen.getByText("editor-surface")).toBeVisible();
       expect(container.querySelector('[data-anchor="left"]')).not.toHaveAttribute("hidden");
       expect(container.querySelector("[data-maximized]")).toBeNull();
     } finally {

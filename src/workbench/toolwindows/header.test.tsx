@@ -4,7 +4,14 @@ import { Tabs } from "@/ui";
 import { useI18n } from "@/platform/i18n";
 import { registerToolWindow, useWorkbenchChrome } from "../contributions";
 import { installToolWindowActions } from "./actions";
-import { isToolWindowVisible, resetToolWindowLayout, showToolWindow, useToolWindowLayout, viewModeOf } from "./store";
+import {
+  isToolWindowVisible,
+  moveToolWindow,
+  resetToolWindowLayout,
+  showToolWindow,
+  useToolWindowLayout,
+  viewModeOf,
+} from "./store";
 import { ToolWindowLayout } from "./ToolWindows";
 
 const Empty = () => null;
@@ -45,26 +52,42 @@ afterEach(() => disposers.forEach((d) => d()));
 
 const header = (id: string) => document.querySelector<HTMLElement>(`[data-toolwindow="${id}"] header`)!;
 
-it("keeps the native stripe in Agent mode and opens the folded workspace from it", () => {
-  showToolWindow("run");
+it("opens and toggles bottom tools below the agent with the workspace folded", () => {
   render(<ToolWindowLayout editor={<input aria-label="Editor draft" defaultValue="Keep me" />} />);
   const editor = screen.getByRole("textbox", { name: "Editor draft" });
-  expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
   act(() =>
     useWorkbenchChrome.setState({
       navigation: ({ children }) => <nav aria-label="Agent navigation">{children}</nav>,
       sidebar: Empty,
-      primary: Empty,
+      primary: () => <main>Agent conversation</main>,
     }),
   );
   expect(screen.getByRole("navigation", { name: "Agent navigation" })).toBeVisible();
-  expect(document.querySelector('[data-toolwindow="run"]')).not.toBeVisible();
-  expect(isToolWindowVisible("run")).toBe(true);
+  expect(editor).not.toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Run" }));
-  expect(useWorkbenchChrome.getState().workspaceOpen).toBe(true);
   expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
+  expect(screen.getByRole("main")).toBeVisible();
+  expect(editor).not.toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Problems" }));
+  expect(screen.getByRole("region", { name: "Problems" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Problems" })).toHaveAttribute("aria-pressed", "true");
+  fireEvent.click(screen.getByRole("button", { name: "Problems" }));
+  expect(isToolWindowVisible("problems")).toBe(false);
+  expect(useWorkbenchChrome.getState().workspaceOpen).toBe(false);
+  act(() => useWorkbenchChrome.setState({ primary: null }));
   expect(screen.getByRole("textbox", { name: "Editor draft" })).toBe(editor);
   expect(screen.getByRole("textbox", { name: "Editor draft" })).toHaveValue("Keep me");
+});
+
+it("reveals the folded workspace for a tool moved to a side", () => {
+  moveToolWindow("run", "right");
+  showToolWindow("run");
+  useWorkbenchChrome.setState({ primary: Empty });
+  render(<ToolWindowLayout editor={<input aria-label="Editor" />} />);
+  expect(isToolWindowVisible("run")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Run" }));
+  expect(screen.getByRole("region", { name: "Run" })).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Editor" })).toBeVisible();
 });
 
 it("middle click on the header hides the tool window", () => {

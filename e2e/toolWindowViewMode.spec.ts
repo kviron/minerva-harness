@@ -4,6 +4,30 @@ import { expect, openFromTree, test } from "./fixtures";
 const project = (page: Page) => page.locator('[data-toolwindow="project"]');
 const editorArea = (page: Page) => page.locator("[data-editor-area]");
 
+test("bottom stripe tools dock below the agent conversation", async ({ workbench: page }) => {
+  await page.getByRole("button", { name: "Workspace mode" }).click();
+  await page.getByRole("option", { name: "Agent", exact: true }).click();
+  const chat = page.getByRole("region", { name: "Agent conversation" });
+  await expect(chat).toBeVisible();
+  const full = (await chat.boundingBox())!;
+  for (const id of ["todo", "terminal", "git", "problems"]) {
+    const button = page.locator(`[data-stripe-button="${id}"]`);
+    const panel = page.locator(`[data-toolwindow="${id}"]`);
+    await button.click();
+    await expect(panel).toBeVisible();
+    await expect(editorArea(page)).toBeHidden();
+    const dock = (await panel.boundingBox())!;
+    const upper = (await chat.boundingBox())!;
+    expect(upper.width).toBe(full.width);
+    expect(dock.x).toBe(upper.x);
+    expect(dock.width).toBe(upper.width);
+    expect(dock.y).toBeGreaterThanOrEqual(upper.y + upper.height);
+    await button.click();
+    await expect(panel).toBeHidden();
+    expect(await chat.boundingBox()).toEqual(full);
+  }
+});
+
 async function setViewMode(page: Page, mode: "Dock Pinned" | "Dock Unpinned" | "Undock") {
   await project(page).getByRole("button", { name: "Options" }).click();
   await page.getByRole("menuitem", { name: "View Mode" }).click();

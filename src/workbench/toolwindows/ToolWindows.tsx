@@ -41,6 +41,7 @@ import {
 } from "../contributions";
 import { useDistractionFree } from "../distractionFree";
 import {
+  anchorShown,
   hideToolWindow,
   MAX_SPLIT,
   MIN_SPLIT,
@@ -90,19 +91,21 @@ export function useToolWindows(): ToolWindowContribution[] {
 export function useEffectiveMaximized(windows: ToolWindowContribution[]): ToolWindowAnchor | null {
   const visible = useToolWindowLayout((s) => s.visible);
   const maximized = useToolWindowLayout((s) => s.maximized);
+  const shown = useWorkbenchChrome((s) => !maximized || anchorShown(maximized, s));
   return useMemo(() => {
-    if (!maximized) return null;
+    if (!maximized || !shown) return null;
     const hasVisible = ([maximized, `${maximized}-split`] as const).some((slot) => {
       const id = visible[slot];
       return !!id && windows.some((w) => w.id === id && slotOf(w) === slot);
     });
     return hasVisible ? maximized : null;
-  }, [visible, windows, maximized]);
+  }, [visible, windows, maximized, shown]);
 }
 
 export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotRecord {
   const visible = useToolWindowLayout((s) => s.visible);
   const effectiveMaximized = useEffectiveMaximized(windows);
+  const sidesShown = useWorkbenchChrome((s) => anchorShown("left", s));
   return useMemo(() => {
     const out = {} as SlotRecord;
     for (const slot of SLOTS) {
@@ -110,13 +113,17 @@ export function useEffectiveVisible(windows: ToolWindowContribution[]): SlotReco
       out[slot] =
         id &&
         windows.some(
-          (w) => w.id === id && slotOf(w) === slot && (!effectiveMaximized || w.anchor === effectiveMaximized),
+          (w) =>
+            w.id === id &&
+            slotOf(w) === slot &&
+            (sidesShown || w.anchor === "bottom") &&
+            (!effectiveMaximized || w.anchor === effectiveMaximized),
         )
           ? id
           : null;
     }
     return out;
-  }, [visible, windows, effectiveMaximized]);
+  }, [visible, windows, effectiveMaximized, sidesShown]);
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +554,6 @@ export function ToolWindowStripe({
   showNames = false,
   buttonWidth,
   navigation: Navigation,
-  workspaceShown = true,
 }: {
   side: StripeSide;
   windows: ToolWindowContribution[];
@@ -557,7 +563,6 @@ export function ToolWindowStripe({
   /** Button width with names, px. */
   buttonWidth?: number;
   navigation?: NonNullable<ReturnType<typeof useWorkbenchChrome.getState>["navigation"]>;
-  workspaceShown?: boolean;
 }) {
   const isActive = (w: ToolWindowContribution) => visible[slotOf(w)] === w.id;
   const stripeButtons = useToolWindowLayout((s) => s.stripeButtons);
@@ -581,13 +586,7 @@ export function ToolWindowStripe({
       {list.map((w) => (
         <div key={w.id} className={styles.stripeSlot}>
           {indicator(slot, w.id)}
-          <StripeButton
-            tw={w}
-            active={workspaceShown && isActive(w)}
-            focused={workspaceShown && focused === w.id}
-            side={side}
-            showName={showNames}
-          />
+          <StripeButton tw={w} active={isActive(w)} focused={focused === w.id} side={side} showName={showNames} />
         </div>
       ))}
       <div className={clsx(styles.stripeSlot, styles.stripeSlotEnd)}>{indicator(slot, null)}</div>
@@ -1332,13 +1331,10 @@ function useToolWindowAppearance() {
  * between islands. A CSS grid does the layout, so a window resize costs no script.
  */
 export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
-  const { navigation: Navigation, sidebar: Sidebar, primary, workspaceOpen } = useWorkbenchChrome();
+  const { navigation: Navigation, sidebar: Sidebar } = useWorkbenchChrome();
   const windows = useToolWindows();
-  const effectiveVisible = useEffectiveVisible(windows);
-  const effectiveMaximized = useEffectiveMaximized(windows);
-  const workspaceShown = !primary || !!workspaceOpen;
-  const visible = effectiveVisible;
-  const maximized = workspaceShown ? effectiveMaximized : null;
+  const visible = useEffectiveVisible(windows);
+  const maximized = useEffectiveMaximized(windows);
   const appearance = useToolWindowAppearance();
   const bars = appearance.bars;
   const { widescreen } = appearance;
@@ -1371,7 +1367,6 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
       showNames={names(side)}
       buttonWidth={stripes[side].width}
       navigation={side === "left" ? (Navigation ?? undefined) : undefined}
-      workspaceShown={workspaceShown}
     />
   );
   const sizes = useToolWindowLayout((s) => s.sizes);
@@ -1424,23 +1419,23 @@ export function ToolWindowLayout({ editor }: { editor: ReactNode }) {
       {bars && stripe("left")}
       {bars && stripeHandle("left")}
       {Sidebar && <Sidebar />}
-      <WorkspaceLayout>
-        <div
-          ref={gridRef}
-          className={clsx(styles.grid, widescreen && styles.widescreen)}
-          data-maximized={maximized ?? undefined}
-        >
-          <SidePanel anchor="left" windows={windows} visible={visible} />
-          {gap("left")}
-          <div ref={editorRef} className={clsx(styles.island, styles.editorIsland)} hidden={!!maximized}>
-            {editor}
-          </div>
-          {gap("right")}
-          <SidePanel anchor="right" windows={windows} visible={visible} />
-          {gap("bottom")}
-          <SidePanel anchor="bottom" windows={windows} visible={visible} />
+      <div
+        ref={gridRef}
+        className={clsx(styles.grid, widescreen && styles.widescreen)}
+        data-maximized={maximized ?? undefined}
+      >
+        <SidePanel anchor="left" windows={windows} visible={visible} />
+        {gap("left")}
+        <div ref={editorRef} className={styles.editorTrack} hidden={!!maximized}>
+          <WorkspaceLayout>
+            <div className={styles.island}>{editor}</div>
+          </WorkspaceLayout>
         </div>
-      </WorkspaceLayout>
+        {gap("right")}
+        <SidePanel anchor="right" windows={windows} visible={visible} />
+        {gap("bottom")}
+        <SidePanel anchor="bottom" windows={windows} visible={visible} />
+      </div>
       {rightStripe && stripeHandle("right")}
       {rightStripe && stripe("right")}
     </div>

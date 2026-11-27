@@ -159,6 +159,11 @@ export function anchorOf(id: string): ToolWindowAnchor | undefined {
   return slot && slotAnchor(slot);
 }
 
+/** Side tools belong to the optional agent workspace. The bottom dock is shared with the conversation. */
+export function anchorShown(anchor: ToolWindowAnchor, chrome: ReturnType<typeof useWorkbenchChrome.getState>): boolean {
+  return anchor === "bottom" || !chrome.primary || !!chrome.workspaceOpen;
+}
+
 /** The other area of the same side. */
 function partnerSlot(slot: ToolWindowSlot): ToolWindowSlot {
   return isSplitSlot(slot) ? slotAnchor(slot) : `${slot as ToolWindowAnchor}-split`;
@@ -437,7 +442,10 @@ function hasRegisteredVisibleOn(
  * visible window recorded in the wrong area moves to its own.
  */
 export function installToolWindowLayoutSync(): () => void {
-  return useContributions.subscribe((c, prev) => {
+  const stopChrome = useWorkbenchChrome.subscribe((chrome, prev) => {
+    if (anchorShown("left", chrome) !== anchorShown("left", prev)) publishVisibility();
+  });
+  const stopContributions = useContributions.subscribe((c, prev) => {
     if (c.toolWindows === prev.toolWindows) return;
     const s = useToolWindowLayout.getState();
     const reconciled = reconcile(s.visible, s.placements);
@@ -460,17 +468,15 @@ export function installToolWindowLayoutSync(): () => void {
     } else publishVisibility();
     if (staleFocused) focusEditor();
   });
+  return () => {
+    stopChrome();
+    stopContributions();
+  };
 }
 
 function publishVisibility() {
-  const { visible, placements, maximized } = useToolWindowLayout.getState();
-  const effectiveMax = maximized && hasRegisteredVisibleOn(maximized, visible, placements) ? maximized : null;
   for (const tw of useContributions.getState().toolWindows.values()) {
-    const window = placed(tw, placements);
-    setContext(
-      `toolWindow.${tw.id}.visible`,
-      (!effectiveMax || effectiveMax === window.anchor) && visible[slotOf(window)] === tw.id,
-    );
+    setContext(`toolWindow.${tw.id}.visible`, isToolWindowVisible(tw.id));
   }
 }
 
@@ -509,9 +515,16 @@ function update(patch: Partial<ToolWindowLayoutState>, save = true) {
 
 export function isToolWindowVisible(id: string): boolean {
   const slot = slotOfId(id);
+  const chrome = useWorkbenchChrome.getState();
+  if (!slot || !anchorShown(slotAnchor(slot), chrome)) return false;
   const { visible, placements, maximized } = useToolWindowLayout.getState();
-  const effectiveMax = maximized && hasRegisteredVisibleOn(maximized, visible, placements) ? maximized : null;
-  return !!slot && (!effectiveMax || effectiveMax === slotAnchor(slot)) && visible[slot] === id;
+  return (
+    visible[slot] === id &&
+    (!maximized ||
+      maximized === slotAnchor(slot) ||
+      !anchorShown(maximized, chrome) ||
+      !hasRegisteredVisibleOn(maximized, visible, placements))
+  );
 }
 
 /** Last shown or focused tool window, kept after it is hidden (Jump to Last Tool Window). */
@@ -530,9 +543,8 @@ export function jumpToLastToolWindow() {
 export function showToolWindow(id: string, focus = false) {
   const slot = slotOfId(id);
   if (!slot) return;
-  const chrome = useWorkbenchChrome.getState();
-  if (focus && chrome.primary && !chrome.workspaceOpen) useWorkbenchChrome.setState({ workspaceOpen: true });
   const a = slotAnchor(slot);
+  if (focus && !anchorShown(a, useWorkbenchChrome.getState())) useWorkbenchChrome.setState({ workspaceOpen: true });
   lastUsed = id;
   const s = useToolWindowLayout.getState();
   const mounted = s.mounted.has(id) ? s.mounted : new Set(s.mounted).add(id);
@@ -581,8 +593,7 @@ export function removeFromStripe(id: string) {
 }
 
 export function toggleToolWindow(id: string) {
-  const chrome = useWorkbenchChrome.getState();
-  if (isToolWindowVisible(id) && (!chrome.primary || chrome.workspaceOpen)) hideToolWindow(id);
+  if (isToolWindowVisible(id)) hideToolWindow(id);
   else showToolWindow(id, true);
 }
 
@@ -591,8 +602,7 @@ export function toggleToolWindow(id: string) {
  * → focus; visible and focused → hide (IDEA behaviour).
  */
 export function activateToolWindow(id: string) {
-  const chrome = useWorkbenchChrome.getState();
-  if (!isToolWindowVisible(id) || (chrome.primary && !chrome.workspaceOpen)) showToolWindow(id, true);
+  if (!isToolWindowVisible(id)) showToolWindow(id, true);
   else if (useToolWindowLayout.getState().focused !== id && !isFocusWithinToolWindow(id)) focusToolWindow(id);
   else hideToolWindow(id);
 }

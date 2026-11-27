@@ -72,8 +72,11 @@
 .grid > [data-anchor="bottom"] {
   grid-area: bottom;
 }
-.editorIsland {
+.editorTrack {
   grid-area: editor;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
 }
 .grid[data-maximized] {
   grid-template-columns: minmax(0, 1fr);
@@ -95,6 +98,7 @@
   flex-direction: row;
 }
 .island[hidden],
+.editorTrack[hidden],
 .side[hidden] {
   display: none;
 }
